@@ -1,0 +1,1185 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+import { InvalidOperationError, ForbiddenError, NotFoundError } from '../../domain/errors.js';
+import { createReconciliation } from '../../domain/models/cover-wallet-reconciliation.js';
+import {
+  createCoverWallet,
+  isWalletActive,
+  isWalletTerminated,
+  priceForCharge,
+  findChargeableItem,
+} from '../../domain/models/cover-wallet.js';
+
+import type { EntityId } from '../../domain/identity.js';
+import type {
+  CoverWalletReconciliation,
+  CoverWalletReconciliationCreateInput,
+  CoverWalletReconciliationDiscrepancy,
+  ReconciliationStatus,
+} from '../../domain/models/cover-wallet-reconciliation.js';
+import type {
+  CoverWallet,
+  CoverWalletPresetItem,
+  CoverWalletTxn,
+  CoverWalletCreateInput,
+  CoverWalletStatus,
+  CoverWalletTxnType,
+  CoverWalletTxnStatus,
+} from '../../domain/models/cover-wallet.js';
+import type { AdminAuditRecord } from '../../domain/ports/audit.js';
+import type { ServiceDeps, ActorContext } from '../context.js';
+
+/**
+ * ─── Cover Wallet Service (Phase 5) ─────────────────────────────────────────────
+ *
+ * Pre-paid wallet for venue entry + cover charges. All amounts in integer paise.
+ * Invariants enforced:
+ * - balance >= 0 (terminated if balance == 0)
+ * - credit/debit via atomic transactions (balance + txn)
+ * - idempotency keys on every mutation
+ * - velocity limit: max 3 debits/min per device
+ * - terminated wallets reject all mutations
+ * - offline debits blocked
+ * - termination time = next day 05:00 local (tzOffset +05:30)
+ * - daily reconciliation for audit
+ */
+
+export interface CoverWalletServiceDeps {
+  coverWallets: ServiceDeps['repositories']['coverWallets'];
+  coverWalletTxns: ServiceDeps['repositories']['coverWalletTxns'];
+  coverWalletReconciliations: ServiceDeps['repositories']['coverWalletReconciliations'];
+  events: ServiceDeps['repositories']['events'];
+  config: ServiceDeps['config'];
+  logger: ServiceDeps['logger'];
+  outbox: ServiceDeps['outbox'];
+  adminAudit: ServiceDeps['adminAudit'];
+}
+
+/**
+ * What the scanner shows when a guest presents their tab. Deliberately NOT
+ * the whole wallet: no metadata, no transaction history, no owner id beyond a
+ * first name. A bartender needs to know who this is, what they can be charged
+ * for, and whether the money is there.
+ */
+export interface WalletChargeView {
+  walletId: EntityId;
+  eventId: EntityId;
+  /** First name only — enough to greet a guest, not enough to identify them. */
+  guestFirstName: string;
+  status: CoverWallet['status'];
+  /** Suppressed to null when the venue has turned balance display off. */
+  balancePaise: number | null;
+  presetItems: CoverWalletPresetItem[];
+  minChargePaise: number;
+  maxChargePaise: number;
+}
+
+export interface ChargePresetInput {
+  walletId: EntityId;
+  presetItemId: EntityId;
+  quantity: number;
+  idempotencyKey: string;
+  deviceId?: string;
+}
+
+export interface CoverWalletService {
+  // Wallet lifecycle
+  createWallet(input: CreateWalletInput, actor: ActorContext): Promise<CoverWallet>;
+  getWallet(walletId: EntityId, actor: ActorContext): Promise<CoverWallet | null>;
+  getWalletByEventAndUser(
+    eventId: EntityId,
+    userId: EntityId,
+    actor: ActorContext,
+  ): Promise<CoverWallet | null>;
+  listWallets(
+    eventId: EntityId,
+    actor: ActorContext,
+    filters?: WalletFilters,
+  ): Promise<CoverWallet[]>;
+
+  // Balance operations
+  creditWallet(
+    input: CreditWalletInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn }>;
+  debitWallet(
+    input: DebitWalletInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn }>;
+  refundWallet(
+    input: RefundWalletInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn }>;
+  adjustWallet(
+    input: AdjustWalletInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn }>;
+
+  // Scanner-facing: rotating QR + charge by preset item
+  /**
+   * Mints the guest's rotating wallet QR. Short-lived by design — a
+   * screenshot of a tab is worthless within a minute.
+   */
+  generateWalletQr(
+    walletId: EntityId,
+    actor: ActorContext,
+  ): Promise<{ qrPayload: string; expiresAt: string; refreshIntervalSec: number }>;
+  /** Verifies a scanned wallet QR and returns the wallet id, or null. */
+  verifyWalletQr(qrPayload: string): EntityId | null;
+  /** The bartender's view of a tab: who, how much, what can be rung up. */
+  getChargeView(walletId: EntityId, actor: ActorContext): Promise<WalletChargeView>;
+  /**
+   * Charges one preset item. The amount is computed from the venue's own
+   * price list — the caller names an item, never a number.
+   */
+  chargePreset(
+    input: ChargePresetInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn; item: CoverWalletPresetItem }>;
+
+  // Wallet status
+  terminateWallet(walletId: EntityId, reason: string, actor: ActorContext): Promise<CoverWallet>;
+  closeWallet(walletId: EntityId, actor: ActorContext): Promise<CoverWallet>;
+  /** Reversible, no balance change. Legal only from `active`. */
+  freezeWallet(walletId: EntityId, actor: ActorContext): Promise<CoverWallet>;
+  /** Legal only from `frozen`. */
+  unfreezeWallet(walletId: EntityId, actor: ActorContext): Promise<CoverWallet>;
+
+  // Transaction history
+  getTransactions(
+    walletId: EntityId,
+    actor: ActorContext,
+    filters?: TxnFilters,
+  ): Promise<CoverWalletTxn[]>;
+  getTransaction(txnId: EntityId, actor: ActorContext): Promise<CoverWalletTxn | null>;
+
+  // Reconciliation
+  runReconciliation(
+    input: RunReconciliationInput,
+    actor: ActorContext,
+  ): Promise<CoverWalletReconciliation>;
+  getReconciliation(
+    reconciliationId: EntityId,
+    actor: ActorContext,
+  ): Promise<CoverWalletReconciliation | null>;
+  listReconciliations(
+    eventId: EntityId,
+    actor: ActorContext,
+    filters?: ReconciliationFilters,
+  ): Promise<CoverWalletReconciliation[]>;
+  resolveReconciliation(
+    reconciliationId: EntityId,
+    notes: string,
+    actor: ActorContext,
+  ): Promise<CoverWalletReconciliation>;
+
+  // Stats
+  getEventStats(eventId: EntityId, actor: ActorContext): Promise<WalletEventStats>;
+  getOrganizationStats(
+    organizationId: EntityId,
+    from: Date,
+    to: Date,
+    actor: ActorContext,
+  ): Promise<WalletOrgStats>;
+}
+
+export interface CreateWalletInput {
+  eventId: EntityId;
+  userId: EntityId;
+  openingBalance: number; // paise
+  metadata?: Record<string, unknown>;
+}
+
+export interface CreditWalletInput {
+  walletId: EntityId;
+  amount: number; // paise
+  referenceId?: EntityId;
+  referenceType?: string;
+  description?: string;
+  idempotencyKey: string;
+}
+
+export interface DebitWalletInput {
+  walletId: EntityId;
+  amount: number; // paise
+  referenceId?: EntityId;
+  referenceType?: string;
+  description?: string;
+  idempotencyKey: string;
+  deviceId?: string;
+}
+
+export interface RefundWalletInput {
+  walletId: EntityId;
+  amount: number; // paise
+  referenceId: EntityId;
+  description?: string;
+  idempotencyKey: string;
+}
+
+export interface AdjustWalletInput {
+  walletId: EntityId;
+  amount: number; // paise (positive or negative)
+  description: string;
+  idempotencyKey: string;
+}
+
+export interface WalletFilters {
+  status?: CoverWalletStatus;
+  userId?: EntityId;
+  from?: Date;
+  to?: Date;
+  minBalance?: number;
+  maxBalance?: number;
+}
+
+export interface TxnFilters {
+  type?: CoverWalletTxnType;
+  status?: CoverWalletTxnStatus;
+  referenceId?: EntityId;
+  referenceType?: string;
+  deviceId?: string;
+  from?: Date;
+  to?: Date;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface RunReconciliationInput {
+  eventId: EntityId;
+  reconciliationDate: string; // YYYY-MM-DD
+  walletId?: EntityId;
+  userId?: EntityId;
+}
+
+export interface ReconciliationFilters {
+  status?: ReconciliationStatus;
+  walletId?: EntityId;
+  userId?: EntityId;
+  from?: Date;
+  to?: Date;
+  hasDiscrepancy?: boolean;
+}
+
+export interface WalletEventStats {
+  totalWallets: number;
+  activeWallets: number;
+  terminatedWallets: number;
+  totalBalance: number;
+  totalCredits: number;
+  totalDebits: number;
+  totalRefunds: number;
+  avgBalance: number;
+  byStatus: Record<string, number>;
+}
+
+export interface WalletOrgStats {
+  totalWallets: number;
+  totalBalance: number;
+  totalCredits: number;
+  totalDebits: number;
+  totalRefunds: number;
+  totalReconciliations: number;
+  completedReconciliations: number;
+  discrepancyReconciliations: number;
+  totalDiscrepancyAmount: number;
+}
+
+/** Entity states an audit record carries as its `before`/`after` snapshot. */
+type AuditSnapshot = CoverWallet | CoverWalletReconciliation;
+
+function createCoverWalletServiceImpl(deps: CoverWalletServiceDeps): CoverWalletService {
+  const { coverWallets, coverWalletTxns, coverWalletReconciliations, events, config, adminAudit } =
+    deps;
+
+  function auditRecord(
+    actor: ActorContext,
+    action: string,
+    targetType: string,
+    targetId: EntityId,
+    before?: AuditSnapshot,
+    after?: AuditSnapshot,
+  ): AdminAuditRecord {
+    return {
+      id: `audit-${targetId}-${Date.now()}`,
+      adminId: actor.userId,
+      actorId: actor.userId,
+      organizationId: actor.organizationId,
+      action,
+      targetType,
+      targetId,
+      // Same bug as door-service.ts's `auditRecord`: `AdminAuditRecord.before`
+      // is documented `null` for a create action, but the falsy branch here
+      // returned the bare `undefined` an omitted parameter produces, and the
+      // Firestore Admin SDK rejects a literal `undefined` field outright —
+      // every wallet-charge (a create, no prior wallet-side state to diff)
+      // 500'd on writing its own audit record.
+      before: before ? { ...before } : null,
+      after: after ? { ...after } : null,
+      occurredAt: Date.now(),
+    };
+  }
+
+  async function createWallet(input: CreateWalletInput, actor: ActorContext): Promise<CoverWallet> {
+    const event = await events.findById(input.eventId);
+    if (!event) throw new NotFoundError('Event', input.eventId);
+    requireOrgAccess(actor, event.organizationId);
+
+    // Check if wallet already exists for this user/event
+    const existing = await coverWallets.findByEventAndUser(input.eventId, input.userId);
+    if (existing) {
+      throw new InvalidOperationError('Wallet already exists for this user and event');
+    }
+
+    const walletInput: CoverWalletCreateInput = {
+      userId: input.userId,
+      eventId: input.eventId,
+      organizationId: actor.organizationId,
+      venueId: event.venueId,
+      openingBalance: input.openingBalance,
+      metadata: input.metadata,
+    };
+
+    const wallet = createCoverWallet(walletInput);
+    const created = await coverWallets.create(wallet);
+
+    // Create opening credit transaction
+    await coverWalletTxns.create({
+      walletId: created.id,
+      eventId: input.eventId,
+      organizationId: actor.organizationId,
+      venueId: event.venueId,
+      userId: input.userId,
+      type: 'credit',
+      amount: input.openingBalance,
+      balanceAfter: input.openingBalance,
+      status: 'committed',
+      idempotencyKey: `wallet-open-${created.id}`,
+      referenceId: null,
+      referenceType: 'wallet_activation',
+      deviceId: null,
+      operatorUid: actor.userId,
+      operatorName: actor.userId,
+      description: 'Wallet activation',
+      failureReason: null,
+      processedAt: new Date().toISOString(),
+    });
+
+    await adminAudit.write(
+      auditRecord(actor, 'cover_wallet.create', 'cover_wallet', created.id, undefined, created),
+    );
+
+    return created;
+  }
+
+  async function getWallet(walletId: EntityId, actor: ActorContext): Promise<CoverWallet | null> {
+    const wallet = await coverWallets.findById(walletId);
+    if (!wallet) return null;
+    requireOrgAccess(actor, wallet.organizationId);
+    return wallet;
+  }
+
+  async function getWalletByEventAndUser(
+    eventId: EntityId,
+    userId: EntityId,
+    actor: ActorContext,
+  ): Promise<CoverWallet | null> {
+    const event = await events.findById(eventId);
+    if (!event) throw new NotFoundError('Event', eventId);
+    requireOrgAccess(actor, event.organizationId);
+
+    return coverWallets.findByEventAndUser(eventId, userId);
+  }
+
+  async function listWallets(
+    eventId: EntityId,
+    actor: ActorContext,
+    filters?: WalletFilters,
+  ): Promise<CoverWallet[]> {
+    const event = await events.findById(eventId);
+    if (!event) throw new NotFoundError('Event', eventId);
+    requireOrgAccess(actor, event.organizationId);
+
+    const allWallets = await coverWallets.findByEvent(eventId, {
+      limit: 1000,
+      cursor: null,
+    });
+    let filtered = allWallets.items;
+
+    if (filters?.status) {
+      filtered = filtered.filter((w) => w.status === filters.status);
+    }
+    if (filters?.userId) {
+      filtered = filtered.filter((w) => w.userId === filters.userId);
+    }
+    if (filters?.from) {
+      const from = filters.from;
+      filtered = filtered.filter((w) => new Date(w.createdAt) >= from);
+    }
+    if (filters?.to) {
+      const to = filters.to;
+      filtered = filtered.filter((w) => new Date(w.createdAt) <= to);
+    }
+    if (filters?.minBalance !== undefined) {
+      const minBalance = filters.minBalance;
+      filtered = filtered.filter((w) => w.balance >= minBalance);
+    }
+    if (filters?.maxBalance !== undefined) {
+      const maxBalance = filters.maxBalance;
+      filtered = filtered.filter((w) => w.balance <= maxBalance);
+    }
+
+    return filtered;
+  }
+
+  async function creditWallet(
+    input: CreditWalletInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn }> {
+    const wallet = await coverWallets.findById(input.walletId);
+    if (!wallet) throw new NotFoundError('Wallet', input.walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    if (!isWalletActive(wallet)) {
+      throw new InvalidOperationError('Cannot credit inactive wallet');
+    }
+
+    // Check idempotency
+    const existingTxn = await coverWalletTxns.findByIdempotencyKey(input.idempotencyKey);
+    if (existingTxn) {
+      const existingWallet = await coverWallets.findById(existingTxn.walletId);
+      if (!existingWallet) throw new NotFoundError('Wallet', existingTxn.walletId);
+      return { wallet: existingWallet, txn: existingTxn };
+    }
+
+    const result = await coverWallets.credit({
+      walletId: input.walletId,
+      amount: input.amount,
+      referenceId: input.referenceId ?? null,
+      referenceType: input.referenceType ?? null,
+      operatorUid: actor.userId,
+      operatorName: actor.userId,
+      description: input.description ?? null,
+      idempotencyKey: input.idempotencyKey,
+    });
+
+    await adminAudit.write(
+      auditRecord(
+        actor,
+        'cover_wallet.credit',
+        'cover_wallet',
+        input.walletId,
+        undefined,
+        result.wallet,
+      ),
+    );
+
+    return result;
+  }
+
+  async function debitWallet(
+    input: DebitWalletInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn }> {
+    const wallet = await coverWallets.findById(input.walletId);
+    if (!wallet) throw new NotFoundError('Wallet', input.walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    if (!isWalletActive(wallet)) {
+      throw new InvalidOperationError('Cannot debit inactive wallet');
+    }
+
+    // Velocity check: max 3 debits/min per device
+    if (input.deviceId) {
+      const since = new Date(Date.now() - 60 * 1000);
+      const recentDebits = await coverWalletTxns.countRecentDebits(input.deviceId, since);
+      if (recentDebits >= 3) {
+        throw new InvalidOperationError(
+          'Velocity limit exceeded: max 3 debits per minute per device',
+        );
+      }
+    }
+
+    // Check idempotency
+    const existingTxn = await coverWalletTxns.findByIdempotencyKey(input.idempotencyKey);
+    if (existingTxn) {
+      const existingWallet = await coverWallets.findById(existingTxn.walletId);
+      if (!existingWallet) throw new NotFoundError('Wallet', existingTxn.walletId);
+      return { wallet: existingWallet, txn: existingTxn };
+    }
+
+    const result = await coverWallets.debit({
+      walletId: input.walletId,
+      amount: input.amount,
+      referenceId: input.referenceId ?? null,
+      referenceType: input.referenceType ?? null,
+      operatorUid: actor.userId,
+      operatorName: actor.userId,
+      description: input.description ?? null,
+      idempotencyKey: input.idempotencyKey,
+      deviceId: input.deviceId ?? null,
+    });
+
+    await adminAudit.write(
+      auditRecord(
+        actor,
+        'cover_wallet.debit',
+        'cover_wallet',
+        input.walletId,
+        undefined,
+        result.wallet,
+      ),
+    );
+
+    return result;
+  }
+
+  async function refundWallet(
+    input: RefundWalletInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn }> {
+    const wallet = await coverWallets.findById(input.walletId);
+    if (!wallet) throw new NotFoundError('Wallet', input.walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    if (!isWalletActive(wallet)) {
+      throw new InvalidOperationError('Cannot refund inactive wallet');
+    }
+
+    // Check idempotency
+    const existingTxn = await coverWalletTxns.findByIdempotencyKey(input.idempotencyKey);
+    if (existingTxn) {
+      const existingWallet = await coverWallets.findById(existingTxn.walletId);
+      if (!existingWallet) throw new NotFoundError('Wallet', existingTxn.walletId);
+      return { wallet: existingWallet, txn: existingTxn };
+    }
+
+    const result = await coverWallets.refund(
+      wallet.id,
+      input.amount,
+      input.referenceId,
+      input.idempotencyKey,
+      actor.userId,
+      input.description ?? 'Refund',
+    );
+
+    await adminAudit.write(
+      auditRecord(
+        actor,
+        'cover_wallet.refund',
+        'cover_wallet',
+        input.walletId,
+        undefined,
+        result.wallet,
+      ),
+    );
+
+    return result;
+  }
+
+  async function adjustWallet(
+    input: AdjustWalletInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn }> {
+    const wallet = await coverWallets.findById(input.walletId);
+    if (!wallet) throw new NotFoundError('Wallet', input.walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    if (!isWalletActive(wallet)) {
+      throw new InvalidOperationError('Cannot adjust inactive wallet');
+    }
+
+    if (wallet.balance + input.amount < 0) {
+      throw new InvalidOperationError('Adjustment would result in negative balance');
+    }
+
+    // Check idempotency
+    const existingTxn = await coverWalletTxns.findByIdempotencyKey(input.idempotencyKey);
+    if (existingTxn) {
+      const existingWallet = await coverWallets.findById(existingTxn.walletId);
+      if (!existingWallet) throw new NotFoundError('Wallet', existingTxn.walletId);
+      return { wallet: existingWallet, txn: existingTxn };
+    }
+
+    const result = await coverWallets.adjust(
+      wallet.id,
+      input.amount,
+      input.idempotencyKey,
+      actor.userId,
+      input.description,
+    );
+
+    await adminAudit.write(
+      auditRecord(
+        actor,
+        'cover_wallet.adjust',
+        'cover_wallet',
+        input.walletId,
+        wallet,
+        result.wallet,
+      ),
+    );
+
+    return result;
+  }
+
+  async function terminateWallet(
+    walletId: EntityId,
+    reason: string,
+    actor: ActorContext,
+  ): Promise<CoverWallet> {
+    const wallet = await coverWallets.findById(walletId);
+    if (!wallet) throw new NotFoundError('Wallet', walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    if (isWalletTerminated(wallet)) {
+      throw new InvalidOperationError('Wallet already terminated');
+    }
+
+    const terminated = await coverWallets.terminate(walletId, reason);
+    if (!terminated) throw new NotFoundError('Wallet', walletId);
+
+    await adminAudit.write(
+      auditRecord(actor, 'cover_wallet.terminate', 'cover_wallet', walletId, wallet, terminated),
+    );
+
+    return terminated;
+  }
+
+  async function freezeWalletFn(walletId: EntityId, actor: ActorContext): Promise<CoverWallet> {
+    const wallet = await coverWallets.findById(walletId);
+    if (!wallet) throw new NotFoundError('Wallet', walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    // Repository throws InvalidOperationError on an illegal transition (the
+    // FSM guard lives in the domain function, not duplicated here) — e.g.
+    // freezing an already-frozen or terminated wallet.
+    const frozen = await coverWallets.freeze(walletId);
+    if (!frozen) throw new NotFoundError('Wallet', walletId);
+
+    await adminAudit.write(
+      auditRecord(actor, 'cover_wallet.freeze', 'cover_wallet', walletId, wallet, frozen),
+    );
+
+    return frozen;
+  }
+
+  async function unfreezeWalletFn(walletId: EntityId, actor: ActorContext): Promise<CoverWallet> {
+    const wallet = await coverWallets.findById(walletId);
+    if (!wallet) throw new NotFoundError('Wallet', walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    const unfrozen = await coverWallets.unfreeze(walletId);
+    if (!unfrozen) throw new NotFoundError('Wallet', walletId);
+
+    await adminAudit.write(
+      auditRecord(actor, 'cover_wallet.unfreeze', 'cover_wallet', walletId, wallet, unfrozen),
+    );
+
+    return unfrozen;
+  }
+
+  async function closeWallet(walletId: EntityId, actor: ActorContext): Promise<CoverWallet> {
+    const wallet = await coverWallets.findById(walletId);
+    if (!wallet) throw new NotFoundError('Wallet', walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    const closed = await coverWallets.close(walletId);
+    if (!closed) throw new NotFoundError('Wallet', walletId);
+
+    await adminAudit.write(
+      auditRecord(actor, 'cover_wallet.close', 'cover_wallet', walletId, wallet, closed),
+    );
+
+    return closed;
+  }
+
+  async function getTransactions(
+    walletId: EntityId,
+    actor: ActorContext,
+    filters?: TxnFilters,
+  ): Promise<CoverWalletTxn[]> {
+    const wallet = await coverWallets.findById(walletId);
+    if (!wallet) throw new NotFoundError('Wallet', walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    // For simplicity, use findByWallet and filter in memory
+    const allTxns = await coverWalletTxns.findByWallet(walletId, {
+      limit: filters?.limit ?? 100,
+      cursor: filters?.cursor ?? null,
+    });
+    let filtered = allTxns.items;
+
+    if (filters?.type) {
+      filtered = filtered.filter((t) => t.type === filters.type);
+    }
+    if (filters?.status) {
+      filtered = filtered.filter((t) => t.status === filters.status);
+    }
+    if (filters?.referenceId) {
+      filtered = filtered.filter((t) => t.referenceId === filters.referenceId);
+    }
+    if (filters?.referenceType) {
+      filtered = filtered.filter((t) => t.referenceType === filters.referenceType);
+    }
+    if (filters?.deviceId) {
+      filtered = filtered.filter((t) => t.deviceId === filters.deviceId);
+    }
+    if (filters?.from) {
+      const from = filters.from;
+      filtered = filtered.filter((t) => new Date(t.createdAt) >= from);
+    }
+    if (filters?.to) {
+      const to = filters.to;
+      filtered = filtered.filter((t) => new Date(t.createdAt) <= to);
+    }
+
+    return filtered;
+  }
+
+  async function getTransaction(
+    txnId: EntityId,
+    actor: ActorContext,
+  ): Promise<CoverWalletTxn | null> {
+    const txn = await coverWalletTxns.findById(txnId);
+    if (!txn) return null;
+
+    const wallet = await coverWallets.findById(txn.walletId);
+    if (!wallet) return null;
+    requireOrgAccess(actor, wallet.organizationId);
+
+    return txn;
+  }
+
+  async function runReconciliation(
+    input: RunReconciliationInput,
+    actor: ActorContext,
+  ): Promise<CoverWalletReconciliation> {
+    const event = await events.findById(input.eventId);
+    if (!event) throw new NotFoundError('Event', input.eventId);
+    requireOrgAccess(actor, event.organizationId);
+
+    // Check if reconciliation already exists for this date
+    const existing = await coverWalletReconciliations.findByEventAndDate(
+      input.eventId,
+      input.reconciliationDate,
+    );
+    if (existing) {
+      throw new InvalidOperationError('Reconciliation already exists for this date');
+    }
+
+    // Get wallets to reconcile
+    let wallets: CoverWallet[];
+    if (input.walletId) {
+      const wallet = await coverWallets.findById(input.walletId);
+      if (!wallet) throw new NotFoundError('Wallet', input.walletId);
+      // The event's org is checked above, but a caller can pass any
+      // `walletId` — verify the wallet itself is in the actor's org so a
+      // reconciliation cannot read another tenant's balance/txn history.
+      requireOrgAccess(actor, wallet.organizationId);
+      wallets = [wallet];
+    } else if (input.userId) {
+      const wallet = await coverWallets.findByEventAndUser(input.eventId, input.userId);
+      if (!wallet) throw new NotFoundError('Wallet', input.userId);
+      wallets = [wallet];
+    } else {
+      const allWallets = await coverWallets.findByEvent(input.eventId, {
+        limit: 1000,
+        cursor: null,
+      });
+      wallets = allWallets.items;
+    }
+
+    // Compute expected vs actual
+    const discrepancies: CoverWalletReconciliationDiscrepancy[] = [];
+    let totalCredits = 0;
+    let totalDebits = 0;
+    let totalRefunds = 0;
+    let totalTxnCount = 0;
+    let totalExpectedBalance = 0;
+    let totalActualBalance = 0;
+
+    for (const wallet of wallets) {
+      const txns = await coverWalletTxns.findByWallet(wallet.id, { limit: 10000, cursor: null });
+
+      // Start at 0, NOT `wallet.openingBalance`: `createWallet` records the
+      // opening balance as a committed `credit` txn (`wallet-open-<id>`), so
+      // it is already summed in the loop below. Seeding with `openingBalance`
+      // too double-counted it (expected 2×, phantom discrepancy).
+      let expectedBalance = 0;
+      let periodCredits = 0;
+      let periodDebits = 0;
+      let periodRefunds = 0;
+
+      for (const txn of txns.items) {
+        if (txn.status !== 'committed') continue;
+
+        if (txn.type === 'credit') {
+          expectedBalance += txn.amount;
+          periodCredits += txn.amount;
+        } else if (txn.type === 'debit') {
+          expectedBalance -= txn.amount;
+          periodDebits += txn.amount;
+        } else if (txn.type === 'refund') {
+          expectedBalance += txn.amount;
+          periodRefunds += txn.amount;
+        }
+        totalTxnCount++;
+      }
+
+      const actualBalance = wallet.balance;
+      const discrepancy = actualBalance - expectedBalance;
+
+      if (discrepancy !== 0) {
+        discrepancies.push({
+          type: 'balance_mismatch',
+          walletId: wallet.id,
+          userId: wallet.userId,
+          expectedAmount: expectedBalance,
+          actualAmount: actualBalance,
+          transactionId: null,
+          description: `Balance mismatch: expected ${expectedBalance}, actual ${actualBalance}`,
+        });
+      }
+
+      totalCredits += periodCredits;
+      totalDebits += periodDebits;
+      totalRefunds += periodRefunds;
+      totalExpectedBalance += expectedBalance;
+      totalActualBalance += actualBalance;
+    }
+
+    const reconInput: CoverWalletReconciliationCreateInput = {
+      eventId: input.eventId,
+      organizationId: actor.organizationId,
+      venueId: event.venueId,
+      reconciliationDate: input.reconciliationDate,
+      walletId: input.walletId ?? null,
+      userId: input.userId ?? null,
+      expectedBalance: totalExpectedBalance,
+      actualBalance: totalActualBalance,
+      periodCredits: totalCredits,
+      periodDebits: totalDebits,
+      periodRefunds: totalRefunds,
+      periodTxnCount: totalTxnCount,
+      discrepancies,
+    };
+
+    const reconciliation = createReconciliation(reconInput);
+    const created = await coverWalletReconciliations.create(reconciliation);
+
+    await adminAudit.write(
+      auditRecord(
+        actor,
+        'cover_wallet.reconcile',
+        'cover_wallet_reconciliation',
+        created.id,
+        undefined,
+        created,
+      ),
+    );
+
+    return created;
+  }
+
+  async function getReconciliation(
+    reconciliationId: EntityId,
+    actor: ActorContext,
+  ): Promise<CoverWalletReconciliation | null> {
+    const recon = await coverWalletReconciliations.findById(reconciliationId);
+    if (!recon) return null;
+    requireOrgAccess(actor, recon.organizationId);
+    return recon;
+  }
+
+  async function listReconciliations(
+    eventId: EntityId,
+    actor: ActorContext,
+    filters?: ReconciliationFilters,
+  ): Promise<CoverWalletReconciliation[]> {
+    const event = await events.findById(eventId);
+    if (!event) throw new NotFoundError('Event', eventId);
+    requireOrgAccess(actor, event.organizationId);
+
+    const allRecons = await coverWalletReconciliations.findByEvent(eventId, {
+      limit: 1000,
+      cursor: null,
+    });
+    let filtered = allRecons.items;
+
+    if (filters?.status) {
+      filtered = filtered.filter((r) => r.status === filters.status);
+    }
+    if (filters?.walletId) {
+      filtered = filtered.filter((r) => r.walletId === filters.walletId);
+    }
+    if (filters?.userId) {
+      filtered = filtered.filter((r) => r.userId === filters.userId);
+    }
+    if (filters?.from) {
+      const from = filters.from;
+      filtered = filtered.filter((r) => new Date(r.createdAt) >= from);
+    }
+    if (filters?.to) {
+      const to = filters.to;
+      filtered = filtered.filter((r) => new Date(r.createdAt) <= to);
+    }
+    if (filters?.hasDiscrepancy) {
+      filtered = filtered.filter((r) => r.discrepancies.length > 0);
+    }
+
+    return filtered;
+  }
+
+  async function resolveReconciliation(
+    reconciliationId: EntityId,
+    notes: string,
+    actor: ActorContext,
+  ): Promise<CoverWalletReconciliation> {
+    const recon = await coverWalletReconciliations.findById(reconciliationId);
+    if (!recon) throw new NotFoundError('Reconciliation', reconciliationId);
+    requireOrgAccess(actor, recon.organizationId);
+
+    if (recon.status === 'resolved') {
+      throw new InvalidOperationError('Reconciliation already resolved');
+    }
+
+    const resolved = await coverWalletReconciliations.resolve(
+      reconciliationId,
+      actor.userId,
+      notes,
+    );
+    if (!resolved) throw new NotFoundError('Reconciliation', reconciliationId);
+
+    await adminAudit.write(
+      auditRecord(
+        actor,
+        'cover_wallet_reconciliation.resolve',
+        'cover_wallet_reconciliation',
+        reconciliationId,
+        recon,
+        resolved,
+      ),
+    );
+
+    return resolved;
+  }
+
+  async function getEventStats(eventId: EntityId, actor: ActorContext): Promise<WalletEventStats> {
+    const event = await events.findById(eventId);
+    if (!event) throw new NotFoundError('Event', eventId);
+    requireOrgAccess(actor, event.organizationId);
+
+    const stats = await coverWallets.getEventStats(eventId);
+    return stats;
+  }
+
+  async function getOrganizationStats(
+    organizationId: EntityId,
+    from: Date,
+    to: Date,
+    actor: ActorContext,
+  ): Promise<WalletOrgStats> {
+    requireOrgAccess(actor, organizationId);
+
+    const [walletStats, reconStats] = await Promise.all([
+      coverWallets.getEventStats(organizationId),
+      coverWalletReconciliations.getOrganizationStats(organizationId, from, to),
+    ]);
+
+    return {
+      totalWallets: walletStats.totalWallets,
+      totalBalance: walletStats.totalBalance,
+      totalCredits: walletStats.totalCredits,
+      totalDebits: walletStats.totalDebits,
+      totalRefunds: walletStats.totalRefunds,
+      totalReconciliations: reconStats.totalReconciliations,
+      completedReconciliations: reconStats.completedCount,
+      discrepancyReconciliations: reconStats.discrepancyCount,
+      totalDiscrepancyAmount: reconStats.totalDiscrepancyAmount,
+    };
+  }
+
+  // ── Scanner-facing: rotating QR + charge by preset item ───────────────────
+
+  /**
+   * A tab's QR rotates on a 30-second window, exactly like a ticket QR, and is
+   * signed with the same key under a different purpose prefix (`wallet:`) so
+   * that a wallet payload can never be presented as a ticket or the reverse.
+   */
+  const WALLET_QR_WINDOW_SEC = 30;
+
+  function walletHmac(message: string): string {
+    return createHmac('sha256', config.magicTicketSecret).update(message).digest('hex');
+  }
+
+  function walletHmacMatches(candidate: string, expected: string): boolean {
+    const a = Buffer.from(candidate, 'utf8');
+    const b = Buffer.from(expected, 'utf8');
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(a, b);
+  }
+
+  async function generateWalletQr(
+    walletId: EntityId,
+    actor: ActorContext,
+  ): Promise<{ qrPayload: string; expiresAt: string; refreshIntervalSec: number }> {
+    const wallet = await coverWallets.findById(walletId);
+    if (!wallet) throw new NotFoundError('Wallet', walletId);
+    // ONLY the guest whose tab this is.
+    //
+    // Venue staff were allowed here at first, for the "guest's phone died"
+    // case. That was wrong: a charge is authorized by the guest presenting
+    // this QR, so staff who can mint it can also charge a tab with nobody
+    // standing there. Anyone else — staff included — gets a 404 rather than a
+    // 403, so the endpoint cannot be used to confirm a wallet id exists
+    // either. A guest with a dead phone is a supervisor-console problem, the
+    // same as refunds and top-ups.
+    if (wallet.userId !== actor.userId) throw new NotFoundError('Wallet', walletId);
+
+    const windowStart = Math.floor(Date.now() / 1000 / WALLET_QR_WINDOW_SEC) * WALLET_QR_WINDOW_SEC;
+    return {
+      qrPayload: `cw:${walletId}:${String(windowStart)}:${walletHmac(`wallet:${walletId}:${String(windowStart)}`)}`,
+      expiresAt: new Date((windowStart + WALLET_QR_WINDOW_SEC) * 1000).toISOString(),
+      refreshIntervalSec: WALLET_QR_WINDOW_SEC,
+    };
+  }
+
+  /**
+   * `cw:<walletId>:<window>:<hmac>`. The `cw:` prefix is what lets the scanner
+   * tell a tab from a ticket before it hits the network, and the signature is
+   * what stops anyone minting one. Accepts the current and previous window
+   * (clock drift); anything older is a replayed screenshot.
+   */
+  function verifyWalletQr(qrPayload: string): EntityId | null {
+    const parts = qrPayload.split(':');
+    if (parts.length !== 4) return null;
+    const [prefix, walletId, windowStr, signature] = parts as [string, string, string, string];
+    if (prefix !== 'cw' || !walletId || !signature) return null;
+    const windowStart = Number.parseInt(windowStr, 10);
+    if (!Number.isFinite(windowStart)) return null;
+
+    const current = walletHmacMatches(
+      signature,
+      walletHmac(`wallet:${walletId}:${String(windowStart)}`),
+    );
+    const previous = walletHmacMatches(
+      signature,
+      walletHmac(`wallet:${walletId}:${String(windowStart - WALLET_QR_WINDOW_SEC)}`),
+    );
+    if (!current && !previous) return null;
+
+    const nowWindow = Math.floor(Date.now() / 1000 / WALLET_QR_WINDOW_SEC) * WALLET_QR_WINDOW_SEC;
+    if (Math.abs(nowWindow - windowStart) > WALLET_QR_WINDOW_SEC * 2) return null;
+    return walletId;
+  }
+
+  async function getChargeView(walletId: EntityId, actor: ActorContext): Promise<WalletChargeView> {
+    const wallet = await coverWallets.findById(walletId);
+    if (!wallet) throw new NotFoundError('Wallet', walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+    return chargeView(wallet);
+  }
+
+  function chargeView(wallet: CoverWallet): WalletChargeView {
+    const holder = (wallet.metadata.guestName ?? wallet.metadata.holderName) as string | undefined;
+    return {
+      walletId: wallet.id,
+      eventId: wallet.eventId,
+      // First name only: enough to greet a guest, not enough to identify them
+      // to whoever is holding the scanner.
+      guestFirstName: (holder ?? 'Guest').trim().split(/\s+/)[0] ?? 'Guest',
+      status: wallet.status,
+      balancePaise: wallet.rules.showBalanceToGuest ? wallet.balance : null,
+      presetItems: wallet.rules.presetItems.filter((item) => item.isAvailable),
+      minChargePaise: wallet.rules.minChargePaise,
+      maxChargePaise: wallet.rules.maxChargePaise,
+    };
+  }
+
+  /**
+   * Charges one preset item against a tab.
+   *
+   * The caller names an item and a quantity; the amount comes from the
+   * venue's own price list. A scanner that could send an amount is a scanner
+   * that could take ₹5,000 for a ₹500 drink, and the guest has no way to
+   * check the screen before it happens.
+   *
+   * Everything below `priceForCharge` — active wallet, sufficient balance,
+   * velocity limit, idempotency — is `debitWallet`'s existing job and is not
+   * reimplemented here.
+   */
+  async function chargePreset(
+    input: ChargePresetInput,
+    actor: ActorContext,
+  ): Promise<{ wallet: CoverWallet; txn: CoverWalletTxn; item: CoverWalletPresetItem }> {
+    const wallet = await coverWallets.findById(input.walletId);
+    if (!wallet) throw new NotFoundError('Wallet', input.walletId);
+    requireOrgAccess(actor, wallet.organizationId);
+
+    const item = findChargeableItem(wallet.rules, input.presetItemId);
+    if (!item) {
+      throw new InvalidOperationError('That item is not available on this tab');
+    }
+    const amount = priceForCharge(wallet.rules, input.presetItemId, input.quantity);
+    if (amount === null) {
+      throw new InvalidOperationError('That charge is outside the limits set for this tab');
+    }
+    // Checked before the debit so the guest is told "not enough left" rather
+    // than watching a charge fail somewhere deeper.
+    if (wallet.balance < amount) {
+      throw new InvalidOperationError('Not enough balance left on this tab');
+    }
+
+    const result = await debitWallet(
+      {
+        walletId: input.walletId,
+        amount,
+        referenceType: 'cover_preset_item',
+        referenceId: item.id,
+        description: `${String(input.quantity)} x ${item.label}`,
+        idempotencyKey: input.idempotencyKey,
+        ...(input.deviceId === undefined ? {} : { deviceId: input.deviceId }),
+      },
+      actor,
+    );
+    return { ...result, item };
+  }
+
+  return {
+    createWallet,
+    getWallet,
+    generateWalletQr,
+    verifyWalletQr,
+    getChargeView,
+    chargePreset,
+    getWalletByEventAndUser,
+    listWallets,
+    creditWallet,
+    debitWallet,
+    refundWallet,
+    adjustWallet,
+    terminateWallet,
+    closeWallet,
+    freezeWallet: freezeWalletFn,
+    unfreezeWallet: unfreezeWalletFn,
+    getTransactions,
+    getTransaction,
+    runReconciliation,
+    getReconciliation,
+    listReconciliations,
+    resolveReconciliation,
+    getEventStats,
+    getOrganizationStats,
+  };
+}
+
+function requireOrgAccess(actor: ActorContext, organizationId: EntityId): void {
+  if (actor.organizationId !== organizationId) {
+    throw new ForbiddenError('Cross-tenant access denied');
+  }
+}
+
+export function createCoverWalletService(deps: CoverWalletServiceDeps): CoverWalletService {
+  return createCoverWalletServiceImpl(deps);
+}

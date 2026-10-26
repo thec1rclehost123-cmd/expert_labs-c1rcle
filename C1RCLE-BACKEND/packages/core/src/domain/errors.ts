@@ -1,0 +1,224 @@
+/**
+ * ─── Typed domain errors ─────────────────────────────────────────────────────
+ * Domain layer throws these; the gateway maps them to HTTP statuses.
+ * No HTTP concepts, no Firestore, no `process.env` in this file.
+ */
+
+/** Base class for all domain errors. */
+export class DomainError extends Error {
+  /** Stable machine-readable code (v2 contract code shape, lowercase). */
+  readonly code: string;
+
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
+export class OrganizationNotFoundError extends DomainError {
+  constructor(organizationId: string) {
+    super(`Organization ${organizationId} not found`, 'organization_not_found');
+  }
+}
+
+export class VenueNotFoundError extends DomainError {
+  constructor(venueId: string) {
+    super(`Venue ${venueId} not found`, 'venue_not_found');
+  }
+}
+
+export class SlotRequestNotFoundError extends DomainError {
+  constructor(slotRequestId: string) {
+    super(`Slot request ${slotRequestId} not found`, 'slot_request_not_found');
+  }
+}
+
+export class EventNotFoundError extends DomainError {
+  constructor(eventId: string) {
+    super(`Event ${eventId} not found`, 'event_not_found');
+  }
+}
+
+export class TicketTierNotFoundError extends DomainError {
+  constructor(tierId: string) {
+    super(`Ticket tier ${tierId} not found`, 'ticket_tier_not_found');
+  }
+}
+
+export class PromoterAssignmentNotFoundError extends DomainError {
+  constructor(assignmentId: string) {
+    super(`Promoter assignment ${assignmentId} not found`, 'promoter_assignment_not_found');
+  }
+}
+
+export class PartnershipNotFoundError extends DomainError {
+  constructor(partnershipId: string) {
+    super(`Partnership ${partnershipId} not found`, 'partnership_not_found');
+  }
+}
+
+export class OnboardingRequestNotFoundError extends DomainError {
+  constructor(requestId: string) {
+    super(`Onboarding request ${requestId} not found`, 'onboarding_request_not_found');
+  }
+}
+
+export class ProposalNotFoundError extends DomainError {
+  constructor(proposalId: string) {
+    super(`Proposed action ${proposalId} not found`, 'proposal_not_found');
+  }
+}
+
+export class ForbiddenError extends DomainError {
+  constructor(message = 'Insufficient permissions') {
+    super(message, 'forbidden');
+  }
+}
+
+/**
+ * The presented scanner-session token is valid, but the handset it belongs to
+ * is no longer authorized by the venue (unbound, or never bound).
+ *
+ * Its own type rather than a plain `ForbiddenError` because the two must get
+ * different answers at the edge. A cross-tenant `ForbiddenError` is masked as
+ * a 404 so it cannot confirm that another club's resource exists; this one
+ * must stay a plain 403, because the door staff standing there need to be
+ * told "this phone is no longer authorized" rather than "no such event" —
+ * and there is nothing to hide, since the caller has already proved both
+ * tenant membership and a live session.
+ */
+export class DeviceNotAuthorizedError extends DomainError {
+  constructor(message = 'This device is not authorized to scan for this venue') {
+    super(message, 'device_not_authorized');
+  }
+}
+
+/** No valid session (B10) — distinct from `ForbiddenError` (valid session, wrong scope). */
+export class UnauthorizedError extends DomainError {
+  constructor(message = 'Authentication required') {
+    super(message, 'unauthorized');
+  }
+}
+
+export class VersionConflictError extends DomainError {
+  constructor(expectedVersion: number, currentVersion: number) {
+    super(
+      `Version conflict: expected ${expectedVersion}, current ${currentVersion}`,
+      'version_conflict',
+    );
+    this.expectedVersion = expectedVersion;
+    this.currentVersion = currentVersion;
+  }
+  readonly expectedVersion: number;
+  readonly currentVersion: number;
+}
+
+export class StateTransitionError extends DomainError {
+  constructor(from: string, to: string, reason?: string) {
+    super(
+      `Illegal state transition ${from} -> ${to}${reason ? `: ${reason}` : ''}`,
+      'state_transition',
+    );
+    this.from = from;
+    this.to = to;
+  }
+  readonly from: string;
+  readonly to: string;
+}
+
+/**
+ * A payment was captured but cannot be honoured (the reservation lapsed and the
+ * seats are gone), so it was refunded in full. Distinct from a generic refusal
+ * so callers can tell a buyer "you have been refunded" instead of "try again".
+ */
+export class PaymentRefundedError extends DomainError {
+  constructor(message: string) {
+    super(message, 'payment_refunded');
+  }
+}
+
+export class InvalidOperationError extends DomainError {
+  constructor(message: string) {
+    super(message, 'invalid_operation');
+  }
+}
+
+/**
+ * The request conflicts with current state (e.g. an RSVP already exists for
+ * this user+event). Maps to HTTP 409 with code `conflict` — distinct from
+ * `VersionConflictError` (optimistic-locking) and `IdempotencyConflictError`
+ * (key reuse): this is a business-rule duplicate, not a concurrency accident.
+ */
+export class ConflictError extends DomainError {
+  constructor(message: string) {
+    super(message, 'conflict');
+  }
+}
+
+/**
+ * A capability this deployment has not been configured for (e.g. payments with
+ * no Razorpay credentials). Fails closed — the caller gets HTTP 503 rather than
+ * the operation running against placeholder credentials.
+ */
+export class ServiceUnavailableError extends DomainError {
+  constructor(message: string) {
+    super(message, 'service_unavailable');
+  }
+}
+
+/**
+ * The payment provider returned an authoritative rejection before accepting
+ * the operation. This is deliberately distinct from a transport error: only
+ * this outcome permits a caller to release money or entitlement locks.
+ */
+export class DefiniteProviderFailureError extends DomainError {
+  constructor(message = 'Payment provider definitively rejected the operation') {
+    super(message, 'provider_rejected');
+  }
+}
+
+export class IdempotencyConflictError extends DomainError {
+  constructor(idempotencyKey: string) {
+    super(
+      `Idempotency-Key ${idempotencyKey} was already used with a different request`,
+      'idempotency_conflict',
+    );
+  }
+}
+
+export class IdempotencyInFlightError extends DomainError {
+  constructor(idempotencyKey: string) {
+    super(
+      `Request with Idempotency-Key ${idempotencyKey} is already in flight`,
+      'idempotency_in_flight',
+    );
+  }
+}
+
+/**
+ * A previous attempt with this key already ran and errored at an unknown
+ * point — it may have persisted the record before failing (outbox / emit /
+ * response-validation), so a retry must NOT re-run it. The client inspects the
+ * outcome instead of blindly retrying with the same key.
+ */
+export class IdempotencyFailedError extends DomainError {
+  constructor(idempotencyKey: string) {
+    super(
+      `A previous attempt with Idempotency-Key ${idempotencyKey} failed partway; re-running it could duplicate the write. Inspect the original response instead of retrying with the same key.`,
+      'idempotency_failed',
+    );
+  }
+}
+
+export class NotFoundError extends DomainError {
+  constructor(resource: string, id: string) {
+    super(`${resource} ${id} not found`, 'not_found');
+  }
+}
+
+export class NotificationNotFoundError extends DomainError {
+  constructor(notificationId: string) {
+    super(`Notification ${notificationId} not found`, 'notification_not_found');
+  }
+}

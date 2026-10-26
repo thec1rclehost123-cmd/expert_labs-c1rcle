@@ -1,0 +1,839 @@
+import { createHmac } from 'node:crypto';
+
+import { MemoryPaymentProvider } from '@c1rcle/core/domain';
+import { describe, expect, it } from 'vitest';
+
+import { createV2Services } from '../../../lib/v2-services.js';
+import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
+import { publishEventForTest } from '../../../test-utils/publish-event.js';
+import partnerEventCatalogRoutes from '../partner/event-catalog.js';
+import partnerEventRoutes from '../partner/events.js';
+import partnerOrganizationRoutes from '../partner/organizations.js';
+import partnerPartnershipRoutes from '../partner/partnerships.js';
+import partnerVenueRoutes from '../partner/venues.js';
+
+import checkoutRoutes from './checkout-routes.js';
+import paymentRoutes from './payment-routes.js';
+import webhookRoutes from './webhook-routes.js';
+
+/**
+ * ─── Razorpay webhook (Phase 4 PR2, the security-critical route, D-022) ────
+ * `RAZORPAY_WEBHOOK_SECRET` is fixed to `'test_webhook_secret'` for this
+ * suite (`vitest.config.mjs`), matching `MemoryPaymentProvider`'s default —
+ * the webhook route's own HMAC is over the *raw request body bytes*, a
+ * different scheme from `MemoryPaymentProvider.generateSignature`'s
+ * canonical-string scheme used by `/payments/:id/verify` (see that route's
+ * doc comment): two independent signature checks, one per confirmation path.
+ */
+const WEBHOOK_SECRET = 'test_webhook_secret';
+
+/** A signature that differs from `valid` in its first character, whatever that is. */
+function corrupt(valid: string): string {
+  return (valid.startsWith('0') ? '1' : '0') + valid.slice(1);
+}
+
+function sign(rawBody: string): string {
+  return createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('hex');
+}
+
+let keySeq = 0;
+const buildServer = () =>
+  buildPartnerTestServer({
+    routes: [
+      partnerOrganizationRoutes,
+      partnerVenueRoutes,
+      partnerEventRoutes,
+      partnerEventCatalogRoutes,
+      partnerPartnershipRoutes,
+      checkoutRoutes,
+      paymentRoutes,
+      webhookRoutes,
+    ],
+  });
+
+type Server = Awaited<ReturnType<typeof buildServer>>;
+
+const write = (org: string) => ({
+  'x-organization-id': org,
+  'idempotency-key': `catalog-key-${++keySeq}`,
+});
+
+async function seedHold(server: Server): Promise<{ holdId: string; grandTotalPaise: number }> {
+  const created = await server.inject({
+    method: 'POST',
+    url: '/organizations',
+    headers: { 'x-organization-id': 'org_seed', 'idempotency-key': `seed-${++keySeq}` },
+    payload: { name: 'Skyline', slug: `skyline-${keySeq}` },
+  });
+  const org: string = created.json().id;
+  const venue = await server.inject({
+    method: 'POST',
+    url: `/organizations/${org}/venues`,
+    headers: write(org),
+    payload: { name: 'Sky Bar', slug: `sky-bar-${keySeq}` },
+  });
+  const venueId: string = venue.json().id;
+  const event = await server.inject({
+    method: 'POST',
+    url: `/organizations/${org}/events`,
+    headers: write(org),
+    payload: { title: 'Sky Night', venueId, startAt: '2026-09-01T18:00:00Z' },
+  });
+  const eventId: string = event.json().id;
+  await publishEventForTest(eventId);
+  const tier = await server.inject({
+    method: 'POST',
+    url: `/events/${eventId}/ticket-tiers`,
+    headers: write(org),
+    payload: { name: 'General', priceInPaise: 150_000, quantity: 100 },
+  });
+  const tierId: string = tier.json().id;
+  const hold = await server.inject({
+    method: 'POST',
+    url: '/checkout/holds',
+    headers: { 'idempotency-key': `hold-${++keySeq}` },
+    payload: { eventId, lines: [{ tierId, quantity: 1 }] },
+  });
+  return { holdId: hold.json().holdId, grandTotalPaise: hold.json().pricing.grandTotalPaise };
+}
+
+async function createPaymentIntent(server: Server, holdId: string): Promise<string> {
+  const attempt = await server.inject({
+    method: 'POST',
+    url: '/payments/attempts',
+    headers: { 'idempotency-key': `attempt-${++keySeq}` },
+    payload: { holdId },
+  });
+  return attempt.json().paymentIntentId as string;
+}
+
+/**
+ * Creates a hold for an event at a venue owned by a DIFFERENT org (venue-owner),
+ * with an active partnership carrying a `venueShareRate` between the host org
+ * and the venue-owner org. Returns the venue-owner's org id so the test can
+ * assert the ledger entry credits the right tenant.
+ */
+async function seedHoldWithPartnership(
+  server: Server,
+  venueShareRate: number,
+): Promise<{ holdId: string; grandTotalPaise: number; venueOwnerOrgId: string }> {
+  // Host org
+  const hostCreated = await server.inject({
+    method: 'POST',
+    url: '/organizations',
+    headers: { 'x-organization-id': 'org_partner_host', 'idempotency-key': `seed-${++keySeq}` },
+    payload: { name: 'Skyline', slug: `skyline-p-${keySeq}` },
+  });
+  const hostOrg: string = hostCreated.json().id;
+
+  // Venue-owner org
+  const venueOwnerCreated = await server.inject({
+    method: 'POST',
+    url: '/organizations',
+    headers: { 'x-organization-id': 'org_partner_venue', 'idempotency-key': `seed-${++keySeq}` },
+    payload: { name: 'Venue Co', slug: `venue-co-${keySeq}` },
+  });
+  const venueOwnerOrg: string = venueOwnerCreated.json().id;
+
+  // Venue owned by the venue-owner org
+  const venueCreated = await server.inject({
+    method: 'POST',
+    url: `/organizations/${venueOwnerOrg}/venues`,
+    headers: { ...write(venueOwnerOrg), 'idempotency-key': `seed-${++keySeq}` },
+    payload: { name: 'Sky Bar', slug: `sky-bar-partner-${keySeq}` },
+  });
+  const venueId: string = venueCreated.json().id;
+
+  // Partnership: host→venue-owner, with negotiated rate, approved immediately
+  const partnershipRequested = await server.inject({
+    method: 'POST',
+    url: '/partnerships',
+    headers: { ...write(hostOrg), 'idempotency-key': `seed-${++keySeq}` },
+    payload: { venueId, initiatedBy: 'host', venueShareRate },
+  });
+  const partnershipId: string = partnershipRequested.json().id;
+
+  const partnershipApproved = await server.inject({
+    method: 'POST',
+    url: `/partnerships/${partnershipId}/approve`,
+    headers: { ...write(venueOwnerOrg), 'idempotency-key': `seed-${++keySeq}` },
+    payload: {},
+  });
+  expect(partnershipApproved.statusCode).toBe(200);
+
+  // Event under host org at the venue owned by venue-owner org
+  const event = await server.inject({
+    method: 'POST',
+    url: `/organizations/${hostOrg}/events`,
+    headers: { ...write(hostOrg), 'idempotency-key': `seed-${++keySeq}` },
+    payload: { title: 'Sky Night', venueId, startAt: '2026-09-01T18:00:00Z' },
+  });
+  const eventId: string = event.json().id;
+  await publishEventForTest(eventId);
+
+  const tier = await server.inject({
+    method: 'POST',
+    url: `/events/${eventId}/ticket-tiers`,
+    headers: { ...write(hostOrg), 'idempotency-key': `seed-${++keySeq}` },
+    payload: { name: 'General', priceInPaise: 150_000, quantity: 100 },
+  });
+  const tierId: string = tier.json().id;
+
+  const hold = await server.inject({
+    method: 'POST',
+    url: '/checkout/holds',
+    headers: { 'idempotency-key': `hold-${++keySeq}` },
+    payload: { eventId, lines: [{ tierId, quantity: 1 }] },
+  });
+
+  return {
+    holdId: hold.json().holdId,
+    grandTotalPaise: hold.json().pricing.grandTotalPaise,
+    venueOwnerOrgId: venueOwnerOrg,
+  };
+}
+
+function webhookPayload(entity: {
+  id: string;
+  order_id: string;
+  holdId?: string;
+  event?: string;
+}): string {
+  return JSON.stringify({
+    event: entity.event ?? 'payment.captured',
+    payload: {
+      payment: {
+        entity: {
+          id: entity.id,
+          order_id: entity.order_id,
+          notes: entity.holdId ? { holdId: entity.holdId } : {},
+        },
+      },
+    },
+  });
+}
+
+function memoryProvider(): MemoryPaymentProvider {
+  const provider = createV2Services().paymentProvider;
+  if (!(provider instanceof MemoryPaymentProvider)) {
+    throw new Error('expected the memory payment provider under STORAGE_DRIVER=memory');
+  }
+  return provider;
+}
+
+describe('POST /webhooks/payments/razorpay', () => {
+  it('missing signature header -> 400', async () => {
+    const server = await buildServer();
+    const response = await server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json' },
+      payload: webhookPayload({ id: 'pay_no_sig', order_id: 'order_x' }),
+    });
+    expect(response.statusCode).toBe(400);
+    await server.close();
+  });
+
+  it('tampered signature -> 400, nothing is fulfilled', async () => {
+    const server = await buildServer();
+    const { holdId, grandTotalPaise } = await seedHold(server);
+    const paymentIntentId = await createPaymentIntent(server, holdId);
+    const paymentId = 'pay_tampered';
+    memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    const body = webhookPayload({ id: paymentId, order_id: paymentIntentId, holdId });
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: {
+        'content-type': 'application/json',
+        // Always change the first hex character. (Replacing it with a fixed letter
+        // leaves the signature intact one time in sixteen.)
+        'x-razorpay-signature': corrupt(sign(body)),
+      },
+      payload: body,
+    });
+
+    expect(response.statusCode).toBe(400);
+    await server.close();
+  });
+
+  it('valid signature + payment.captured -> fulfils the order exactly once', async () => {
+    const server = await buildServer();
+    const { holdId, grandTotalPaise } = await seedHold(server);
+    const paymentIntentId = await createPaymentIntent(server, holdId);
+    const paymentId = 'pay_captured_1';
+    memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    const body = webhookPayload({ id: paymentId, order_id: paymentIntentId, holdId });
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ received: true });
+    await server.close();
+  });
+
+  it('an event type other than payment.captured is acknowledged but never fulfils anything', async () => {
+    const server = await buildServer();
+    const { holdId, grandTotalPaise } = await seedHold(server);
+    const paymentIntentId = await createPaymentIntent(server, holdId);
+    const paymentId = 'pay_authorized_only';
+    memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    const body = webhookPayload({
+      id: paymentId,
+      order_id: paymentIntentId,
+      holdId,
+      event: 'payment.authorized',
+    });
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+
+    expect(response.statusCode).toBe(200);
+    // The hold must still be reachable as `active` — a payments/attempts
+    // idempotency replay would prove the hold was never converted.
+    const holdStillActive = await server.inject({
+      method: 'POST',
+      url: '/payments/attempts',
+      headers: { 'idempotency-key': `attempt-${++keySeq}` },
+      payload: { holdId },
+    });
+    expect(holdStillActive.statusCode).toBe(201);
+    await server.close();
+  });
+
+  it('payment.captured with no hold/order correlation in notes is acknowledged, never fulfilled', async () => {
+    const server = await buildServer();
+    const body = webhookPayload({ id: 'pay_no_notes', order_id: 'order_x' });
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+
+    // 200, not 400: a retry cannot add the missing notes, and non-2xx answers
+    // make Razorpay retry for a day and eventually disable the webhook.
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ received: true });
+    await server.close();
+  });
+
+  it('dual confirmation: webhook and client-redirect racing the same payment converge on one order', async () => {
+    const server = await buildServer();
+    const { holdId, grandTotalPaise } = await seedHold(server);
+    const paymentIntentId = await createPaymentIntent(server, holdId);
+    const paymentId = 'pay_dual_confirm';
+    const provider = memoryProvider();
+    provider.simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    const body = webhookPayload({ id: paymentId, order_id: paymentIntentId, holdId });
+
+    const webhookCall = server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+    const redirectSignature = provider.generateSignature({ paymentId, orderId: paymentIntentId });
+    const redirectCall = server.inject({
+      method: 'POST',
+      url: `/payments/${paymentId}/verify`,
+      payload: { holdId, paymentIntentId, signature: redirectSignature },
+    });
+
+    const [webhookResponse, redirectResponse] = await Promise.all([webhookCall, redirectCall]);
+    expect(webhookResponse.statusCode).toBe(200);
+    expect(redirectResponse.statusCode).toBe(200);
+
+    // Whichever path lost the race converged on the winner's order — assert
+    // via the redirect path's own idempotent re-check, not a second write.
+    const recheck = await server.inject({
+      method: 'POST',
+      url: `/payments/${paymentId}/verify`,
+      payload: { holdId, paymentIntentId, signature: redirectSignature },
+    });
+    expect(recheck.statusCode).toBe(200);
+    expect(recheck.json().order.id).toBe(redirectResponse.json().order.id);
+    expect(recheck.json().order.version).toBe(1);
+    await server.close();
+  });
+
+  it('records the settlement ledger split exactly once (Phase 6 checkout-webhook integration)', async () => {
+    const server = await buildServer();
+    const { holdId, grandTotalPaise } = await seedHold(server);
+    const paymentIntentId = await createPaymentIntent(server, holdId);
+    const paymentId = 'pay_ledger_1';
+    memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    const body = webhookPayload({ id: paymentId, order_id: paymentIntentId, holdId });
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+    expect(response.statusCode).toBe(200);
+
+    const orderId = `ORD-${paymentId}`;
+    const repositories = createV2Services().repos();
+    const order = await repositories.orders.getById(orderId);
+    const netTicketRevenuePaise = order?.discountedSubtotalPaise ?? 0;
+    const entries = await repositories.ledger.findByOrder(orderId);
+    // No venue partnership (venue created directly under the host org via
+    // seedHold, so the host<->venue Partnership lookup finds nothing and
+    // settlement falls back to host-only), no promoter attribution -> the 4
+    // unconditional legs finance-service always writes: ticket_revenue
+    // (settled), platform_fee, venue_share (0 — no configured rate yet),
+    // host_payout.
+    expect(entries.map((e) => e.entryType).sort()).toEqual(
+      ['host_payout', 'platform_fee', 'ticket_revenue', 'venue_share'].sort(),
+    );
+    const revenue = entries.find((e) => e.entryType === 'ticket_revenue');
+    expect(revenue?.amount).toBe(netTicketRevenuePaise);
+    expect(revenue?.status).toBe('settled');
+    // basic-tier platform fee (15%) is the documented fallback when no
+    // approved onboarding request is on file for the host org.
+    const platformFee = entries.find((e) => e.entryType === 'platform_fee');
+    expect(platformFee?.amount).toBe(Math.round(netTicketRevenuePaise * 0.15));
+    const venueShare = entries.find((e) => e.entryType === 'venue_share');
+    expect(venueShare?.amount).toBe(0);
+
+    // A second delivery of the same event (Razorpay retry semantics) must
+    // not double the ledger — confirmPayment's own orderId idempotency
+    // means recordSettlement is only ever reached on the winning call, and
+    // recordTicketSale itself dedups by orderId as a second guard.
+    const retry = await server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+    expect(retry.statusCode).toBe(200);
+    const entriesAfterRetry = await createV2Services().repos().ledger.findByOrder(orderId);
+    expect(entriesAfterRetry).toHaveLength(entries.length);
+
+    await server.close();
+  });
+
+  it('settlement splits a negotiated venue share to the venue-owner org (Phase 6 + venueShareRate)', async () => {
+    const server = await buildServer();
+    const { holdId, grandTotalPaise, venueOwnerOrgId } = await seedHoldWithPartnership(server, 20);
+    const paymentIntentId = await createPaymentIntent(server, holdId);
+    const paymentId = 'pay_venue_share_1';
+    memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    const body = webhookPayload({ id: paymentId, order_id: paymentIntentId, holdId });
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+    expect(response.statusCode).toBe(200);
+
+    const orderId = `ORD-${paymentId}`;
+    const repositories = createV2Services().repos();
+    const order = await repositories.orders.getById(orderId);
+    const netTicketRevenuePaise = order?.discountedSubtotalPaise ?? 0;
+    const entries = await repositories.ledger.findByOrder(orderId);
+
+    // A partnership with venueShareRate=20 exists → venue_share is non-zero
+    // and credited to the venue-owner org, not the host org.
+    const venueShare = entries.find((e) => e.entryType === 'venue_share');
+    expect(venueShare?.amount).toBe(Math.round(netTicketRevenuePaise * 0.2));
+    expect(venueShare?.organizationId).toBe(venueOwnerOrgId);
+    expect(venueShare?.status).toBe('pending');
+
+    const platformFee = entries.find((e) => e.entryType === 'platform_fee');
+    expect(platformFee?.amount).toBe(Math.round(netTicketRevenuePaise * 0.15));
+
+    // Split legs sum to discounted ticket face value. Guest fees and GST are
+    // explicit journal components, never partner-distributable revenue.
+    const splitEntries = entries.filter((e) => e.entryType !== 'ticket_revenue');
+    const splitSum = splitEntries.reduce((sum, e) => sum + e.amount, 0);
+    expect(splitSum).toBe(netTicketRevenuePaise);
+
+    await server.close();
+  });
+});
+
+describe('POST /webhooks/payments/razorpay — provider reconciliation', () => {
+  const post = (server: Server, body: string, eventId?: string) =>
+    server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': sign(body),
+        ...(eventId ? { 'x-razorpay-event-id': eventId } : {}),
+      },
+      payload: body,
+    });
+
+  const captureBody = (args: {
+    id: string;
+    order_id: string;
+    holdId: string;
+    amount: number;
+    fee?: number;
+    tax?: number;
+  }) =>
+    JSON.stringify({
+      event: 'payment.captured',
+      payload: {
+        payment: {
+          entity: {
+            id: args.id,
+            order_id: args.order_id,
+            amount: args.amount,
+            currency: 'INR',
+            fee: args.fee ?? 0,
+            tax: args.tax ?? 0,
+            notes: { holdId: args.holdId },
+          },
+        },
+      },
+    });
+
+  async function fulfilledPayment(server: Server, paymentId: string, fee = 2_360, tax = 425) {
+    const { holdId, grandTotalPaise } = await seedHold(server);
+    const paymentIntentId = await createPaymentIntent(server, holdId);
+    memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    const response = await post(
+      server,
+      captureBody({
+        id: paymentId,
+        order_id: paymentIntentId,
+        holdId,
+        amount: grandTotalPaise,
+        fee,
+        tax,
+      }),
+    );
+    expect(response.statusCode).toBe(200);
+    return { orderId: `ORD-${paymentId}`, grandTotalPaise };
+  }
+
+  it('records the provider’s fee and tax on a fulfilled capture and ties it to our order', async () => {
+    const server = await buildServer();
+    const { orderId, grandTotalPaise } = await fulfilledPayment(server, 'pay_recon_1');
+
+    const stored = await createV2Services().repos().providerPayments.findByPaymentId('pay_recon_1');
+    expect(stored).toMatchObject({
+      orderId,
+      capturedPaise: grandTotalPaise,
+      feePaise: 2_360,
+      taxOnFeePaise: 425,
+    });
+    await server.close();
+  });
+
+  it('reconciles a fulfilled order against the provider’s record', async () => {
+    const server = await buildServer();
+    const { orderId, grandTotalPaise } = await fulfilledPayment(server, 'pay_recon_2');
+
+    const result = await createV2Services().providerPayments.reconcileOrder(orderId);
+
+    expect(result).toMatchObject({
+      reconciled: true,
+      providerNetPaise: grandTotalPaise - 2_360 - 425,
+    });
+    await server.close();
+  });
+
+  it('records a refund the provider processed, and reconciliation then flags the difference', async () => {
+    const server = await buildServer();
+    const { orderId } = await fulfilledPayment(server, 'pay_recon_3');
+    const refund = JSON.stringify({
+      event: 'refund.processed',
+      payload: { refund: { entity: { id: 'rfnd_1', payment_id: 'pay_recon_3', amount: 5_000 } } },
+    });
+
+    expect((await post(server, refund)).statusCode).toBe(200);
+    expect((await post(server, refund)).statusCode).toBe(200); // Razorpay retries
+
+    const result = await createV2Services().providerPayments.reconcileOrder(orderId);
+    expect(result.reconciled).toBe(false);
+    expect(result.findings).toContainEqual({
+      kind: 'refund_mismatch',
+      ourPaise: 0,
+      providerPaise: 5_000,
+    });
+    const stored = await createV2Services().repos().providerPayments.findByPaymentId('pay_recon_3');
+    expect(stored?.refunds).toEqual({ rfnd_1: 5_000 });
+    await server.close();
+  });
+
+  it('deduplicates by Razorpay event id and persists only minimized facts plus the payload hash', async () => {
+    const server = await buildServer();
+    await fulfilledPayment(server, 'pay_event_dedupe');
+    const refund = JSON.stringify({
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: 'rfnd_event_dedupe',
+            payment_id: 'pay_event_dedupe',
+            amount: 5_000,
+            email: 'payer@example.invalid',
+            contact: '+919999999999',
+          },
+        },
+      },
+    });
+
+    expect((await post(server, refund, 'event_razorpay_1')).statusCode).toBe(200);
+    expect((await post(server, refund, 'event_razorpay_1')).statusCode).toBe(200);
+
+    const events = await createV2Services()
+      .repos()
+      .providerFinancialEvents.listByPaymentId('pay_event_dedupe');
+    const stored = events.filter((event) => event.providerEventId === 'event_razorpay_1');
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.payloadHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(stored[0])).not.toContain('payer@example.invalid');
+    expect(JSON.stringify(stored[0])).not.toContain('+919999999999');
+    await server.close();
+  });
+
+  it('follows a dispute from opened to lost, and subtracts only the lost amount from the net', async () => {
+    const server = await buildServer();
+    const { orderId, grandTotalPaise } = await fulfilledPayment(server, 'pay_recon_4');
+    const dispute = (event: string) =>
+      JSON.stringify({
+        event,
+        payload: {
+          dispute: { entity: { id: 'disp_1', payment_id: 'pay_recon_4', amount: 9_000 } },
+        },
+      });
+
+    await post(server, dispute('payment.dispute.created'));
+    const open = await createV2Services().providerPayments.reconcileOrder(orderId);
+    expect(open.findings).toContainEqual({ kind: 'open_dispute' });
+    expect(open.providerNetPaise).toBe(grandTotalPaise - 2_360 - 425);
+
+    await post(server, dispute('payment.dispute.lost'));
+    await post(server, dispute('payment.dispute.created')); // a late, out-of-order delivery
+    const lost = await createV2Services().providerPayments.reconcileOrder(orderId);
+    expect(lost.findings).not.toContainEqual({ kind: 'open_dispute' });
+    expect(lost.providerNetPaise).toBe(grandTotalPaise - 2_360 - 425 - 9_000);
+    await server.close();
+  });
+
+  it('still records a capture it cannot tie to a hold, with no order', async () => {
+    const server = await buildServer();
+    const body = JSON.stringify({
+      event: 'payment.captured',
+      payload: {
+        payment: {
+          entity: {
+            id: 'pay_orphan',
+            order_id: 'order_x',
+            amount: 10_000,
+            currency: 'INR',
+            fee: 320,
+            tax: 58,
+            notes: [],
+          },
+        },
+      },
+    });
+
+    expect((await post(server, body)).statusCode).toBe(200);
+
+    const stored = await createV2Services().repos().providerPayments.findByPaymentId('pay_orphan');
+    expect(stored).toMatchObject({
+      orderId: null,
+      capturedPaise: 10_000,
+      feePaise: 320,
+      processingState: 'requires_support',
+    });
+    await server.close();
+  });
+
+  it('does not record anything for an unsigned or tampered call', async () => {
+    const server = await buildServer();
+    const body = JSON.stringify({
+      event: 'refund.processed',
+      payload: { refund: { entity: { id: 'rfnd_x', payment_id: 'pay_forged', amount: 1 } } },
+    });
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': 'not-a-signature' },
+      payload: body,
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(
+      await createV2Services().repos().providerPayments.findByPaymentId('pay_forged'),
+    ).toBeNull();
+    await server.close();
+  });
+});
+
+describe('fulfilment repair (a paid order whose fulfilment stalled part-way)', () => {
+  const post = (server: Server, body: string) =>
+    server.inject({
+      method: 'POST',
+      url: '/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+
+  /** A fully fulfilled order, plus handles to damage it the way a crash would. */
+  async function fulfilledOrder(paymentId: string) {
+    const server = await buildServer();
+    const { holdId, grandTotalPaise } = await seedHold(server);
+    const paymentIntentId = await createPaymentIntent(server, holdId);
+    memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    const response = await post(
+      server,
+      webhookPayload({ id: paymentId, order_id: paymentIntentId, holdId }),
+    );
+    expect(response.statusCode).toBe(200);
+    const orderId = `ORD-${paymentId}`;
+    const repos = createV2Services().repos();
+
+    return {
+      server,
+      orderId,
+      holdId,
+      /** The crash: tickets, the ledger entries and the hold conversion never landed. */
+      stallFulfilment: async (steps: ('tickets' | 'ledger' | 'hold')[]) => {
+        if (steps.includes('tickets')) {
+          for (const [id, e] of (
+            repos.entitlements as unknown as { entitlements: Map<string, { orderId: string }> }
+          ).entitlements) {
+            if (e.orderId === orderId) {
+              (
+                repos.entitlements as unknown as { entitlements: Map<string, unknown> }
+              ).entitlements.delete(id);
+            }
+          }
+        }
+        if (steps.includes('ledger')) {
+          const ledger = repos.ledger as unknown as {
+            entries: Map<string, { orderId: string; idempotencyKey: string }>;
+            byIdempotencyKey: Map<string, string>;
+          };
+          for (const [id, entry] of ledger.entries) {
+            if (entry.orderId === orderId) {
+              ledger.entries.delete(id);
+              ledger.byIdempotencyKey.delete(entry.idempotencyKey);
+            }
+          }
+        }
+        if (steps.includes('hold')) {
+          const holds = (
+            repos.cartReservations as unknown as {
+              reservations: Map<string, Record<string, unknown>>;
+            }
+          ).reservations;
+          const hold = holds.get(holdId);
+          if (hold) holds.set(holdId, { ...hold, status: 'active', convertedOrderId: null });
+        }
+      },
+    };
+  }
+
+  const sweepAll = (dryRun: boolean) =>
+    createV2Services().fulfilmentRepair.sweep({
+      settleMs: 0,
+      lookbackMs: 365 * 24 * 3600 * 1000,
+      dryRun,
+    });
+
+  it('finds nothing wrong with a normally fulfilled order', async () => {
+    const { server, orderId } = await fulfilledOrder('pay_repair_ok');
+
+    const report = await sweepAll(true);
+
+    expect(report.findings.find((f) => f.orderId === orderId)).toBeUndefined();
+    expect(report.complete).toBeGreaterThanOrEqual(1);
+    await server.close();
+  });
+
+  it('reports what a stalled order is missing without changing anything (dry run)', async () => {
+    const { server, orderId, stallFulfilment } = await fulfilledOrder('pay_repair_dry');
+    await stallFulfilment(['tickets', 'ledger', 'hold']);
+
+    const report = await sweepAll(true);
+
+    const finding = report.findings.find((f) => f.orderId === orderId);
+    expect(finding).toMatchObject({ outcome: 'found' });
+    expect([...(finding?.missing ?? [])].sort()).toEqual(['hold_conversion', 'ledger', 'tickets']);
+    expect(await createV2Services().repos().entitlements.getByOrderId(orderId)).toHaveLength(0);
+    await server.close();
+  });
+
+  it('finishes a stalled order: tickets, ledger and hold conversion are restored', async () => {
+    const { server, orderId, holdId, stallFulfilment } = await fulfilledOrder('pay_repair_fix');
+    await stallFulfilment(['tickets', 'ledger', 'hold']);
+
+    const report = await sweepAll(false);
+
+    expect(report.findings.find((f) => f.orderId === orderId)).toMatchObject({
+      outcome: 'repaired',
+    });
+    const repos = createV2Services().repos();
+    expect((await repos.entitlements.getByOrderId(orderId)).length).toBeGreaterThan(0);
+    expect((await repos.ledger.findByOrder(orderId)).length).toBeGreaterThan(0);
+    expect((await repos.cartReservations.getById(holdId))?.status).toBe('converted');
+    expect((await sweepAll(false)).findings.find((f) => f.orderId === orderId)).toBeUndefined();
+    await server.close();
+  });
+
+  it('repairs each missing step on its own, and never duplicates what is already there', async () => {
+    const { server, orderId, stallFulfilment } = await fulfilledOrder('pay_repair_partial');
+    const repos = createV2Services().repos();
+    const ticketsBefore = (await repos.entitlements.getByOrderId(orderId)).length;
+    const ledgerBefore = (await repos.ledger.findByOrder(orderId)).length;
+    await stallFulfilment(['ledger']);
+
+    const report = await sweepAll(false);
+
+    expect(report.findings.find((f) => f.orderId === orderId)).toMatchObject({
+      outcome: 'repaired',
+      missing: ['ledger'],
+    });
+    expect(await repos.entitlements.getByOrderId(orderId)).toHaveLength(ticketsBefore);
+    expect(await repos.ledger.findByOrder(orderId)).toHaveLength(ledgerBefore);
+    await server.close();
+  });
+
+  it('leaves recent orders alone: they may still be mid-fulfilment', async () => {
+    const { server, orderId, stallFulfilment } = await fulfilledOrder('pay_repair_recent');
+    await stallFulfilment(['tickets']);
+
+    const report = await createV2Services().fulfilmentRepair.sweep({
+      settleMs: 60 * 60 * 1000,
+      lookbackMs: 365 * 24 * 3600 * 1000,
+      dryRun: false,
+    });
+
+    expect(report.findings.find((f) => f.orderId === orderId)).toBeUndefined();
+    expect(await createV2Services().repos().entitlements.getByOrderId(orderId)).toHaveLength(0);
+    await server.close();
+  });
+
+  it('refuses to repair an order that was never paid', async () => {
+    const server = await buildServer();
+
+    await expect(
+      createV2Services().checkout.repairFulfilment('ORD-does-not-exist'),
+    ).rejects.toThrow(/not found/i);
+    await server.close();
+  });
+});

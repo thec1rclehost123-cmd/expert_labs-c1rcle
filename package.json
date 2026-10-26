@@ -1,0 +1,16 @@
+{
+  "name": "c1rcle-platform",
+  "private": true,
+  "description": "C1RCLE umbrella workspace: C1RCLE-FRONTEND (web apps) + C1RCLE-BACKEND (Fastify API gateway). Each is its own pnpm workspace; this root only delegates.",
+  "scripts": {
+    "install:all": "pnpm --dir C1RCLE-BACKEND install && pnpm --dir C1RCLE-FRONTEND install",
+    "dev:backend": "pnpm --dir C1RCLE-BACKEND dev",
+    "dev:frontend": "pnpm --dir C1RCLE-FRONTEND dev",
+    "build": "pnpm --dir C1RCLE-BACKEND build && pnpm --dir C1RCLE-FRONTEND build",
+    "lint": "pnpm --dir C1RCLE-BACKEND lint && pnpm --dir C1RCLE-FRONTEND lint",
+    "typecheck": "pnpm --dir C1RCLE-BACKEND typecheck && pnpm --dir C1RCLE-FRONTEND typecheck",
+    "test": "pnpm --dir C1RCLE-BACKEND test && pnpm --dir C1RCLE-FRONTEND test",
+    "check": "pnpm --dir C1RCLE-BACKEND check && pnpm --dir C1RCLE-FRONTEND check",
+    "format": "pnpm --dir C1RCLE-BACKEND format && pnpm --dir C1RCLE-FRONTEND format"
+  }
+}

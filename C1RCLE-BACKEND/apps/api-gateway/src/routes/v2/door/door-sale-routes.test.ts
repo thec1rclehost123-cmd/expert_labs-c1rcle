@@ -1,0 +1,379 @@
+import { describe, expect, it } from 'vitest';
+
+import type { ActorContext } from '@c1rcle/core/application';
+
+import { createV2Services } from '../../../lib/v2-services.js';
+import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
+
+import phase5DoorSaleRoutes from './door-sale-routes.js';
+
+import type { FastifyInstance, FastifyRequest } from 'fastify';
+
+/**
+ * `buildPartnerTestServer` never registers `plugins/auth.ts` (that plugin is
+ * a no-op on `STORAGE_DRIVER=memory` — see its own header comment), so
+ * nothing populates `request.actor` for these routes the way the real
+ * Better Auth `onRequest` hook would on the firestore driver. This local
+ * stand-in mirrors that hook: derive an actor straight from the test-supplied
+ * `x-organization-id` header, exactly as `plugins/auth.ts` derives it from
+ * the header + session. Local to this test file only — not a shared plugin.
+ */
+async function fakeAuthPlugin(fastify: FastifyInstance) {
+  fastify.addHook('onRequest', async (request: FastifyRequest) => {
+    const organizationId = request.headers['x-organization-id'];
+    if (typeof organizationId === 'string' && organizationId.length > 0) {
+      request.actor = {
+        userId: 'user_1',
+        organizationId,
+        role: 'owner',
+        capabilities: [],
+        platformRole: 'partner',
+      };
+    }
+  });
+}
+
+const buildServer = () =>
+  buildPartnerTestServer({ routes: [fakeAuthPlugin, phase5DoorSaleRoutes] });
+
+const HEADERS = { 'x-organization-id': 'org_1' };
+
+/** Core `ActorContext` has no `platformRole` — that field only exists on the
+ * gateway-level `request.actor` shape (`plugins/auth.ts`'s module
+ * augmentation). `fakeAuthPlugin` below adds it back on top of this. */
+const ACTOR: ActorContext = {
+  userId: 'user_1',
+  organizationId: 'org_1',
+  role: 'owner',
+  capabilities: [],
+};
+
+/** Seeds an event plus a walk-in and a dine-in ticket tier via the same
+ * cached `createV2Services()` singleton the routes read from — no dedicated
+ * Phase 5 route creates tiers, so this goes through `EventCatalogService`
+ * directly, the same repository the door routes are wired to. */
+async function seedEventWithTiers() {
+  const services = createV2Services();
+  const event = await services.events.create(ACTOR, {
+    venueId: 'ven_1',
+    title: 'Door Sale Test Night',
+    startAt: '2026-09-01T18:00:00Z',
+  });
+  const walkInTier = await services.catalog.createTier(ACTOR, {
+    eventId: event.id,
+    name: 'Walk-in',
+    entryType: 'walkin',
+    priceInPaise: 50000,
+    quantity: 100,
+  });
+  const dineInTier = await services.catalog.createTier(ACTOR, {
+    eventId: event.id,
+    name: 'Dine-in',
+    entryType: 'dinein',
+    priceInPaise: 150000,
+    quantity: 100,
+  });
+  return { event, walkInTier, dineInTier };
+}
+
+describe('V2 door sales slice — walk-in / dine-in / sales list', () => {
+  it('creates a walk-in sale priced server-side from the walk-in tier', async () => {
+    const server = await buildServer();
+    const { event, walkInTier } = await seedEventWithTiers();
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/door/walk-in',
+      headers: HEADERS,
+      payload: {
+        eventId: event.id,
+        guestName: 'Ada Lovelace',
+        totalGuests: 2,
+        paymentMode: 'cash',
+        idempotencyKey: 'idem-walkin-1',
+      },
+    });
+
+    expect(response.statusCode).toBe(201);
+    const body = response.json();
+    // Priced from the event's walk-in tier, server-side. The wire contract
+    // carries no price, no tierId and no quantity — there is nothing a client
+    // could send that would change this number.
+    expect(body.amountPaise).toBe(walkInTier.priceInPaise);
+    expect(body).toMatchObject({
+      eventId: event.id,
+      category: 'walkin',
+      guestName: 'Ada Lovelace',
+      totalGuests: 2,
+      paymentMode: 'cash',
+      status: 'active',
+    });
+    expect(typeof body.id).toBe('string');
+    await server.close();
+  });
+
+  it('D2: rejects tierId/quantity/price outright — the contract is strict, pricing stays server-side', async () => {
+    const server = await buildServer();
+    const { event } = await seedEventWithTiers();
+
+    for (const extra of [
+      { tierId: 'tier_walkin' },
+      { quantity: 3 },
+      { priceInPaise: 1 },
+      { tierId: 'tier_walkin', quantity: 2, priceInPaise: 100 },
+    ]) {
+      const response = await server.inject({
+        method: 'POST',
+        url: '/door/walk-in',
+        headers: HEADERS,
+        payload: {
+          eventId: event.id,
+          guestName: 'Ada Lovelace',
+          totalGuests: 1,
+          paymentMode: 'cash',
+          idempotencyKey: `idem-reject-${Math.random().toString(36).slice(2)}`,
+          ...extra,
+        },
+      });
+      expect(response.statusCode).toBe(422);
+      // Explicit rejection at the boundary — no client-selected tier or price
+      // ever reaches DoorService.
+      expect(response.json().fieldErrors).toHaveProperty('_root');
+      (response.json().fieldErrors._root as string[]).forEach((message: string) =>
+        expect(message).toMatch(/unrecognized/i),
+      );
+    }
+    await server.close();
+  });
+
+  it('creates a dine-in sale priced server-side from the dine-in tier', async () => {
+    const server = await buildServer();
+    const { event, dineInTier } = await seedEventWithTiers();
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/door/dine-in',
+      headers: HEADERS,
+      payload: {
+        eventId: event.id,
+        guestName: 'Grace Hopper',
+        totalGuests: 4,
+        tableNumber: 'T-12',
+        paymentMode: 'card',
+        idempotencyKey: 'idem-dinein-1',
+      },
+    });
+
+    expect(response.statusCode).toBe(201);
+    const body = response.json();
+    expect(body.amountPaise).toBe(dineInTier.priceInPaise);
+    expect(body).toMatchObject({
+      eventId: event.id,
+      category: 'dinein',
+      guestName: 'Grace Hopper',
+      totalGuests: 4,
+      paymentMode: 'card',
+      status: 'active',
+    });
+    await server.close();
+  });
+
+  it('lists door sales for an event, filterable by category', async () => {
+    const server = await buildServer();
+    const { event } = await seedEventWithTiers();
+
+    await server.inject({
+      method: 'POST',
+      url: '/door/walk-in',
+      headers: HEADERS,
+      payload: {
+        eventId: event.id,
+        guestName: 'Walk-in Guest',
+        totalGuests: 1,
+        paymentMode: 'cash',
+        idempotencyKey: 'idem-walkin-list-1',
+      },
+    });
+    await server.inject({
+      method: 'POST',
+      url: '/door/dine-in',
+      headers: HEADERS,
+      payload: {
+        eventId: event.id,
+        guestName: 'Dine-in Guest',
+        totalGuests: 2,
+        tableNumber: 'T-1',
+        paymentMode: 'upi',
+        idempotencyKey: 'idem-dinein-list-1',
+      },
+    });
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/door/sales?eventId=${event.id}&category=walkin`,
+      headers: HEADERS,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0]).toMatchObject({ category: 'walkin', guestName: 'Walk-in Guest' });
+    expect(body.pageInfo.total).toBe(1);
+    await server.close();
+  });
+
+  it('returns 404 with V2 shape for a walk-in against an unknown event', async () => {
+    const server = await buildServer();
+    const response = await server.inject({
+      method: 'POST',
+      url: '/door/walk-in',
+      headers: HEADERS,
+      payload: {
+        eventId: 'event_does_not_exist',
+        guestName: 'Nobody',
+        totalGuests: 1,
+        paymentMode: 'cash',
+        idempotencyKey: 'idem-walkin-404',
+      },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ code: 'not_found', status: 404 });
+    await server.close();
+  });
+});
+
+describe('V2 door-sale RBAC', () => {
+  // `actorRole` drives `services.actor`'s memory-driver membership (the same
+  // path the existing role-gate suites use); the fakeAuthPlugin in this file
+  // hardcodes owner, so it is intentionally bypassed here.
+  const buildMemberServer = () =>
+    buildPartnerTestServer({ routes: [phase5DoorSaleRoutes], actorRole: 'member' });
+
+  it('denies a read-only member the walk-in and dine-in routes (403)', async () => {
+    const server = await buildMemberServer();
+    const { event } = await seedEventWithTiers();
+    for (const [url, key] of [
+      ['/door/walk-in', 'idem-rbac-walkin'],
+      ['/door/dine-in', 'idem-rbac-dinein'],
+    ] as const) {
+      const response = await server.inject({
+        method: 'POST',
+        url,
+        headers: HEADERS,
+        payload: {
+          eventId: event.id,
+          guestName: 'Denied Guest',
+          totalGuests: 1,
+          paymentMode: 'cash',
+          idempotencyKey: key,
+        },
+      });
+      expect(response.statusCode).toBe(403);
+      expect(response.json()).toMatchObject({ code: 'forbidden', status: 403 });
+    }
+    await server.close();
+  });
+
+  it('lets a read-only member read the sales list (venue.read)', async () => {
+    const server = await buildMemberServer();
+    const { event } = await seedEventWithTiers();
+    const response = await server.inject({
+      method: 'GET',
+      url: `/door/sales?eventId=${event.id}`,
+      headers: HEADERS,
+    });
+    expect(response.statusCode).toBe(200);
+    await server.close();
+  });
+});
+
+/**
+ * The door form's own rules, enforced server-side. They used to live only in
+ * the app's submit button, which means they did not apply at all to anyone
+ * calling the API directly.
+ */
+describe('door guest validation', () => {
+  async function post(overrides: Record<string, unknown>) {
+    const server = await buildServer();
+    const { event } = await seedEventWithTiers();
+    return server.inject({
+      method: 'POST',
+      url: '/door/walk-in',
+      headers: HEADERS,
+      payload: {
+        eventId: event.id,
+        guestName: 'Ada Lovelace',
+        totalGuests: 1,
+        paymentMode: 'cash',
+        idempotencyKey: `idem-val-${Math.random().toString(36).slice(2)}`,
+        ...overrides,
+      },
+    });
+  }
+
+  it('rejects a phone that is not exactly ten digits', async () => {
+    expect((await post({ guestPhone: '98765' })).statusCode).toBe(422);
+    expect((await post({ guestPhone: '+919876543210' })).statusCode).toBe(422);
+  });
+
+  it('accepts a well-formed ten-digit phone', async () => {
+    expect((await post({ guestPhone: '9876543210' })).statusCode).toBe(201);
+  });
+
+  it('rejects an under-age guest — a licensing problem, not a rounding one', async () => {
+    expect((await post({ guestAge: 17 })).statusCode).toBe(422);
+  });
+
+  it('rejects free-text gender and a malformed email', async () => {
+    expect((await post({ gender: 'whatever' })).statusCode).toBe(422);
+    expect((await post({ guestEmail: 'not-an-email' })).statusCode).toBe(422);
+  });
+
+  it('rejects a client-supplied price — the server owns the amount', async () => {
+    expect((await post({ amountPaise: 1 })).statusCode).toBe(422);
+  });
+});
+
+describe('the walk-in contract carries nothing the server ignores', () => {
+  it('rejects a tierId — choosing a tier is what /door/ticket-sale is for', async () => {
+    const server = await buildServer();
+    const { event, walkInTier } = await seedEventWithTiers();
+    const response = await server.inject({
+      method: 'POST',
+      url: '/door/walk-in',
+      headers: HEADERS,
+      payload: {
+        eventId: event.id,
+        guestName: 'Ada Lovelace',
+        totalGuests: 1,
+        paymentMode: 'cash',
+        idempotencyKey: 'idem-walkin-tier',
+        // Used to be REQUIRED here and silently ignored, so a client sending a
+        // VIP tier was charged the walk-in price. Safe, but it reads like an
+        // exploit to anyone integrating. Now the field does not exist.
+        tierId: walkInTier.id,
+      },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+
+  it('rejects a quantity — totalGuests is the headcount, and it is priced', async () => {
+    const server = await buildServer();
+    const { event } = await seedEventWithTiers();
+    const response = await server.inject({
+      method: 'POST',
+      url: '/door/walk-in',
+      headers: HEADERS,
+      payload: {
+        eventId: event.id,
+        guestName: 'Ada Lovelace',
+        totalGuests: 1,
+        paymentMode: 'cash',
+        idempotencyKey: 'idem-walkin-qty',
+        quantity: 5,
+      },
+    });
+    expect(response.statusCode).toBe(422);
+  });
+});

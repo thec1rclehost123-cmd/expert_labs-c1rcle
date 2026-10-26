@@ -1,0 +1,703 @@
+import { createLogger, type Logger } from '@c1rcle/core';
+import {
+  OrganizationService,
+  VenueService,
+  PartnershipService,
+  PartnerDiscoveryService,
+  PublicService,
+  ReferralLinkService,
+  PromoterConnectionService,
+  VenueCalendarService,
+  VenueSlotRequestService,
+  EventService,
+  EventCatalogService,
+  AnalyticsService,
+  IdempotencyService,
+  OnboardingService,
+  AdminAuthorityService,
+  AdminOperationsService,
+  InProcessEventBus,
+  createAuditConsumer,
+  ANALYTICS_PROJECTION_EVENT_TYPES,
+  createAnalyticsProjectionConsumer,
+  CheckoutService,
+  FulfilmentRepairService,
+  InventoryService,
+  PricingService,
+  OrderService,
+  TicketService,
+  createScannerService,
+  createDoorService,
+  createCoverWalletService,
+  createDoorStatsService,
+  createDoorOpsService,
+  createDoorTicketSaleService,
+  createFinanceService,
+  createPayoutService,
+  AdminPayoutService,
+  createBankAccountService,
+  createDisputeService,
+  AdminDisputeService,
+  ProviderPaymentService,
+  RefundService,
+  ReconciliationService,
+  JournalTransitionService,
+  SupportService,
+  AdminSupportService,
+  createLeaderboardService,
+  createEmailOtpService,
+  createGuestProfileService,
+  SocialService,
+  createFollowerFanOutConsumer,
+  NotificationService,
+  createNotificationConsumer,
+  type ScannerService,
+  type DoorService,
+  type CoverWalletService,
+  type DoorStatsService,
+  type DoorOpsService,
+  type DoorTicketSaleService,
+  type FinanceService,
+  type PayoutService,
+  type BankAccountService,
+  type DisputeService,
+  type LeaderboardService,
+  type EmailOtpService,
+  type GuestProfileService,
+  type ServiceDeps,
+  type ActorContext,
+} from '@c1rcle/core/application';
+import { createCoreConfig } from '@c1rcle/core/config';
+import {
+  EchoObjectStorage,
+  FormatCheckVerificationProvider,
+  CompositeVerificationProvider,
+  MemoryPaymentProvider,
+  MemoryStaffCredentialProvisioner,
+  MemoryStaffRotationStore,
+  MemoryStaffUserDirectory,
+} from '@c1rcle/core/domain';
+import {
+  MemoryOutboxStore,
+  FirestoreOutboxStore,
+  MemoryAuditRepository,
+  MemoryAdminAuditRepository,
+  FirestoreAdminAuditRepository,
+  FirebaseObjectStorage,
+  FirestoreStaffRotationStore,
+  FirestoreUserDirectory,
+  buildRepositories,
+  firestoreClient,
+  storageClient,
+  authClient,
+  buildIdempotencyStore,
+  buildActorContext,
+} from '@c1rcle/core/infrastructure';
+
+import type {
+  AdminAuditRepository,
+  EmailSender,
+  PaymentProvider,
+  StaffRotationStore,
+  StaffUserDirectory,
+  VerificationProvider,
+  UserDirectoryPort,
+} from '@c1rcle/core/domain';
+import type { SocialNotificationRepository } from '@c1rcle/core/domain/ports';
+
+import { getGatewayConfig, GatewayConfigError } from '../config/index.js';
+import { buildBetterAuth, type BetterAuthInstance } from '../plugins/auth.js';
+
+import { BetterAuthStaffCredentialProvisioner } from './auth/staff-credential-provisioner.js';
+import { ResendEmailSender } from './notifications/resend-email-sender.js';
+import { RazorpayPaymentProvider } from './payments/razorpay-adapter.js';
+import { UnconfiguredPaymentProvider } from './payments/unconfigured-provider.js';
+import { FirebasePhoneVerificationProvider } from './verification/firebase-phone-verifier.js';
+
+import type { GatewayConfig } from '../config/index.js';
+import type { FastifyRequest } from 'fastify';
+
+/**
+ * ─── V2 partner services wiring ──────────────────────────────────────────────
+ * Builds the `ServiceDeps` bundle v2 routes consume: application services
+ * depend on repository interfaces, routes stay thin. Repository implementation
+ * is chosen by `STORAGE_DRIVER` (B12) — `memory` (default, used by `pnpm test`)
+ * or `firestore` (used by `pnpm dev`) — routes and services never know which.
+ * No `.collection()` in routes, no `process.env` in application layer.
+ */
+export interface PartnerV2Services {
+  organizations: OrganizationService;
+  venues: VenueService;
+  partnerships: PartnershipService;
+  /** Partner-network browse behind `GET /organizations/:id/discover-partners`. */
+  discovery: PartnerDiscoveryService;
+  referralLinks: ReferralLinkService;
+  promoterConnections: PromoterConnectionService;
+  venueCalendar: VenueCalendarService;
+  venueSlotRequests: VenueSlotRequestService;
+  events: EventService;
+  catalog: EventCatalogService;
+  analytics: AnalyticsService;
+  /** Phase 8: follow graph + notification inbox (guest, session-scoped). */
+  social: SocialService;
+  /** Phase 2: partner applications, applicant + admin review sides. */
+  onboarding: OnboardingService;
+  /** Phase 2: platform-admin resolution, tiering and dual control. */
+  adminAuthority: AdminAuthorityService;
+  /** Phase 7 admin: platform directory views + venue suspension resolution. */
+  adminOps: AdminOperationsService;
+  checkout: CheckoutService;
+  /** Finds paid orders whose fulfilment stalled part-way and finishes them. */
+  fulfilmentRepair: FulfilmentRepairService;
+  /** Phase 4 PR1: unauthenticated guest-facing discovery reads. */
+  public: PublicService;
+  /**
+   * Phase 4: the payment provider adapter itself — routes need this directly
+   * (not just through `checkout`) for the redirect-confirm route's signature
+   * verification (`verifyPayment`), which happens *before* `confirmPayment`
+   * is ever called. Typed as the port interface, not a concrete adapter —
+   * `STORAGE_DRIVER=memory` selects `MemoryPaymentProvider` (no network
+   * calls, used by `pnpm test`/CI); `firestore` selects the real
+   * `RazorpayPaymentProvider`. Tests that need to seed a "captured" payment
+   * narrow to `MemoryPaymentProvider` and call its `simulateCapture` escape
+   * hatch (not part of this interface — see that class's doc comment).
+   */
+  paymentProvider: PaymentProvider;
+  /** Phase 4 PR3: guest-facing order reads (GET /orders, /orders/:id[/status]). */
+  orders: OrderService;
+  /** Phase 4 PR3: guest-facing ticket reads (GET /tickets/:id, /wallet/tickets). */
+  tickets: TicketService;
+  /** T09 idempotency — durable on the firestore driver, in-memory on `memory`. */
+  idempotency: IdempotencyService;
+  /** Builds the service actor from the authenticated request state. */
+  actor(request: FastifyRequest): ActorContext;
+  /** Raw repository bundle for seed/test wiring only. */
+  repos(): ServiceDeps['repositories'];
+  /** Core runtime configuration for route-composed financial commands. */
+  config(): ServiceDeps['config'];
+  /** T13 audit trail written by the event bus (B09 slice consumer). */
+  audits: MemoryAuditRepository;
+  /** Phase 2 admin audit trail (before/after), for seed/test wiring. */
+  adminAudits(): AdminAuditRepository;
+  /** Phase 5: Scanner service */
+  scanner: ScannerService;
+  /** Phase 5: Door service */
+  door: DoorService;
+  /** Phase 5: Cover wallet service */
+  coverWallet: CoverWalletService;
+  /** Phase 5 (Founder Task B2): GET /door/stats read model. */
+  doorStats: DoorStatsService;
+  /** Phase 5: event picker, shift start, guest roster, manual check-in. */
+  doorOps: DoorOpsService;
+  /** Phase 5: paid walk-up ticket sale (real order + tickets + settlement). */
+  doorTicketSale: DoorTicketSaleService;
+  /** Phase 6: ledger + balances. */
+  finance: FinanceService;
+  /** Phase 6: payout requests + lifecycle. */
+  payout: PayoutService;
+  /** Phase 6 admin: freeze/release (TIER3) + batch execution (TIER2). */
+  adminPayout: AdminPayoutService;
+  /** Phase 6: bank account management. */
+  bankAccount: BankAccountService;
+  /** Phase 6: dispute lifecycle. */
+  dispute: DisputeService;
+  /** Phase 6 admin: dispute resolution desk (mutates the ledger on `upheld`). */
+  adminDispute: AdminDisputeService;
+  /** Phase 6 admin: amount-tiered refund approval over an order's payment. */
+  refund: RefundService;
+  /** The payment provider's record of each payment, for reconciliation. */
+  providerPayments: ProviderPaymentService;
+  /** Persisted cross-system finance reconciliation. */
+  reconciliation: ReconciliationService;
+  /** Explicit legacy-ledger to journal backfill/comparison/cutover controls. */
+  journalTransition: JournalTransitionService;
+  /** Phase 7 support: guest/requester intake + follow-ups on your own tickets. */
+  support: SupportService;
+  /** Phase 7 support: admin desk over the same ticket aggregate. */
+  adminSupport: AdminSupportService;
+  /** Phase 6: promoter leaderboard. */
+  leaderboard: LeaderboardService;
+  /** Email OTP (signup verification). */
+  emailOtp: EmailOtpService;
+  /** Guest-portal signup onboarding profile (session-scoped, no org). */
+  guestProfile: GuestProfileService;
+  /** Phase 8: social notifications (guest inbox). */
+  socialNotifications: SocialNotificationRepository;
+  /** V2 partner-dashboard inbox — recipient is the org tenant. */
+  notifications: NotificationService;
+  /**
+   * Better Auth instance, or null on the memory driver (no persistent store
+   * backs auth — see `plugins/auth.ts`). Built here (not in the route
+   * manifest) so the staff credential provisioner below shares it.
+   */
+  auth: BetterAuthInstance | null;
+  /** First-login rotation flags, for auth routes and the request guard. */
+  rotationStore: StaffRotationStore;
+  /** Outbound transactional email (OTP + password-reset links). */
+  emailSender: EmailSender;
+}
+
+// Each route module calls `createV2Services()` independently at import time
+// (`const services = createV2Services()`). Memoized (no-logger calls only) so
+// they all share one repository set — required for cross-route lookups (the
+// auth preHandler hook's organization-membership check must see organizations
+// written via the organizations routes). Logger-injecting callers (tests that
+// want to assert on log calls) bypass the cache and get a fresh build.
+let cachedServices: PartnerV2Services | null = null;
+
+export function createV2Services(logger?: Logger): PartnerV2Services {
+  if (!logger && cachedServices) return cachedServices;
+  const built = buildV2Services(logger);
+  if (!logger) cachedServices = built;
+  return built;
+}
+
+/**
+ * Pre-B10 fabricated actor, restored (see `plugins/auth.ts`'s header
+ * comment — this is meant to live here, not in `packages/core`, precisely
+ * because it needs `STORAGE_DRIVER` to gate itself: fabricating an actor
+ * from a bare header is only safe when there is no real auth flow to bypass
+ * (`STORAGE_DRIVER=memory`, i.e. `pnpm test` / CI). On `firestore`,
+ * `plugins/auth.ts`'s `onRequest` hook always populates `request.actor`
+ * before this runs when there's a real session — this never fabricates one.
+ */
+export function actorFromRequest(gw: GatewayConfig, request: FastifyRequest): ActorContext {
+  if (gw.NODE_ENV !== 'production' && gw.STORAGE_DRIVER === 'memory' && !request.actor) {
+    // "The memory driver has a single fixed dev actor" (see
+    // `partner/invitations.test.ts`) — always fabricates on this driver,
+    // never throws. Only `STORAGE_DRIVER=firestore` (real auth) reaches the
+    // `buildActorContext` throw below when there's genuinely no session.
+    //
+    // Mirrors what `plugins/auth.ts`'s real onRequest hook would have put on
+    // the request (`request.user`/`request.authContext`) when a test/caller
+    // fabricates that shape directly (see `v2-services.test.ts`'s
+    // `fakeRequest`) — preferred over the header fallback so role and
+    // capabilities aren't silently flattened to a hardcoded default. Falls
+    // back further to `x-organization-id` (org-scoped routes) or `x-user-id`
+    // (not-yet-in-an-org routes, e.g. onboarding's `requireUserId`), and
+    // finally to a fixed default when a route needs no identity at all
+    // (e.g. `/invitations/:id/accept`, which looks the org up from the
+    // invitation itself).
+    const membership = request.authContext?.activeMembership;
+    const orgHeader = request.headers['x-organization-id'];
+    const organizationId =
+      membership?.organizationId ?? (Array.isArray(orgHeader) ? orgHeader[0] : orgHeader);
+    const userHeader = request.headers['x-user-id'];
+    const userId = request.user?.uid ?? (Array.isArray(userHeader) ? userHeader[0] : userHeader);
+    return {
+      userId: userId ?? 'user_1',
+      organizationId: organizationId ?? '',
+      role: membership?.role ?? 'owner',
+      capabilities: membership?.capabilities ?? [],
+      platformRole: 'partner',
+    } as ActorContext;
+  }
+  return buildActorContext(request);
+}
+
+function buildV2Services(logger?: Logger): PartnerV2Services {
+  const gw = getGatewayConfig();
+  const coreConfig = createCoreConfig({
+    redis: { url: gw.REDIS_URL },
+    firestore: { projectId: gw.FIRESTORE_PROJECT_ID },
+    storage: gw.FIREBASE_STORAGE_BUCKET ? { kycBucket: gw.FIREBASE_STORAGE_BUCKET } : undefined,
+    emailOtpSecret: gw.EMAIL_OTP_SECRET,
+    // Was never passed, so every deploy silently used the core default — a
+    // published constant that anyone reading the repo could use to mint a
+    // valid door QR for any ticket. Production now fails to boot without it.
+    magicTicketSecret: gw.MAGIC_TICKET_SECRET,
+    // Same story as the magic-ticket secret: this was never passed, so bank
+    // account numbers were sealed with a key published in the repo.
+    bankEncryptionSecret: gw.ENCRYPTION_KEY,
+    bankEncryptionSalt: gw.ENCRYPTION_SALT,
+    ...(gw.PARTNER_DASHBOARD_URL ? { partnerDashboardUrl: gw.PARTNER_DASHBOARD_URL } : {}),
+  });
+
+  const repositories: ServiceDeps['repositories'] = buildRepositories(gw);
+
+  // Financial and domain-event intents must survive a production process
+  // restart. Tests keep the deterministic memory adapter; Firestore uses the
+  // leased durable outbox.
+  const outboxStore =
+    gw.STORAGE_DRIVER === 'memory'
+      ? new MemoryOutboxStore()
+      : new FirestoreOutboxStore(firestoreClient(gw));
+  const audits = new MemoryAuditRepository();
+  const eventBus = new InProcessEventBus(outboxStore);
+  eventBus.subscribe('event.published', createAuditConsumer(audits));
+  eventBus.subscribe('event.updated', createAuditConsumer(audits));
+  // B11: the analytics projection consumer is subscribed below, once `deps`
+  // exists — it needs the AnalyticsService instance, which needs `deps`.
+  // Phase 8 pub/sub: follow graph changes are audited, and every publish fans
+  // out "new event" notifications to venue + host followers. The publisher
+  // (EventService / SocialService) never calls these directly.
+  eventBus.subscribe('follow.created', createAuditConsumer(audits));
+  eventBus.subscribe('follow.removed', createAuditConsumer(audits));
+  eventBus.subscribe(
+    'event.published',
+
+    createFollowerFanOutConsumer({
+      events: repositories.events,
+      follows: repositories.follows,
+      notifications: repositories.socialNotifications,
+    }),
+  );
+
+  const adminAudits: AdminAuditRepository =
+    gw.STORAGE_DRIVER === 'memory'
+      ? new MemoryAdminAuditRepository()
+      : new FirestoreAdminAuditRepository(firestoreClient(gw));
+
+  // Phase 4: Payment provider, pricing, inventory
+  const gwConfig = getGatewayConfig();
+
+  // Same-shape choice as every other port in this file (repositories, object
+  // storage): memory driver never makes a network call, firestore driver
+  // talks to the real provider. Without this branch, `pnpm test`/CI would
+  // hit `api.razorpay.com` for every checkout/payment test.
+  const {
+    RAZORPAY_KEY_ID: keyId,
+    RAZORPAY_KEY_SECRET: keySecret,
+    RAZORPAY_WEBHOOK_SECRET: webhookSecret,
+  } = gwConfig;
+  // Never construct the real provider with placeholder secrets: redirect-path
+  // payment verification is an HMAC under RAZORPAY_KEY_SECRET, so a published
+  // placeholder would make forged "paid" signatures verify. Unconfigured
+  // firestore deployments get a provider that fails closed (503) instead.
+  const paymentProvider: PaymentProvider =
+    gw.STORAGE_DRIVER === 'memory'
+      ? new MemoryPaymentProvider(webhookSecret ?? 'test_webhook_secret')
+      : keyId && keySecret && webhookSecret
+        ? new RazorpayPaymentProvider({ keyId, keySecret, webhookSecret })
+        : new UnconfiguredPaymentProvider();
+  const pricing = new PricingService({ eventCatalog: repositories.catalog });
+  const inventory = new InventoryService({
+    eventCatalog: repositories.catalog,
+    cartReservation: repositories.cartReservations,
+    order: repositories.orders,
+  });
+
+  // Phone verification: real GCP Identity Platform check when firestore
+  // credentials exist (see `firebase-phone-verifier.ts`); on the memory
+  // driver (tests, local dev with no GCP project) every documentType,
+  // 'phone' included, falls through to the same format-check default as
+  // KYC documents — there is nothing to verify an ID token against.
+  const verificationProvider: VerificationProvider =
+    gw.STORAGE_DRIVER === 'memory'
+      ? new FormatCheckVerificationProvider()
+      : new CompositeVerificationProvider(
+          { phone: new FirebasePhoneVerificationProvider(authClient(gw)) },
+          new FormatCheckVerificationProvider(),
+        );
+
+  const resolvedLogger =
+    logger ??
+    createLogger({
+      info: (message, obj) => console.info(message, obj ?? {}),
+      warn: (message, obj) => console.warn(message, obj ?? {}),
+      error: (message, obj) => console.error(message, obj ?? {}),
+    });
+  // One Resend-backed sender shared by OTP, staff invitations, and onboarding notifications.
+  const emailSender = new ResendEmailSender(
+    gwConfig.RESEND_API_KEY,
+    gwConfig.NODE_ENV,
+    resolvedLogger,
+  );
+
+  // B10: auth is only real on the firestore driver — see plugins/auth.ts and
+  // docs/roadmap/phase-00-foundation.md for why the memory driver skips it.
+  // Built here so the staff credential provisioner shares the instance.
+  let auth: BetterAuthInstance | null = null;
+  if (gw.STORAGE_DRIVER === 'firestore') {
+    if (!gw.FIREBASE_CLIENT_EMAIL || !gw.FIREBASE_PRIVATE_KEY) {
+      throw new GatewayConfigError(
+        'STORAGE_DRIVER=firestore requires FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY',
+      );
+    }
+    auth = buildBetterAuth(gw, firestoreClient(gw), emailSender);
+  }
+  // Staff credentials follow the same driver split as every other port:
+  // memory implementations never touch the network (tests, keyless dev),
+  // firestore implementations talk to the real stores.
+  const rotationStore: StaffRotationStore =
+    gw.STORAGE_DRIVER === 'memory'
+      ? new MemoryStaffRotationStore()
+      : new FirestoreStaffRotationStore(firestoreClient(gw));
+  // The user directory is shared between the provisioner (duplicate-account
+  // detection) and the invitation service (already-a-member guard).
+  const userDirectory: UserDirectoryPort & StaffUserDirectory =
+    gw.STORAGE_DRIVER === 'memory'
+      ? new MemoryStaffUserDirectory()
+      : new FirestoreUserDirectory(firestoreClient(gw));
+  const credentialProvisioner =
+    auth !== null
+      ? new BetterAuthStaffCredentialProvisioner(auth, userDirectory, resolvedLogger)
+      : new MemoryStaffCredentialProvisioner();
+
+  const deps: ServiceDeps = {
+    config: coreConfig,
+    logger: resolvedLogger,
+    outbox: eventBus,
+    adminAudit: adminAudits,
+    // Swap here — and only here — when a real KYC provider is contracted.
+    verification: verificationProvider,
+    objectStorage:
+      gw.STORAGE_DRIVER === 'memory'
+        ? new EchoObjectStorage()
+        : new FirebaseObjectStorage(storageClient(gw), coreConfig.storage.kycBucket),
+    emailSender,
+    userDirectory,
+    paymentProvider,
+    credentialProvisioner,
+    rotationStore,
+    pricing,
+    inventory,
+    repositories,
+  };
+
+  // V2 partner inbox producer consumer: domain events → notification rows.
+  // Subscribed to each producer event type; the handler is a named function
+  // (its `handler.name` keys the bus's per-event dedupe set).
+  const notificationConsumer = createNotificationConsumer({
+    notifications: repositories.notifications,
+    config: coreConfig,
+    logger: deps.logger,
+  });
+  eventBus.subscribe('promoter_connection.requested', notificationConsumer);
+  eventBus.subscribe('partnership.requested', notificationConsumer);
+  eventBus.subscribe('event.published', notificationConsumer);
+
+  // B11: analytics projection. Built here (not with the audit subscriptions
+  // above) because the projector IS the AnalyticsService instance the returned
+  // bag exposes — one instance, two uses. Every `event.*` lifecycle change
+  // reconciles the event's own row and its organization's roll-up; the periodic
+  // refresh in `app.ts` covers the order/scan writes that emit no event.
+  const analytics = new AnalyticsService(deps);
+  const analyticsProjectionConsumer = createAnalyticsProjectionConsumer(analytics);
+  for (const type of ANALYTICS_PROJECTION_EVENT_TYPES) {
+    eventBus.subscribe(type, analyticsProjectionConsumer);
+  }
+
+  const adminAuthority = new AdminAuthorityService(deps);
+  const onboardingService = new OnboardingService(deps, adminAuthority);
+
+  // Phase 5 services
+  const scanner = createScannerService({
+    scanLedger: repositories.scanLedger,
+    eventCodes: repositories.eventCodes,
+    scannerSessions: repositories.scannerSessions,
+    scannerDevices: repositories.scannerDevices,
+    entitlements: repositories.entitlements,
+    repositories,
+    config: coreConfig,
+    logger: deps.logger,
+    outbox: eventBus,
+    adminAudit: adminAudits,
+  });
+
+  const door = createDoorService({
+    doorSales: repositories.doorSales,
+    events: repositories.events,
+    catalog: repositories.catalog,
+    coverWallets: repositories.coverWallets,
+    coverWalletTxns: repositories.coverWalletTxns,
+    config: coreConfig,
+    logger: deps.logger,
+    outbox: eventBus,
+    adminAudit: adminAudits,
+    pricing,
+  });
+
+  const coverWallet = createCoverWalletService({
+    coverWallets: repositories.coverWallets,
+    coverWalletTxns: repositories.coverWalletTxns,
+    coverWalletReconciliations: repositories.coverWalletReconciliations,
+    events: repositories.events,
+    config: coreConfig,
+    logger: deps.logger,
+    outbox: eventBus,
+    adminAudit: adminAudits,
+  });
+
+  const doorStats = createDoorStatsService({
+    events: repositories.events,
+    catalog: repositories.catalog,
+    scanLedger: repositories.scanLedger,
+    doorSales: repositories.doorSales,
+    coverWallets: repositories.coverWallets,
+  });
+
+  // The door's non-camera screens: event picker, shift start, roster, manual
+  // check-in. Composes scanner + stats + catalog, so a route stays one call.
+  const doorOps = createDoorOpsService({
+    scanner,
+    coverWallet,
+    doorStats,
+    events: repositories.events,
+    catalog: repositories.catalog,
+    entitlements: repositories.entitlements,
+    eventCodes: repositories.eventCodes,
+    doorSales: repositories.doorSales,
+    scanLedger: repositories.scanLedger,
+    venues: repositories.venues,
+    adminAudit: adminAudits,
+    logger: deps.logger,
+  });
+
+  const checkout = new CheckoutService(deps);
+  const fulfilmentRepair = new FulfilmentRepairService(deps, checkout);
+
+  // The paid walk-up sale. `settleOrder` is injected from the checkout
+  // service so door revenue lands in the finance ledger through the SAME
+  // writer as online revenue, rather than growing a second settlement path
+  // that can drift from it.
+  const doorTicketSale = createDoorTicketSaleService({
+    scanner,
+    events: repositories.events,
+    catalog: repositories.catalog,
+    orders: repositories.orders,
+    entitlements: repositories.entitlements,
+    scanLedger: repositories.scanLedger,
+    inventory,
+    adminAudit: adminAudits,
+    logger: deps.logger,
+    settleOrder: (order) => checkout.settleOrder(order),
+  });
+
+  // Phase 6 services
+  const finance = createFinanceService({
+    ledger: repositories.ledger,
+    financialJournals: repositories.financialJournals,
+    journalTransition: repositories.journalTransition,
+    payouts: repositories.payouts,
+    events: repositories.events,
+    reconciliations: repositories.reconciliations,
+    config: coreConfig,
+  });
+
+  const payout = createPayoutService({
+    payouts: repositories.payouts,
+    bankAccounts: repositories.bankAccounts,
+    ledger: repositories.ledger,
+    financialJournals: repositories.financialJournals,
+    journalTransition: repositories.journalTransition,
+    events: repositories.events,
+    reconciliations: repositories.reconciliations,
+    platformSettings: repositories.platformSettings,
+    config: coreConfig,
+  });
+
+  const bankAccount = createBankAccountService({
+    bankAccounts: repositories.bankAccounts,
+    config: coreConfig,
+  });
+
+  const dispute = createDisputeService({
+    disputes: repositories.disputes,
+    config: coreConfig,
+  });
+
+  const refund = new RefundService(deps, adminAuthority);
+  const providerPayments = new ProviderPaymentService(deps);
+  const reconciliation = new ReconciliationService(deps);
+  const journalTransition = new JournalTransitionService(deps);
+  const adminPayout = new AdminPayoutService(deps, adminAuthority);
+  const adminDispute = new AdminDisputeService(deps, adminAuthority);
+  const adminOps = new AdminOperationsService(deps, adminAuthority);
+  const support = new SupportService(deps);
+  const adminSupport = new AdminSupportService(deps, adminAuthority);
+
+  const leaderboard = createLeaderboardService({
+    leaderboard: repositories.leaderboard,
+    config: coreConfig,
+  });
+
+  const emailOtp = createEmailOtpService({
+    emailOtp: repositories.emailOtp,
+    emailSender,
+    config: coreConfig,
+  });
+
+  const guestProfile = createGuestProfileService({
+    guestProfiles: repositories.guestProfiles,
+    config: coreConfig,
+  });
+
+  if (gw.STORAGE_DRIVER === 'firestore') {
+    const drainPersistedOutbox = () => {
+      void eventBus.drain().catch((error: unknown) => {
+        resolvedLogger.error('outbox.drain_failed', {
+          error: error instanceof Error ? error.message : 'unknown error',
+        });
+      });
+    };
+    // Recover rows left by a previous process immediately, then poll for
+    // scheduled retries. `unref` lets graceful shutdown proceed naturally.
+    queueMicrotask(drainPersistedOutbox);
+    setInterval(drainPersistedOutbox, 1_000).unref();
+  }
+
+  return {
+    organizations: new OrganizationService(deps),
+    venues: new VenueService(deps),
+    partnerships: new PartnershipService(deps),
+    discovery: new PartnerDiscoveryService(deps),
+    referralLinks: new ReferralLinkService(deps),
+    promoterConnections: new PromoterConnectionService(deps),
+    venueCalendar: new VenueCalendarService(deps),
+    venueSlotRequests: new VenueSlotRequestService(deps),
+    events: new EventService(deps),
+    catalog: new EventCatalogService(deps),
+    analytics,
+    onboarding: onboardingService,
+
+    social: new SocialService(deps),
+    adminAuthority,
+    adminOps,
+    checkout,
+    fulfilmentRepair,
+    public: new PublicService(deps),
+    paymentProvider,
+    orders: new OrderService(deps),
+    tickets: new TicketService(deps),
+    // Replay protection must outlive the process: a restart mid-retry with an
+    // in-memory store turns a client's retry into a second business result.
+
+    idempotency: new IdempotencyService(buildIdempotencyStore(), logger),
+    actor: (request: FastifyRequest) => actorFromRequest(gw, request),
+    repos: () => repositories,
+    config: () => coreConfig,
+    /** T13 audit trail surfaced to routes/tests (B09 slice consumer). */
+    audits,
+    adminAudits: () => adminAudits,
+    // Phase 5
+    scanner,
+    door,
+    coverWallet,
+    doorStats,
+    doorOps,
+    doorTicketSale,
+    // Phase 6
+    finance,
+    payout,
+    bankAccount,
+    dispute,
+    refund,
+    providerPayments,
+    reconciliation,
+    journalTransition,
+    adminPayout,
+    adminDispute,
+    support,
+    adminSupport,
+    leaderboard,
+    emailOtp,
+    guestProfile,
+    auth,
+    rotationStore,
+    socialNotifications: repositories.socialNotifications,
+    notifications: new NotificationService(deps),
+    /** Serves `buildBetterAuth`'s `emailAndPassword.sendResetPassword` callback. */
+    emailSender,
+  };
+}

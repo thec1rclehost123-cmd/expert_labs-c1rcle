@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C1RCLE Payments and Finance: visual guide</title>
+<style>
+:root{--bg:#fff;--fg:#1b1f24;--muted:#57606a;--line:#d0d7de;--card:#f6f8fa}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9da7b3;--line:#30363d;--card:#161b22}}
+body{background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:1.9rem} h2{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--line);font-size:1.35rem}
+code{background:var(--card);padding:.1em .35em;border-radius:4px;font-size:.9em}
+figure{margin:1rem 0;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--card);overflow-x:auto}
+.mermaid{background:transparent;margin:0}
+table{border-collapse:collapse;margin:1rem 0;display:block;overflow-x:auto} th,td{border:1px solid var(--line);padding:6px 10px;text-align:left} th{background:var(--card)}
+p,li{color:var(--fg)} hr{border:0;border-top:1px solid var(--line);margin:1.5rem 0} a{color:#0969da}
+.note{color:var(--muted);font-size:.9rem}
+</style></head><body><main>
+<p class="note">Confidential. Share only under NDA. Diagrams are drawn by the Mermaid library loaded from a CDN, so an internet connection is needed to see them.</p>
+<h1 id="00-payments-and-finance-visual-guide">00. Payments and finance: visual guide</h1>
+<p>Start here if you prefer pictures. Each diagram points to the file that explains it. Colours:</p>
+<ul><li>🟩 <strong>green</strong> = works and is enforced</li><li>🟨 <strong>yellow</strong> = partial, manual, or a decision is pending</li><li>🟥 <strong>red</strong> = defect or risk (see <code>09-status-prs-and-open-decisions.md</code>)</li><li>⬜ <strong>grey</strong> = infrastructure or neutral step</li></ul>
+<p>How to view: GitHub, VS Code (Markdown Preview Mermaid Support), or <a href="https://mermaid.live.">https://mermaid.live.</a> A browser version is in <code>visual-guide.html</code> (needs internet for the Mermaid library).</p>
+<p>Contents: 1 Where the money goes · 2 Price the guest pays · 3 Checkout sequence · 4 Hold and order states · 5 Confirming a payment · 6 Webhook handling · 7 Settlement split · 8 Two ledgers · 9 Journal postings · 10 How balances are computed · 11 Paying partners · 12 Refund paths · 13 Chargebacks · 14 What runs automatically · 15 Failure cases · 16 What is merged where · 17 Defect map · 18 Fix order</p>
+<hr>
+<h2 id="1-where-the-money-goes">1. Where the money goes</h2>
+<p>Files: <code>01-money-model-and-pricing.md</code>, <code>04-ledger-and-journal.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  G["Guest pays&lt;br/&gt;ticket + fees + GST on fees"] --&gt; RZ["Razorpay&lt;br/&gt;(collects, deducts its own fee)"]
+  RZ --&gt; PC["provider_clearing&lt;br/&gt;(platform's books)"]
+  PC --&gt; FEES["Guest fees kept by platform:&lt;br/&gt;5 percent platform fee + 2.5 percent payment fee"]
+  PC --&gt; GST["GST on those fees&lt;br/&gt;liability account"]
+  PC --&gt; NET["Net ticket revenue"]
+  NET --&gt; PL["Platform commission&lt;br/&gt;15, 12 or 10 percent by plan"]
+  NET --&gt; VS["Venue share&lt;br/&gt;0 to 50 percent per partnership"]
+  NET --&gt; PR["Promoter commission&lt;br/&gt;from assignment or volume tier"]
+  NET --&gt; HO["Host: the remainder"]
+  VS --&gt; PAY["Payable to partners"]
+  PR --&gt; PAY
+  HO --&gt; PAY
+  PAY --&gt;|"payout request, manual bank transfer"| BANK["Partner bank account"]
+  PAY -.gate off in production.-&gt; BLK["Payouts blocked until legal, tax and provider approvals"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef infra fill:#eeeeee,stroke:#888,color:#111
+  class G,PC,NET,HO ok
+  class PAY,BANK,BLK warn
+  class RZ infra</pre></figure>
+<h2 id="2-the-price-the-guest-pays-example">2. The price the guest pays (example)</h2>
+<p>Files: <code>01-money-model-and-pricing.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  T["Ticket 1,500.00"] --&gt; D{"Promo code?"}
+  D --&gt;|"yes: capped to eligible subtotal"| DS["Discounted subtotal"]
+  D --&gt;|no| DS
+  DS --&gt; PF["Platform fee 5 percent = 75.00"]
+  DS --&gt; PY["Payment fee 2.5 percent = 37.50"]
+  PF --&gt; GS["GST 18 percent of the two fees = 20.25&lt;br/&gt;(hard-coded rate, not on the ticket price)"]
+  PY --&gt; GS
+  DS --&gt; TOT["Grand total = 1,500.00 + 75.00 + 37.50 + 20.25 = 1,632.75"]
+  PF --&gt; TOT
+  PY --&gt; TOT
+  GS --&gt; TOT
+  TOT --&gt; CHK{"Total between 0 and 1 rupee?"}
+  CHK --&gt;|yes| REJ["Rejected: online payments must be at least 1 rupee"]
+  CHK --&gt;|"0 or 1+"| OK["Quote accepted"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class OK,TOT ok
+  class REJ bad
+  class GS warn</pre></figure>
+<h2 id="3-checkout-step-by-step">3. Checkout, step by step</h2>
+<p>Files: <code>02-checkout-and-payment-flow.md</code>.</p>
+<figure><pre class="mermaid">sequenceDiagram
+  participant U as Guest
+  participant G as Gateway
+  participant R as Razorpay
+  U-&gt;&gt;G: quote (read-only price)
+  U-&gt;&gt;G: hold (Idempotency-Key)
+  G-&gt;&gt;G: transaction takes the next per-event number, then checks capacity
+  G--&gt;&gt;U: hold for 10 minutes
+  U-&gt;&gt;G: payment attempt (Idempotency-Key)
+  G-&gt;&gt;R: create order (once per hold)
+  G--&gt;&gt;U: order id, amount, public key
+  U-&gt;&gt;R: pay
+  R--&gt;&gt;U: payment id + signature
+  U-&gt;&gt;G: verify (signature checked against the order stored on the hold)
+  R-&gt;&gt;G: webhook payment.captured (HMAC)
+  G-&gt;&gt;G: confirmPayment (same code for both paths, idempotent on payment id)
+  G--&gt;&gt;U: order and tickets</pre></figure>
+<h2 id="4-hold-and-order-states">4. Hold and order states</h2>
+<p>Files: <code>03-order-hold-inventory.md</code>.</p>
+<figure><pre class="mermaid">stateDiagram-v2
+  direction LR
+  state "Hold" as H {
+    [*] --&gt; active
+    active --&gt; converted: payment confirmed
+    active --&gt; released: expired, lost the race, abandoned
+    released --&gt; active: late payment revives it
+  }</pre></figure>
+<figure><pre class="mermaid">stateDiagram-v2
+  direction LR
+  [*] --&gt; paid: online checkout and free RSVP create orders already paid
+  paid --&gt; refund_requested: admin starts a refund
+  refund_requested --&gt; paid: refund failed or partial
+  refund_requested --&gt; refunded: full refund settled
+  note right of paid: Only door ticket sales walk pending, awaiting_payment, paid</pre></figure>
+<h2 id="5-confirming-a-payment-decision-tree">5. Confirming a payment (decision tree)</h2>
+<p>Files: <code>02-checkout-and-payment-flow.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Payment arrives (redirect or webhook)"]) --&gt; E{"Order already exists for this payment id?"}
+  E --&gt;|yes| SAME{"Same user, event and hold?"}
+  SAME --&gt;|yes| FUL["Finish fulfilment (safe to repeat)"]
+  SAME --&gt;|no| R1["Reject: payment belongs to a different hold"]
+  E --&gt;|no| B{"Hold bound to this Razorpay order?&lt;br/&gt;amount, currency, captured all match the provider?"}
+  B --&gt;|no| R2["Reject, webhook is retried by Razorpay"]
+  B --&gt;|yes| T{"Hold still valid?"}
+  T --&gt;|yes| NEW["Create order as paid"]
+  T --&gt;|"expired or released"| LATE{"Seats still free after revival?"}
+  LATE --&gt;|yes| NEW
+  LATE --&gt;|no| AR["Auto-refund in full, hold released, 409 to the buyer"]
+  NEW --&gt; P{"Promo limit still ok?"}
+  P --&gt;|no| AR2["Auto-refund in full, 409"]
+  P --&gt;|yes| FUL
+  FUL --&gt; TK["Tickets issued, ledger and journal posted"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class FUL,TK,NEW ok
+  class R1,R2,AR,AR2 bad</pre></figure>
+<p>Not covered: a second payment against a hold that is already converted is captured with no order and no refund.</p>
+<h2 id="6-webhook-handling">6. Webhook handling</h2>
+<p>Files: <code>02-checkout-and-payment-flow.md</code>, <code>05-razorpay-and-provider-facts.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  W(["POST /webhooks/payments/razorpay"]) --&gt; SEC{"Webhook secret configured?"}
+  SEC --&gt;|no| E503["503 (fails closed)"]
+  SEC --&gt;|yes| SIG{"HMAC of the raw body matches?"}
+  SIG --&gt;|no| E400["400"]
+  SIG --&gt;|yes| EV{"Event type"}
+  EV --&gt;|"payment.captured"| COR{"Hold and order ids found in notes?"}
+  COR --&gt;|yes| CP["Record capture fact, confirmPayment as system actor"]
+  COR --&gt;|no| ORF["Record capture fact, log ids, answer 200&lt;br/&gt;(no auto refund, no alert)"]
+  EV --&gt;|"refund.processed, payment.dispute.*"| FACT["Record provider fact, post chargeback journals"]
+  EV --&gt;|"payment.failed, order.paid, payment.authorized, refund.created or failed"| IGN["Acknowledged and ignored"]
+  CP --&gt;|"error"| RETRY["Non-2xx so Razorpay retries"]
+  FACT --&gt;|"dispute without a correlated order"| LOOP["Error: retry loop until support acts"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class CP,FACT ok
+  class E503,E400,LOOP bad
+  class ORF,IGN,RETRY warn</pre></figure>
+<p>No rate limit on this route and no replay window.</p>
+<h2 id="7-settlement-split">7. Settlement split</h2>
+<p>Files: <code>01-money-model-and-pricing.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  N["Net ticket revenue (discounted subtotal)&lt;br/&gt;guest fees and GST are NOT in this base"] --&gt; A["Platform commission = round(net x plan rate)&lt;br/&gt;basic 15, silver 12, diamond 10"]
+  N --&gt; B["Venue share = round(net x rate)&lt;br/&gt;partnership rate 0 to 50, null means 0"]
+  N --&gt; C{"Promoter attributed?"}
+  C --&gt;|"yes"| C1["Promoter = frozen commission from the order&lt;br/&gt;or volume tier (10, 12, 15, 18, 20 percent), rounded down"]
+  C --&gt;|no| C2["Promoter = 0"]
+  A --&gt; H["Host = net minus the other three"]
+  B --&gt; H
+  C1 --&gt; H
+  C2 --&gt; H
+  C1 -.guard.-&gt; GD["Fails later if promoter exceeds net minus platform minus venue,&lt;br/&gt;even though the quote check was weaker"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class N,A,B,H,C1,C2 ok
+  class GD bad</pre></figure>
+<p>Example: net 1,500 with plan basic, venue 20 percent and promoter 10 percent gives platform 225, venue 300, promoter 150, host 825.</p>
+<h2 id="8-two-ledgers-and-why-partners-cannot-withdraw-yet">8. Two ledgers (and why partners cannot withdraw yet)</h2>
+<p>Files: <code>04-ledger-and-journal.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  SALE["Every sale posts to BOTH ledgers"] --&gt; L1["Legacy partner ledger (default read model)"]
+  SALE --&gt; L2["Journal v2: double-entry, balanced"]
+  L1 --&gt; S1["ticket_revenue and platform_fee entries: settled"]
+  L1 --&gt; S2["venue_share, host_payout, promoter_commission entries: PENDING"]
+  S2 -.nothing ever advances them.-&gt; NEVER["Available balance is always 0"]
+  L2 --&gt; S3["Balances computed from payable accounts,&lt;br/&gt;minus holds"]
+  S3 --&gt; S4{"Is the event ended and past the 3 day delay?"}
+  S4 --&gt;|no| PEND["Pending"]
+  S4 --&gt;|yes| AVAIL["Available"]
+  SW["Read-model switch (journal cutover)"] -.has no route or script.-&gt; CODE["Only callable from code"]
+  L1 --&gt;|"read model = legacy_reads (default)"| SW
+  SW --&gt; L2
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class L2,S3,AVAIL ok
+  class NEVER,CODE bad
+  class L1,PEND,S2 warn</pre></figure>
+<p>The app reads one model or the other, never the sum. Events only reach <code>ended</code> through an admin force-complete, so even the journal model keeps money pending.</p>
+<h2 id="9-journal-postings-by-event">9. Journal postings by event</h2>
+<p>Files: <code>04-ledger-and-journal.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph SALE["Ticket sale"]
+    A1["collection: Dr provider_clearing / Cr ticket_collection_control, platform_fee_revenue, gst_tax_liability"]
+    A2["allocation: Dr ticket_collection_control / Cr platform_commission_revenue, host, venue, promoter payable"]
+    A3["provider fee: Dr provider_fee_expense / Cr provider_clearing"]
+  end
+  subgraph PAYOUT["Payout"]
+    B1["request: Dr partner_payable / Cr payout_clearing"]
+    B2["completed: Dr payout_clearing / Cr cash_bank_clearing"]
+    B3["failed: reversal of the reservation"]
+  end
+  subgraph REF["Refund (3 journals)"]
+    C1["recognition, payable reversal, provider settlement&lt;br/&gt;pro rata across original credits"]
+  end
+  subgraph CB["Chargeback"]
+    D1["hold, provider deduction, hold release&lt;br/&gt;chargeback_reserve and chargeback_loss_receivable"]
+  end
+  subgraph MAN["Manual adjustment (two supers)"]
+    E1["Dr or Cr manual_adjustment_control against partner_payable"]
+  end</pre></figure>
+<h2 id="10-how-the-available-balance-is-computed-journal-model">10. How the available balance is computed (journal model)</h2>
+<p>Files: <code>04-ledger-and-journal.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  P["Payable lines: host, venue, promoter, partner"] --&gt; NET["net = credits minus debits"]
+  NET --&gt; H1["minus pending (inside the settlement delay or event not ended)"]
+  H1 --&gt; H2["minus policy reserve (reserve basis points)"]
+  H2 --&gt; H3["minus cancellation hold (event cancelled)"]
+  H3 --&gt; H4["minus reconciliation hold (unresolved discrepancies)"]
+  H4 --&gt; AV["available"]
+  NET --&gt; CBH["chargeback holds are tracked separately and reported as held"]
+  AV --&gt; LIM["Payout limit = available + reserved + paid"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class AV,LIM ok</pre></figure>
+<h2 id="11-paying-partners">11. Paying partners</h2>
+<p>Files: <code>06-payouts-refunds-disputes.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  R(["Partner owner or admin requests a payout"]) --&gt; G{"Release gate on?"}
+  G --&gt;|"off (production default)"| X["503: payouts not enabled"]
+  G --&gt;|on| V{"At least 100 rupees and within available + reserved + paid?"}
+  V --&gt;|no| E["Rejected"]
+  V --&gt;|yes| RQ["Payout requested + reservation journal"]
+  RQ --&gt; BR["Admin runs the batch (gated)"]
+  BR --&gt; PR["processing"]
+  PR --&gt; MT["Admin records a MANUAL bank transfer:&lt;br/&gt;reference, method, time, proof hash"]
+  MT --&gt; PD["paid + completion journal"]
+  RQ -.-&gt; FZ["Freeze or release needs two super admins"]
+  MT -.-&gt; NG["Recording a transfer is not behind the gate"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class RQ,PD ok
+  class X,E bad
+  class MT,NG,FZ warn</pre></figure>
+<p>No payout API is ever called: payouts are evidence of a manual transfer.</p>
+<h2 id="12-refund-paths">12. Refund paths</h2>
+<p>Files: <code>06-payouts-refunds-disputes.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  subgraph AUTO["Automatic (guest paid but cannot get tickets)"]
+    A1["Late payment, seats gone"] --&gt; AR["Full refund, key autorefund:payment id"]
+    A2["Promo limit reached at capture"] --&gt; AR2["Full refund, key promo-limit-refund:payment id"]
+  end
+  subgraph ADMIN["Admin-initiated (no guest or partner API)"]
+    B1["Request (order paid, amount within balance)"] --&gt; B2["Approvals by amount:&lt;br/&gt;under 500: none, under 5,000: one, else two&lt;br/&gt;scanned ticket: at least one"]
+    B2 --&gt; B3["Execute: Razorpay refund, journals, order refunded, tickets voided"]
+  end
+  subgraph DISP["Partner-raised dispute"]
+    C1["Partner disputes an order"] --&gt; C2{"Admin resolves"}
+    C2 --&gt;|upheld| C3["Writes an ignored legacy refund entry, moves no money"]
+    C2 --&gt;|denied| C4["Nothing"]
+  end
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class AR,AR2,B3 ok
+  class C3 bad</pre></figure>
+<h2 id="13-chargebacks">13. Chargebacks</h2>
+<p>Files: <code>06-payouts-refunds-disputes.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  D(["Razorpay dispute event"]) --&gt; C{"Correlated order known?"}
+  C --&gt;|no| ERR["Error, event marked support_required, retried"]
+  C --&gt;|yes| ST{"Dispute status"}
+  ST --&gt;|"open or under review"| HOLD["Post chargeback hold"]
+  ST --&gt;|"lost, or closed with deduction"| LOSS["Post loss: partner payable first,&lt;br/&gt;excess to chargeback_loss_receivable"]
+  ST --&gt;|"won or closed without deduction"| REL["Release the hold"]
+  LOSS -.-&gt; DEC["Who bears the loss and the fee is an open decision"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class HOLD,REL ok
+  class ERR bad
+  class DEC,LOSS warn</pre></figure>
+<h2 id="14-what-runs-automatically-and-what-does-not">14. What runs automatically (and what does not)</h2>
+<p>Files: <code>07-reconciliation-repair-scheduling.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph AUTO["Automatic (per instance, Firestore only)"]
+    T1["Every 5 min: release expired holds, expire scanner sessions"]
+    T2["Every 5 min: refresh analytics read model"]
+    T3["Every 1 s: drain the outbox"]
+  end
+  subgraph MAN["Manual only"]
+    M1["repair:fulfilment script"]
+    M2["Reconciliation run (admin console)"]
+    M3["Payout batch (admin, gated)"]
+    M4["Journal backfill, compare, cutover (code only)"]
+  end
+  subgraph PLAN["Planned, not built"]
+    P1["Hourly Cloudflare cron: reconcile + repair"]
+    P2["Alerting on requires_support"]
+  end
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class T1,T2,T3 ok
+  class M1,M2,M3 warn
+  class M4 bad
+  class P1,P2 warn</pre></figure>
+<h2 id="15-failure-cases-at-a-glance">15. Failure cases at a glance</h2>
+<p>Files: <code>08-failure-and-edge-cases.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  F(["What can go wrong"]) --&gt; X{"Case"}
+  X --&gt;|"Webhook and redirect both arrive"| OK1["Safe: same idempotent confirm, one order"]
+  X --&gt;|"Payment after the hold expired"| OK2["Revive if seats free, otherwise auto-refund"]
+  X --&gt;|"Crash half-way through fulfilment"| OK3["Retry or run repair:fulfilment"]
+  X --&gt;|"Refund provider times out"| OK4["Order stays locked, needs reconciliation"]
+  X --&gt;|"Payment with no hold or order named"| BAD1["Captured and recorded, no refund, no alert"]
+  X --&gt;|"Second payment on the same hold"| BAD2["Captured, no order, no refund"]
+  X --&gt;|"Chargeback after the payout"| BAD3["Receivable booked, who pays is undecided"]
+  X --&gt;|"payment.failed event"| BAD4["Ignored"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class OK1,OK2,OK3,OK4 ok
+  class BAD1,BAD2,BAD3,BAD4 bad</pre></figure>
+<h2 id="16-what-is-merged-where-corrected">16. What is merged where (corrected)</h2>
+<p>Files: <code>09-status-prs-and-open-decisions.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  P113["#113 merged: fail-closed payments, Redis rate limiting"] --&gt; M1
+  S["#115, #117, #118, #124, #126, #130, #133&lt;br/&gt;closed, but their commits landed through #135"] --&gt; M1["#135 merged 10-18: test-mode checkout (whole stack)"]
+  M1 --&gt; M2["#136 merged 10-18: financial engine&lt;br/&gt;journal v2, refund executor, disputes, reconciliation, transition"]
+  M2 --&gt; M3["#125 merged: PAYOUTS_ENABLED gate"]
+  M3 --&gt; STG["On staging, and identical on the reviewed backend branch"]
+  O1["#127 part 2: tax rules store"] -.open.-&gt; NO["Not on staging or main"]
+  O2["#129: tax and reconciliation admin routes"] -.open.-&gt; NO
+  O3["#119: settlement legs, GST as its own line"] -.open.-&gt; NO
+  O4["#131: refund and chargeback decisions doc"] -.open.-&gt; NO
+  O5["#116: payments design docs"] -.open.-&gt; NO
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class P113,S,M1,M2,M3,STG ok
+  class O1,O2,O3,O4,O5,NO warn</pre></figure>
+<h2 id="17-defect-map">17. Defect map</h2>
+<p>Files: <code>09-status-prs-and-open-decisions.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  ROOT(["Payments risks"]) --&gt; PAYQ["Getting partners paid"]
+  ROOT --&gt; ORPH["Orphan money"]
+  ROOT --&gt; HARD["Hardening"]
+  ROOT --&gt; TAXQ["Tax and legal"]
+  PAYQ --&gt; a1["Legacy ledger never advances: available is always 0"]
+  PAYQ --&gt; a2["Journal cutover has no route or script"]
+  PAYQ --&gt; a3["Events never end, so money stays pending"]
+  ORPH --&gt; b1["Second payment on a converted hold: no order, no refund"]
+  ORPH --&gt; b2["Capture with no hold named: no refund, no alert"]
+  ORPH --&gt; b3["payment.failed ignored, no scheduled repair"]
+  HARD --&gt; c1["Webhook: no rate limit, no replay window"]
+  HARD --&gt; c2["Adapter: no fetch timeout"]
+  HARD --&gt; c3["Promoter guard weaker than settlement"]
+  HARD --&gt; c4["Placeholder buyer contact"]
+  TAXQ --&gt; d1["GST on fees only, hard-coded 18 percent"]
+  TAXQ --&gt; d2["No TDS or TCS"]
+  TAXQ --&gt; d3["Funds flow undecided (RBI question)"]
+  TAXQ --&gt; d4["Refund and chargeback loss rules undecided"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class a1,a2,b1,d3 bad
+  class a3,b2,b3,c1,c2,c3,c4,d1,d2,d4 warn</pre></figure>
+<h2 id="18-suggested-fix-order">18. Suggested fix order</h2>
+<p>Files: <code>09-status-prs-and-open-decisions.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  F1["Step 1: Give the journal cutover an operator path&lt;br/&gt;(or retire the legacy model)"] --&gt; F2["Step 2: Let events end&lt;br/&gt;so money can become available"]
+  F2 --&gt; F3["Step 3: Close orphan-capture gaps,&lt;br/&gt;handle payment.failed"]
+  F3 --&gt; F4["Step 4: Schedule repair and reconciliation, add alerts"]
+  F4 --&gt; F5["Step 5: Harden webhook and adapter"]
+  F5 --&gt; F6["Step 6: Fix promoter guard, send attendee details"]
+  F6 --&gt; F7["Step 7: Decide tax, funds flow, refund and chargeback rules"]
+  F7 --&gt; F8["Step 8: Only then consider enabling payouts"]
+  classDef step fill:#e8f0fe,stroke:#4a6fa5,color:#111
+  class F1,F2,F3,F4,F5,F6,F7,F8 step</pre></figure>
+</main>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({startOnLoad:true, theme: dark ? "dark" : "default", securityLevel:"loose", flowchart:{htmlLabels:true, useMaxWidth:true}});
+</script></body></html>

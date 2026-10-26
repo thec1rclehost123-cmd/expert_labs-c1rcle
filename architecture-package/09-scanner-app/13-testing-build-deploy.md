@@ -1,0 +1,25 @@
+# 13. Testing, build and deploy
+
+## Frontend tests (scanner app)
+- **On the checked-out branch there are no scanner-app tests and no Jest config.** `.turbo/turbo-test.log` says "No tests found, exiting with code 0"; `jest-expo` is installed but unused; the script `jest --passWithNoTests` makes the gate always pass. Not covered anywhere: screens, the auth state machine, API client mapping, idempotency logic in door and wallet, the couple-confirm timer, venue binding.
+- **On PR #82 (`feat/scanner-offline-engine`)**: an inline `jest` config (`testEnvironment: node`, babel-jest with `babel-preset-expo`, `moduleNameMapper` `@/` → `src/`, `transformIgnorePatterns` carve-out for `@noble`, `testMatch: src/**/*.test.ts`) and four test files under `src/offline/` (crypto with backend known-answer vectors, manifest, scanner, sync).
+- `packages/api-client` has real tests (client, errors, factory, schemas) covering retry, timeout and reauth.
+- E2E: the scanner app is **excluded from the Playwright matrix** (no native E2E tool). A manual physical-device walkthrough has never been run; only a script-level HTTP E2E ran (24 of 25 passed) via `apps/api-gateway/src/scripts/{e2e-scanner-check,e2e-double-tap-check,seed-scanner-e2e,create-scanner-event,verify-scanner-event}.ts`.
+
+## Frontend CI (`.github/workflows/ci.yml`)
+PR `gate`: format, lint, typecheck, boundaries, `test:coverage` (a no-op for this app), env seeding (`.env.example` → `.env`), `npx expo install --check` (SDK drift gate), `pnpm build` (`expo export`); `contract-parity` against the backend; `ci-ok`. CI proves the app bundles and typechecks; it proves little about behaviour.
+
+## Backend tests relevant here
+Route tests under `apps/api-gateway/src/routes/v2/door/`:
+- `scanner-routes.test.ts`: door codes (org from event, foreign refused, active-only list, revoke kills sessions), geofence (inside, far, no-fix), `POST /door/sessions` (raw token once, 404 unknown, foreign code answered identically), check-ins (admit and spend, second scan refused, couple stops and asks, no double admit under concurrency, missing/fabricated/cross-event token refused, void, wrong-event without leakage, unverifiable magic QR denied, genuine QR admitted), verify and lookup, get check-in, override, offline (manifest signed, sync re-decides server-side), ticket QR (holder allowed, stranger 404).
+- `door-ops-routes.test.ts`: events, start shift (one call, auto-bind), device binding (unbound refused even with a live session, unbind closes sessions, rebind keeps history), heartbeat, couple flow (confirm admits both, one-guest denial, no replay, wrong door, forged token), staff-deny, guests merge, attendance report, manual check-in, occupancy, reauthorize, production-length ids, RBAC.
+- `door-commerce-routes.test.ts`: wallet-qr, wallet-charge (venue price, quantity, client amount rejected, unavailable item, insufficient balance, double-bill retry, frozen), ticket-sale (priced, settled to ledger, client price ignored, retry charges once, no oversell, scan_only refused, foreign tier refused, guest validation), wallet QR minting rules.
+- `door-sale-routes.test.ts`, `cover-wallet-routes.test.ts`, `phase5-routes.test.ts` (stats, cross-tenant, `/door/stats/ws` gone), `door-stats-stream.test.ts` (stream lifecycle, budgets).
+- Core: `admission.test.ts`, `scan-ledger.test.ts`, `event-code.test.ts`, `scanner-device.test.ts`, `door-sale.test.ts`, `door-sale-parity.test.ts`, `cover-wallet-service.test.ts`, `id-length.test.ts`. On staging also `offline-ticket-crypto.test.ts` and the offline route tests.
+- **Not covered by any test found:** stale-QR offline sync on the old design; the rotating QR beyond the window edge or the bare-id acceptance; walk-in `totalGuests` pricing; reconciliation with debits; same-millisecond txn id collision; door-code expiry vs session lifetime; cross-tenant idempotency-key collision; override of staff-deny rows.
+
+## Build and deploy
+- **No native build pipeline.** No `eas.json`, EAS project id, `updates`, runtime version, bundle identifier or Android package id; only `expo export` (web) in CI. Getting the app onto handsets (TestFlight, Play internal track, MDM) is undefined today.
+- Web build (`dev:web`, `dist/`) is a preview target with weaker storage.
+- Backend deploys as described in `../11-infrastructure-and-cicd`. The scanner needs the gateway CORS allow-list to include `X-Scanner-Session-Token` (fixed), the SSE route to bypass the global CORS plugin correctly (fixed), and nginx to serve `/door/stats/stream` unbuffered with a long read timeout. Render's free tier cold start (30–40 s) hits the first scan of the night: warm the instance (keep-alive cron is a planned Cloudflare item, not built).
+- Env names: app `EXPO_PUBLIC_API_BASE_URL`, `EXPO_PUBLIC_ENV`, `EXPO_PUBLIC_ORGANIZATION_ID`; backend `MAGIC_TICKET_SECRET` (≥ 32 chars in production; signs tickets, wallets, confirmations, the offline manifest and the derived Ed25519 key), `ALLOWED_ORIGINS`, `RATE_LIMIT_STORE`, `REDIS_URL` (needed for a second instance), `PAYOUTS_ENABLED` (unrelated to door), `FIREBASE_*`. Door seed scripts: `create-scanner-event`, `seed-scanner-e2e`.

@@ -1,0 +1,242 @@
+import type { EntityId } from '../../domain/identity.js';
+import type {
+  CartReservation,
+  CartReservationStatus,
+} from '../../domain/models/cart-reservation.js';
+import type { CartReservationRepository, TxContext } from '../../domain/ports/repositories.js';
+import type { DocumentData, Firestore } from 'firebase-admin/firestore';
+
+const COLLECTION = 'v2_cart_reservations';
+/** One document per event holding the last hold number handed out. */
+const SEQUENCE_COLLECTION = 'v2_hold_sequences';
+
+/**
+ * Firestore adapter for `CartReservationRepository` (Phase 4).
+ * Same interface as `MemoryCartReservationRepository`.
+ */
+export class FirestoreCartReservationRepository implements CartReservationRepository {
+  constructor(private readonly db: Firestore) {}
+
+  private get collection() {
+    return this.db.collection(COLLECTION);
+  }
+
+  async create(reservation: CartReservation, _tx?: TxContext | null): Promise<CartReservation> {
+    // Every hold for an event takes the next number from ONE document inside a
+    // transaction. Concurrent creators all read that document, so Firestore
+    // serialises them (all but one retry): each hold gets a distinct position,
+    // and a hold's position is only assigned after every earlier one has
+    // committed. That is what lets the caller judge capacity correctly.
+    const sequenceRef = this.db.collection(SEQUENCE_COLLECTION).doc(reservation.eventId);
+    const holdRef = this.collection.doc(reservation.id);
+    return this.db.runTransaction(async (tx) => {
+      const [sequenceSnap, holdSnap] = await Promise.all([tx.get(sequenceRef), tx.get(holdRef)]);
+      const existing = holdSnap.data();
+      // Same id again (a retried request): return what is stored, change nothing.
+      if (existing) return toCartReservation(existing);
+      const sequence = Number(sequenceSnap.data()?.last ?? 0) + 1;
+      const stored: CartReservation = { ...reservation, sequence };
+      tx.set(sequenceRef, { last: sequence, eventId: reservation.eventId });
+      tx.set(holdRef, toDoc(stored));
+      return stored;
+    });
+  }
+
+  async reactivate(reservationId: EntityId, expiresAt: string): Promise<CartReservation | null> {
+    const holdRef = this.collection.doc(reservationId);
+    return this.db.runTransaction(async (tx) => {
+      const holdSnap = await tx.get(holdRef);
+      const data = holdSnap.data();
+      if (!data) return null;
+      const existing = toCartReservation(data);
+      if (existing.status === 'converted') return existing;
+      // Same single per-event document creation uses, so a revived hold is
+      // ordered against everyone else exactly like a brand-new one.
+      const sequenceRef = this.db.collection(SEQUENCE_COLLECTION).doc(existing.eventId);
+      const sequenceSnap = await tx.get(sequenceRef);
+      const sequence = Number(sequenceSnap.data()?.last ?? 0) + 1;
+      const revived: CartReservation = { ...existing, status: 'active', expiresAt, sequence };
+      tx.set(sequenceRef, { last: sequence, eventId: existing.eventId });
+      tx.set(holdRef, toDoc(revived));
+      return revived;
+    });
+  }
+
+  async getById(reservationId: EntityId): Promise<CartReservation | null> {
+    const snap = await this.collection.doc(reservationId).get();
+    const data = snap.data();
+    return data ? toCartReservation(data) : null;
+  }
+
+  async getByIdempotencyKey(key: string): Promise<CartReservation | null> {
+    const snap = await this.collection.where('idempotencyKey', '==', key).limit(1).get();
+    if (snap.empty) return null;
+    const doc = snap.docs[0];
+    if (!doc) return null;
+    const data = doc.data();
+    return data ? toCartReservation(data) : null;
+  }
+
+  async release(reservationId: EntityId, _tx?: TxContext | null): Promise<void> {
+    const ref = this.collection.doc(reservationId);
+    await this.db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const data = snap.data();
+      if (!data) return;
+      const released: CartReservation = {
+        ...toCartReservation(data),
+        status: 'released',
+      };
+      tx.set(ref, toDoc(released));
+    });
+  }
+
+  async convertToOrder(
+    reservationId: EntityId,
+    orderId: EntityId,
+    _tx?: TxContext | null,
+  ): Promise<void> {
+    const ref = this.collection.doc(reservationId);
+    await this.db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const data = snap.data();
+      if (!data) return;
+      const converted: CartReservation = {
+        ...toCartReservation(data),
+        status: 'converted',
+        convertedOrderId: orderId,
+      };
+      tx.set(ref, toDoc(converted));
+    });
+  }
+
+  async bindProviderOrder(
+    reservationId: EntityId,
+    providerOrderId: string,
+    _tx?: TxContext | null,
+  ): Promise<string | null> {
+    const ref = this.collection.doc(reservationId);
+    // Transactional read-check-write: two concurrent attempts for one hold both
+    // read "unbound", but only the first commit wins; Firestore retries the
+    // loser, which then reads the winner's binding and returns it.
+    return this.db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const data = snap.data();
+      if (!data) return null;
+      const existing = data.providerOrderId as string | null | undefined;
+      if (existing) return existing;
+      tx.set(ref, toDoc({ ...toCartReservation(data), providerOrderId }));
+      return providerOrderId;
+    });
+  }
+
+  // One equality filter on a single field: served by the automatic index.
+  async getByProviderOrderId(providerOrderId: string): Promise<CartReservation | null> {
+    const snap = await this.collection
+      .where('providerOrderId', '==', providerOrderId)
+      .limit(1)
+      .get();
+    const doc = snap.docs[0];
+    return doc ? toCartReservation(doc.data()) : null;
+  }
+
+  async cleanupExpired(now: Date, _tx?: TxContext | null): Promise<number> {
+    const snap = await this.collection
+      .where('status', '==', 'active')
+      .where('expiresAt', '<=', now.toISOString())
+      .get();
+
+    if (snap.empty) return 0;
+
+    const batch = this.db.batch();
+    for (const doc of snap.docs) {
+      const data = doc.data();
+      const released: CartReservation = {
+        ...toCartReservation(data),
+        status: 'released',
+      };
+      batch.set(doc.ref, toDoc(released));
+    }
+    await batch.commit();
+    return snap.size;
+  }
+
+  /**
+   * Index-free by design: single-field `eventId` filter only (automatic
+   * single-field index), active/expiry filtering happens in code — the live
+   * hold set is bounded by the ~10-minute TTL, so the extra reads are
+   * negligible, and this avoids a composite index (repo convention). Never a
+   * public route response; only `InventoryService` aggregation input.
+   */
+  async listActiveByEvent(eventId: EntityId, now: Date): Promise<CartReservation[]> {
+    const snap = await this.collection.where('eventId', '==', eventId).get();
+    const nowMs = now.getTime();
+    return snap.docs
+      .map((doc) => toCartReservation(doc.data()))
+      .filter((hold) => hold.status === 'active' && Date.parse(hold.expiresAt) > nowMs);
+  }
+
+  async countActiveQuantity(
+    userId: EntityId,
+    eventId: EntityId,
+    tierId: EntityId,
+    now: Date,
+  ): Promise<number> {
+    // Single-field equality on `userId` (already indexed by `listByUser`),
+    // then event/tier/status/time filtered in application code — bounded by
+    // one user's live cart holdings, no new composite index required.
+    const snap = await this.collection.where('userId', '==', userId).get();
+    return snap.docs.reduce((sum, doc) => {
+      const r = toCartReservation(doc.data());
+      if (r.eventId !== eventId || r.status !== 'active') return sum;
+      if (Date.parse(r.expiresAt) <= now.getTime()) return sum;
+      return sum + r.lines.reduce((s, line) => s + (line.tierId === tierId ? line.quantity : 0), 0);
+    }, 0);
+  }
+}
+
+function toDoc(reservation: CartReservation): DocumentData {
+  return {
+    id: reservation.id,
+    eventId: reservation.eventId,
+    organizationId: reservation.organizationId,
+    userId: reservation.userId,
+    lines: reservation.lines,
+    pricing: reservation.pricing,
+    appliedPromoCode: reservation.appliedPromoCode,
+    attribution: reservation.attribution,
+    status: reservation.status,
+    expiresAt: reservation.expiresAt,
+    convertedOrderId: reservation.convertedOrderId,
+    providerOrderId: reservation.providerOrderId ?? null,
+    attendee: reservation.attendee ?? null,
+    sequence: reservation.sequence ?? null,
+    idempotencyKey: reservation.idempotencyKey,
+    version: reservation.version,
+    createdAt: reservation.createdAt,
+    updatedAt: reservation.updatedAt,
+  };
+}
+
+function toCartReservation(data: DocumentData): CartReservation {
+  return {
+    id: data.id as string,
+    eventId: data.eventId as string,
+    organizationId: data.organizationId as string,
+    userId: data.userId as string | null,
+    lines: data.lines as CartReservation['lines'],
+    pricing: data.pricing as CartReservation['pricing'],
+    appliedPromoCode: data.appliedPromoCode as string | null,
+    attribution: data.attribution as CartReservation['attribution'],
+    status: data.status as CartReservationStatus,
+    expiresAt: data.expiresAt as string,
+    convertedOrderId: data.convertedOrderId as string | null,
+    providerOrderId: (data.providerOrderId as string | null | undefined) ?? null,
+    attendee: (data.attendee as CartReservation['attendee'] | undefined) ?? null,
+    sequence: (data.sequence as number | null | undefined) ?? null,
+    idempotencyKey: data.idempotencyKey as string,
+    version: data.version as number,
+    createdAt: data.createdAt as string,
+    updatedAt: data.updatedAt as string,
+  };
+}

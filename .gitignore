@@ -1,0 +1,52 @@
+# ─── Secrets / local environment ──────────────────────────────────────────────
+# Never commit a real value. Only .env.example files belong in the repo.
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+!**/*.env.example
+
+# ─── Dependencies / build output ──────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+dist/
+build/
+out/
+.next/
+coverage/
+*.tsbuildinfo
+.turbo/
+.eslintcache
+.cache/
+.vercel/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# ─── Logs / local runtime ─────────────────────────────────────────────────────
+*.log
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+tmp/
+temp/
+*.emulator.bak
+
+# ─── Local tooling / agent state ──────────────────────────────────────────────
+.claude/
+**/.claude/
+.mcp.json
+**/.mcp.json
+.code-review-graph/
+**/.code-review-graph/
+qa-artifacts/
+
+# ─── OS / editors ─────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+*.swp
+.vscode/*
+!**/.vscode/extensions.json
+!**/.vscode/settings.json

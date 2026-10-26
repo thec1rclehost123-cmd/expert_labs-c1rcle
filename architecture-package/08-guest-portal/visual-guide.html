@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C1RCLE Guest Portal: visual guide</title>
+<style>
+:root{--bg:#fff;--fg:#1b1f24;--muted:#57606a;--line:#d0d7de;--card:#f6f8fa}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9da7b3;--line:#30363d;--card:#161b22}}
+body{background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:1.9rem} h2{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--line);font-size:1.35rem}
+code{background:var(--card);padding:.1em .35em;border-radius:4px;font-size:.9em}
+figure{margin:1rem 0;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--card);overflow-x:auto}
+.mermaid{background:transparent;margin:0}
+table{border-collapse:collapse;margin:1rem 0;display:block;overflow-x:auto} th,td{border:1px solid var(--line);padding:6px 10px;text-align:left} th{background:var(--card)}
+p,li{color:var(--fg)} hr{border:0;border-top:1px solid var(--line);margin:1.5rem 0} a{color:#0969da}
+.note{color:var(--muted);font-size:.9rem}
+</style></head><body><main>
+<p class="note">Confidential. Share only under NDA. Diagrams are drawn by the Mermaid library loaded from a CDN, so an internet connection is needed to see them.</p>
+<h1 id="00-guest-portal-visual-guide">00. Guest portal: visual guide</h1>
+<p>Start here if you prefer pictures. Each diagram points to the file that explains it. Colours:</p>
+<ul><li>🟩 <strong>green</strong> = live and working</li><li>🟨 <strong>yellow</strong> = fixture, partial, blocked in production or a decision is pending</li><li>🟥 <strong>red</strong> = defect or risk (see <code>07-status-gaps-and-roadmap.md</code>)</li><li>⬜ <strong>grey</strong> = infrastructure or neutral step</li></ul>
+<p>How to view: GitHub, VS Code (Markdown Preview Mermaid Support), or <a href="https://mermaid.live.">https://mermaid.live.</a> A browser version is in <code>visual-guide.html</code> (needs internet for the Mermaid library).</p>
+<p>Contents: 1 System map · 2 Page map (production) · 3 Sign-in and gating · 4 The BFF path · 5 Discovery data flow · 6 RSVP · 7 Paid checkout · 8 Payment recovery · 9 Tickets and the QR · 10 Promoter link flow · 11 What the portal does not use · 12 SEO map · 13 Security findings · 14 Production vs preview · 15 Defect map · 16 Fix order</p>
+<hr>
+<h2 id="1-system-map">1. System map</h2>
+<p>Files: <code>02-architecture-auth-and-bff.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  G["Guest browser"] --&gt; PX["proxy.ts&lt;br/&gt;canonical host, cookie gate for private pages"]
+  PX --&gt; PG["Pages (server and client)"]
+  PG --&gt;|"same-origin /api/*"| BFF["BFF route handlers&lt;br/&gt;origin check, CSRF, id checks"]
+  PG --&gt;|"direct, Bearer token&lt;br/&gt;(tickets page reads)"| GW
+  BFF --&gt;|"cookie forwarded"| GW["Gateway /api/v2&lt;br/&gt;(Render)"]
+  GW --&gt; CORE["Core services"] --&gt; FS[("Firestore")]
+  GW --&gt; RZ["Razorpay (orders, refunds)"]
+  G --&gt;|"Razorpay widget script"| RZS["checkout.razorpay.com&lt;br/&gt;(no SRI, no CSP)"]
+  RZ --&gt;|webhook| GW
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef infra fill:#eeeeee,stroke:#888,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class PG,BFF,GW,CORE live
+  class PX,FS,RZ infra
+  class RZS warn</pre></figure>
+<h2 id="2-page-map-what-a-production-visitor-really-gets">2. Page map (what a production visitor really gets)</h2>
+<p>Files: <code>01-routes-and-screens.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  HOME["/ home: fixture hero + live upcoming events"] --&gt; EXP["/explore: live, client-side filters, 20 events"]
+  EXP --&gt; EVT["/event/id: live"]
+  EVT --&gt; CHK["/checkout/id: live, needs sign-in"]
+  CHK --&gt; CONF["/confirmation/id: live, decorative pass"]
+  CONF --&gt; TIX["/tickets: live wallet + rotating QR"]
+  HOME --&gt; APP["/app, /about, /privacy, /terms: marketing and stubs"]
+  HOME --&gt; HOSTS["/hosts: empty in production"]
+  HOME --&gt; VEN["/venue/slug and /host/slug: live, minimal"]
+  HOME --&gt; PRO["/profile: BLOCKED in production"]
+  HOME --&gt; HLP["/help: BLOCKED in production"]
+  HOME --&gt; SGN["/signup: redirects to login, says use the mobile app"]
+  HOME --&gt; VAN["/handle/slug promoter link: resolves then redirects to the event"]
+  CHK -.fixture slugs reachable.-&gt; FX["/checkout/neon-nights etc and /confirmation/preview-*"]
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class EXP,EVT,CHK,CONF,TIX,VEN,VAN live
+  class HOME,APP,HOSTS,PRO,HLP,SGN warn
+  class FX bad</pre></figure>
+<h2 id="3-sign-in-and-page-gating">3. Sign-in and page gating</h2>
+<p>Files: <code>02-architecture-auth-and-bff.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  V(["Visit /profile, /tickets, /help, /checkout or /confirmation"]) --&gt; C{"Session cookie present?"}
+  C --&gt;|no| RD["307 to /login?next=path (query string dropped)"]
+  C --&gt;|yes| SRV{"Server session valid?"}
+  SRV --&gt;|no| RD2["Server redirect to login"]
+  SRV --&gt;|yes| PAGE["Page renders, private and no-store"]
+  RD --&gt; LG["Login form: email and password"]
+  LG --&gt; API["POST /api/auth/login (BFF re-scopes cookie, mints CSRF)"]
+  API --&gt; OK{"Login ok?"}
+  OK --&gt;|no| ERR["Incorrect email or password, too many attempts, or unavailable"]
+  OK --&gt;|yes| NX["safeNextPath: only same-site paths, else /profile"]
+  NX --&gt; PAGE
+  SU["/signup"] -.redirects to login with a note.-&gt; LG
+  PAGE -.-&gt; IDLE["30 minute idle timer logs the user out"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class PAGE,NX,API ok
+  class ERR bad
+  class SU,IDLE,RD warn</pre></figure>
+<p>The proxy only checks that a cookie exists. The gateway reports every user as role partner, so a partner or admin can sign in here.</p>
+<h2 id="4-the-bff-path-and-its-checks">4. The BFF path and its checks</h2>
+<p>Files: <code>02-architecture-auth-and-bff.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  B(["Browser calls /api/..."]) --&gt; O{"Same origin?"}
+  O --&gt;|"Origin mismatch or cross-site"| X1["Rejected"]
+  O --&gt;|"ok (a missing Origin is allowed)"| W{"State-changing call?"}
+  W --&gt;|yes| CS{"CSRF header matches the cookie?"}
+  CS --&gt;|no| X2["Rejected"]
+  CS --&gt;|yes| ID
+  W --&gt;|no| ID{"Ids validated by regex?"}
+  ID --&gt;|"orders, qr, verify, wallet, recovery"| FW["Forward with the browser cookie"]
+  ID --&gt;|"help ticket routes"| NV["No validation: ticketId goes into the gateway path"]
+  FW --&gt; GWY["Gateway"]
+  NV --&gt; GWY
+  NV -.-&gt; INJ["Path injection risk"]
+  GWY -.-&gt; IP["Client IP is not forwarded: anonymous auth shares one rate-limit bucket"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class FW,GWY ok
+  class X1,X2,INJ,NV,IP bad</pre></figure>
+<p>The help POST routes check origin but not CSRF, and the help GET detail route does not check origin.</p>
+<h2 id="5-discovery-data-flow">5. Discovery data flow</h2>
+<p>Files: <code>03-discovery-seo-and-promoter-links.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  EXP["Explore page"] --&gt; D["GET /public/discovery&lt;br/&gt;20 soonest events"]
+  D --&gt; V["N venue reads (one per event)"]
+  EXP --&gt; FILT["Search, city, date and sort run in the browser"]
+  EVT["Event page"] --&gt; E1["GET /public/events/id"]
+  E1 --&gt; E2["GET venue by id"]
+  E1 --&gt; E3["GET host by id"]
+  E1 -.already embeds.-&gt; EMB["venue and organizer in the same response"]
+  SM["Sitemap"] --&gt; D
+  SM --&gt; NV["Venues and hosts: always empty"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class D,E1,E2,E3,V ok
+  class FILT,EMB,NV warn</pre></figure>
+<p>No public list endpoint exists for venues or hosts, and the gateway sends no cache headers on public reads.</p>
+<h2 id="6-free-ticket-rsvp">6. Free ticket (RSVP)</h2>
+<p>Files: <code>04-booking-and-checkout.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Pick a free tier (max 1 ticket)"]) --&gt; Q["Confirm"]
+  Q --&gt; R["POST /api/rsvp {eventId, tierId}"]
+  R --&gt; G{"Gateway result"}
+  G --&gt;|created| OK["Paid 0 order + ticket, go to /confirmation/orderId"]
+  G --&gt;|"conflict (already RSVPed)"| DUP["Message: already on the list, link to My Tickets"]
+  G --&gt;|unauthorized| LG["Redirect to login"]
+  G --&gt;|other| ER["RSVP failed"]
+  OK -.contact saved as.-&gt; PH["RSVP Guest, no email, no phone&lt;br/&gt;(attendee details are not sent)"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class OK ok
+  class ER bad
+  class DUP,LG,PH warn</pre></figure>
+<h2 id="7-paid-checkout">7. Paid checkout</h2>
+<p>Files: <code>04-booking-and-checkout.md</code>, <code>../10-payments-and-finance/02-checkout-and-payment-flow.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S1["Step 1: choose tiers"] --&gt; S2["Step 2: name, email (phone optional)&lt;br/&gt;goes only to Razorpay prefill"]
+  S2 --&gt; Q["Quote from the server (total shown from the quote only)"]
+  Q --&gt; H["Hold for 10 minutes (no countdown shown)"]
+  H --&gt; PC{"Hold total equals quoted total?"}
+  PC --&gt;|no| RQ["Re-quote with a new key"]
+  RQ --&gt; H
+  PC --&gt;|yes| PA["Payment attempt: one Razorpay order per hold"]
+  PA --&gt; WG["Razorpay widget"]
+  WG --&gt; RES{"Result"}
+  RES --&gt;|dismissed| BACK["Back to the page, hold still active for a few minutes"]
+  RES --&gt;|paid| VF["Verify with signature"]
+  VF --&gt; VR{"Gateway answer"}
+  VR --&gt;|confirmed| CF["Confirmation page"]
+  VR --&gt;|"409 refund message"| RF["Show refund message, clear recovery cookie"]
+  VR --&gt;|"other error"| PR["Processing: poll My Tickets about 30 s,&lt;br/&gt;then tell the guest to contact support"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class CF,Q,H,PA ok
+  class RQ,BACK,PR warn
+  class RF bad</pre></figure>
+<p>Not sent by the portal: attendee, promo code, referral code. Not shown: hold countdown, QR on the confirmation page.</p>
+<h2 id="8-payment-recovery">8. Payment recovery</h2>
+<p>Files: <code>04-booking-and-checkout.md</code>.</p>
+<figure><pre class="mermaid">sequenceDiagram
+  participant U as Guest browser
+  participant B as BFF
+  participant G as Gateway
+  U-&gt;&gt;B: create hold
+  B-&gt;&gt;G: hold
+  G--&gt;&gt;B: hold id
+  B--&gt;&gt;U: set httpOnly cookie with the hold id (15 min)
+  Note over U: Guest closes the tab or loses connection mid-payment
+  U-&gt;&gt;B: returns to the checkout page, GET recovery
+  B-&gt;&gt;G: status for the hold id from the cookie
+  G--&gt;&gt;B: pending, processing, fulfilled, failed, cancelled, expired, refunded or requires_support
+  B--&gt;&gt;U: status
+  alt fulfilled
+    U-&gt;&gt;U: go to the confirmation page
+  else refunded or terminal
+    U-&gt;&gt;B: DELETE recovery cookie
+  end</pre></figure>
+<h2 id="9-tickets-and-the-rotating-qr">9. Tickets and the rotating QR</h2>
+<p>Files: <code>05-tickets-wallet-profile-support.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  T["/tickets"] --&gt; W["GET /api/wallet/tickets (first 50 entitlements)"]
+  W --&gt; EV["Browser reads event and venue for each distinct event"]
+  EV --&gt; CARD["Cards grouped by order and tier"]
+  CARD --&gt; M["Open a ticket"]
+  M --&gt; ST{"Ticket status"}
+  ST --&gt;|active| QR["GET /api/tickets/first-ticket-id/qr every 30 s, shown as a QR"]
+  ST --&gt;|"used, cancelled, pending"| NQ["No entry code message"]
+  QR -.-&gt; ONE["Only the FIRST ticket's QR is reachable for a multi-ticket card"]
+  QR -.-&gt; OFF["No offline copy: a failed fetch shows Entry code unavailable"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class W,CARD,QR ok
+  class NQ,OFF warn
+  class ONE bad</pre></figure>
+<h2 id="10-promoter-link-flow-what-is-broken">10. Promoter link flow (what is broken)</h2>
+<p>Files: <code>03-discovery-seo-and-promoter-links.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  A["Guest opens /handle/slug"] --&gt; B["Server resolves and redirects to /event/slug?ref=CODE"]
+  B --&gt; C["Event page ignores ?ref"]
+  C --&gt; D["No click is posted (tracker is never rendered)"]
+  C --&gt; E["Checkout sends no referral code"]
+  E --&gt; F["Order has no promoter attribution"]
+  F --&gt; G["Promoter earns no commission, conversions stay at 0"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class A,B ok
+  class C,D,E,F,G bad</pre></figure>
+<h2 id="11-backend-features-the-portal-does-not-use">11. Backend features the portal does not use</h2>
+<p>Files: <code>05-tickets-wallet-profile-support.md</code>, <code>06-backend-public-and-guest-api.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  BE["Gateway guest-side features"] --&gt; U1["Used: public reads, quote, hold, attempt, verify, RSVP,&lt;br/&gt;order by id, wallet tickets, ticket QR, profile read, support intake"]
+  BE --&gt; N1["Promo codes and referral codes"]
+  BE --&gt; N2["Attendee details on the order"]
+  BE --&gt; N3["Profile save (PUT /profile/me)"]
+  BE --&gt; N4["Follows and guest notifications"]
+  BE --&gt; N5["Cover wallet QR (guest can mint, cannot find the wallet id)"]
+  BE --&gt; N6["Order list, order status, wallet summary"]
+  BE --&gt; N7["Search endpoint, venue and host lists (list does not exist)"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class U1 ok
+  class N1,N2,N3,N4,N5,N6,N7 warn</pre></figure>
+<h2 id="12-seo-map">12. SEO map</h2>
+<p>Files: <code>03-discovery-seo-and-promoter-links.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S["SEO setup"] --&gt; R["robots.ts: production allows crawling, other environments disallow"]
+  S --&gt; SM["sitemap.ts: home, app, explore (if events), live events"]
+  S --&gt; MD["Metadata helpers: canonical, Open Graph, Twitter"]
+  S --&gt; JL["JSON-LD: Organization and WebSite on home, Breadcrumbs on events"]
+  SM --&gt; BUG1["Event pages are listed in the sitemap..."]
+  BUG1 --&gt; BUG2["...but every event page sends robots noindex"]
+  JL --&gt; BUG3["The Event schema block is in a component no page renders"]
+  MD --&gt; BUG4["Event and explore pages hard-code the canonical origin"]
+  SM --&gt; BUG5["Venues and hosts are never listed"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class R,MD ok
+  class BUG1,BUG2,BUG3,BUG4,BUG5 bad</pre></figure>
+<h2 id="13-security-findings-map">13. Security findings map</h2>
+<p>Files: <code>07-status-gaps-and-roadmap.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  ROOT(["Guest portal security"]) --&gt; FE["Frontend"]
+  ROOT --&gt; BE["Backend"]
+  FE --&gt; f1["Help ticket routes: unvalidated id goes into the gateway path"]
+  FE --&gt; f2["No client IP forwarded: shared rate-limit bucket"]
+  FE --&gt; f3["No CSP, no HSTS, Razorpay script without SRI"]
+  FE --&gt; f4["Help POST: origin check only, no CSRF"]
+  FE --&gt; f5["Bad percent encoding gives a 500"]
+  BE --&gt; b1["Support tickets return internal notes, assignee, timeline, SLA to the guest"]
+  BE --&gt; b2["Every user is reported as role partner"]
+  BE --&gt; b3["Referral secret falls back to dev-secret if unset"]
+  BE --&gt; b4["Promoter clicks can be inflated anonymously"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class f1,b1 bad
+  class f2,f3,f4,f5,b2,b3,b4 warn</pre></figure>
+<h2 id="14-production-vs-preview">14. Production vs preview</h2>
+<p>Files: <code>01-routes-and-screens.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph PROD["Production"]
+    p1["Live: explore, event, checkout, confirmation, tickets"]
+    p2["Blocked: profile, help"]
+    p3["Empty: hosts. 404: public profile"]
+    p4["Fixture still reachable: checkout slugs, preview confirmations"]
+  end
+  subgraph PREV["Preview and development"]
+    v1["Everything in production"]
+    v2["Plus live: profile, help"]
+    v3["Plus fixtures: hosts, public profile, home drops, venue and host pages"]
+    v4["robots: noindex nofollow on every response"]
+  end
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class p1,v1,v2 ok
+  class p2,p3,v3,v4 warn
+  class p4 bad</pre></figure>
+<h2 id="15-defect-map">15. Defect map</h2>
+<p>Files: <code>07-status-gaps-and-roadmap.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  ROOT(["Guest portal risks"]) --&gt; REV["Revenue and data"]
+  ROOT --&gt; TRUST["Trust and security"]
+  ROOT --&gt; REACH["Reach and SEO"]
+  ROOT --&gt; UX["Experience"]
+  REV --&gt; r1["Promoter attribution broken"]
+  REV --&gt; r2["Placeholder buyer contact on every order"]
+  REV --&gt; r3["No promo code entry"]
+  TRUST --&gt; t1["Internal support notes visible to guests"]
+  TRUST --&gt; t2["Help route path injection"]
+  TRUST --&gt; t3["No CSP or HSTS"]
+  REACH --&gt; s1["Event pages noindex"]
+  REACH --&gt; s2["No web sign-up, profile and help blocked in production"]
+  REACH --&gt; s3["Venues and hosts missing from sitemap"]
+  UX --&gt; u1["Confirmation page shows Guest and a wrong reference"]
+  UX --&gt; u2["Only first ticket's QR; profile edit does nothing"]
+  UX --&gt; u3["No hold countdown, fonts never load"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class r1,t1,t2 bad
+  class r2,r3,t3,s1,s2,s3,u1,u2,u3 warn</pre></figure>
+<h2 id="16-suggested-fix-order">16. Suggested fix order</h2>
+<p>Files: <code>07-status-gaps-and-roadmap.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  F1["Step 1: Redact internal support fields,&lt;br/&gt;validate help route ids, add CSRF"] --&gt; F2["Step 2: Forward client IP from the BFF"]
+  F2 --&gt; F3["Step 3: Send attendee, promo and referral codes,&lt;br/&gt;wire the click tracker"]
+  F3 --&gt; F4["Step 4: Decide guest role and web sign-up"]
+  F4 --&gt; F5["Step 5: Fix event SEO and sitemap"]
+  F5 --&gt; F6["Step 6: Enable profile and help in production, add profile save"]
+  F6 --&gt; F7["Step 7: Per-ticket QR, wallet pagination, order history"]
+  F7 --&gt; F8["Step 8: CSP, HSTS, SRI, remove fixture routes and dead code"]
+  classDef step fill:#e8f0fe,stroke:#4a6fa5,color:#111
+  class F1,F2,F3,F4,F5,F6,F7,F8 step</pre></figure>
+</main>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({startOnLoad:true, theme: dark ? "dark" : "default", securityLevel:"loose", flowchart:{htmlLabels:true, useMaxWidth:true}});
+</script></body></html>

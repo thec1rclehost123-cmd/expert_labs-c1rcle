@@ -1,0 +1,397 @@
+import { z } from 'zod';
+
+import { opaqueIdSchema } from './shared.js';
+
+/**
+ * ─── Onboarding / KYC Contracts ──────────────────────────────────────────────
+ */
+
+export const onboardingStatusSchema = z.enum([
+  'draft',
+  'submitted',
+  'changes_requested',
+  'approved',
+  'rejected',
+]);
+
+export const onboardingPlanSchema = z.enum(['basic', 'silver', 'diamond']);
+
+/**
+ * Everything an applicant may set. Kept `.strict()` at the request boundary
+ * and re-filtered in the domain — a client cannot smuggle `role` in either
+ * place (v1's privilege-escalation guard, made total).
+ */
+export const onboardingProfileSchema = z
+  .object({
+    legalName: z.string().min(1).max(200),
+    contactPerson: z.string().min(1).max(200),
+    phone: z.string().min(6).max(20),
+    city: z.string().min(1).max(120),
+    area: z.string().max(120).optional(),
+    website: z.string().max(300).optional(),
+    capacity: z.number().int().nonnegative().nullable().optional(),
+    instagram: z.string().max(120).optional(),
+    bio: z.string().max(2000).optional(),
+    businessType: z.string().max(120).optional(),
+    registrationNumber: z.string().max(120).optional(),
+    entityType: z.string().max(120).optional(),
+  })
+  .strict();
+export type OnboardingProfileDto = z.infer<typeof onboardingProfileSchema>;
+
+export const onboardingDocumentStatusSchema = z.enum(['pending', 'verified', 'rejected']);
+
+export const onboardingDocumentSchema = z.object({
+  label: z.string().min(1).max(60),
+  storagePath: z.string().min(1).max(500),
+  uploadedAt: z.iso.datetime(),
+  status: onboardingDocumentStatusSchema,
+  reviewedBy: opaqueIdSchema.nullable(),
+  reviewedAt: z.iso.datetime().nullable(),
+  rejectionReason: z.string().nullable(),
+});
+
+export const onboardingRequestDtoSchema = z.object({
+  id: opaqueIdSchema,
+  userId: opaqueIdSchema,
+  status: onboardingStatusSchema,
+  requestedType: z.enum(['venue', 'host', 'promoter']),
+  plan: onboardingPlanSchema,
+  profile: onboardingProfileSchema,
+  documents: z.array(onboardingDocumentSchema),
+  /** Labels still missing before the applicant may submit. */
+  missingDocuments: z.array(z.string()),
+  submittedAt: z.iso.datetime().nullable(),
+  reviewedBy: opaqueIdSchema.nullable(),
+  reviewedAt: z.iso.datetime().nullable(),
+  reviewNote: z.string().nullable(),
+  provisionedOrganizationId: opaqueIdSchema.nullable(),
+  version: z.number().int().positive(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+});
+export type OnboardingRequestDto = z.infer<typeof onboardingRequestDtoSchema>;
+
+export const startOnboardingSchema = z
+  .object({
+    requestedType: z.enum(['venue', 'host', 'promoter']),
+    plan: onboardingPlanSchema,
+    profile: onboardingProfileSchema,
+  })
+  .strict();
+export type StartOnboardingRequest = z.infer<typeof startOnboardingSchema>;
+
+/**
+ * Autosave. Loose on purpose at the type level (every field optional) but
+ * still `.strict()`, so an unknown key is a 422 rather than something the
+ * server silently ignores — the applicant should know their data was dropped.
+ */
+export const saveOnboardingProgressSchema = onboardingProfileSchema.partial().strict();
+export type SaveOnboardingProgressRequest = z.infer<typeof saveOnboardingProgressSchema>;
+
+export const addOnboardingDocumentSchema = z
+  .object({
+    label: z.string().min(1).max(60),
+    storagePath: z.string().min(1).max(500),
+  })
+  .strict();
+export type AddOnboardingDocumentRequest = z.infer<typeof addOnboardingDocumentSchema>;
+
+/**
+ * The KYC images V2 collects. `id_front`/`id_back`/`selfie` cover an
+ * individual applicant's identity step; the remaining four back the
+ * business-entity path (a registration document plus a separate identity
+ * set for the authorized signatory) — v1's label vocabulary (domain model's
+ * own comment: "id_front, id_back, selfie, cheque, registration_certificate…"),
+ * widened here to the exact set the signup wizard's business/signatory
+ * steps need.
+ */
+export const onboardingDocumentLabelSchema = z.enum([
+  'id_front',
+  'id_back',
+  'selfie',
+  'registration_certificate',
+  'sig_id_front',
+  'sig_id_back',
+  'sig_selfie',
+]);
+export type OnboardingDocumentLabel = z.infer<typeof onboardingDocumentLabelSchema>;
+
+/**
+ * Ask for a pre-signed upload URL for one KYC image. The client `PUT`s the
+ * file to the returned `uploadUrl` with the returned `headers`, then calls
+ * `POST .../documents` with the returned `storagePath`.
+ */
+export const documentUploadUrlRequestSchema = z
+  .object({
+    label: onboardingDocumentLabelSchema,
+    contentType: z.enum(['image/jpeg', 'image/png', 'image/webp']),
+  })
+  .strict();
+export type DocumentUploadUrlRequest = z.infer<typeof documentUploadUrlRequestSchema>;
+
+export const documentUploadUrlDtoSchema = z
+  .object({
+    uploadUrl: z.string().min(1),
+    method: z.literal('PUT'),
+    /** Headers the client must send on the PUT, verbatim. */
+    headers: z.record(z.string(), z.string()),
+    /** Pass this back to `POST .../documents` as `storagePath`. */
+    storagePath: z.string().min(1).max(500),
+    /** Epoch ms — the URL is unusable after this. */
+    expiresAt: z.number().int().positive(),
+  })
+  .strict();
+export type DocumentUploadUrlDto = z.infer<typeof documentUploadUrlDtoSchema>;
+
+/** Admin-side signed GET for one uploaded KYC document. */
+export const documentReadUrlDtoSchema = z
+  .object({
+    readUrl: z.string().min(1),
+    /** Epoch ms — the URL is unusable after this. */
+    expiresAt: z.number().int().positive(),
+  })
+  .strict();
+export type DocumentReadUrlDto = z.infer<typeof documentReadUrlDtoSchema>;
+
+export const verifyDocumentSchema = z
+  .object({
+    documentType: z.string().min(1).max(40),
+    documentNumber: z.string().min(1).max(64),
+    holderName: z.string().max(200).optional(),
+    /**
+     * A provider-issued proof rather than a value to format-validate —
+     * `documentType: 'phone'`'s GCP Identity Platform ID token from the
+     * client's `signInWithPhoneNumber` flow. Unused for every other
+     * documentType.
+     */
+    proofToken: z.string().min(1).max(4096).optional(),
+  })
+  .strict();
+export type VerifyDocumentRequest = z.infer<typeof verifyDocumentSchema>;
+
+/**
+ * `passed` is never rendered as "verified" by the frontend unless `provider`
+ * is a real one — the default provider reports `format-check` / `format_ok`
+ * precisely so a green tick cannot be mistaken for an identity confirmation.
+ */
+export const verificationResultDtoSchema = z.object({
+  passed: z.boolean(),
+  provider: z.string().min(1),
+  reason: z.string().nullable(),
+  referenceId: z.string().nullable(),
+});
+export type VerificationResultDto = z.infer<typeof verificationResultDtoSchema>;
+
+/** Admin decision on an application. A note is required to ask for changes. */
+export const reviewOnboardingSchema = z
+  .object({
+    note: z.string().max(2000).optional(),
+  })
+  .strict();
+export type ReviewOnboardingRequest = z.infer<typeof reviewOnboardingSchema>;
+
+/** KYC desk: rejecting a document always requires a reason (unlike verifying it). */
+export const rejectKycDocumentSchema = z
+  .object({
+    reason: z.string().min(1).max(2000),
+  })
+  .strict();
+export type RejectKycDocumentRequest = z.infer<typeof rejectKycDocumentSchema>;
+
+/**
+ * The organization an approval created. Deliberately not `organizationDtoSchema`:
+ * that one carries `role`, meaning *the caller's* role in the org, and the
+ * approving admin has none — they provisioned it for someone else.
+ */
+export const provisionedOrganizationDtoSchema = z.object({
+  id: opaqueIdSchema,
+  name: z.string().min(1).max(200),
+  slug: z.string().min(1).max(60),
+  ownerId: opaqueIdSchema,
+  /** Whole-number percent, set from the applicant's plan. */
+  platformFeePercent: z.number().int().nonnegative().max(100),
+  status: z.enum(['active', 'suspended', 'archived']),
+  version: z.number().int().positive(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+});
+export type ProvisionedOrganizationDto = z.infer<typeof provisionedOrganizationDtoSchema>;
+
+export const approveOnboardingResultSchema = z.object({
+  request: z.object({
+    id: opaqueIdSchema,
+    userId: opaqueIdSchema,
+    status: z.enum(['draft', 'submitted', 'changes_requested', 'approved', 'rejected']),
+    requestedType: z.enum(['venue', 'host', 'promoter']),
+    plan: z.enum(['basic', 'silver', 'diamond']),
+    profile: z.object({
+      legalName: z.string().min(1).max(200),
+      contactPerson: z.string().min(1).max(200),
+      phone: z.string().min(6).max(20),
+      city: z.string().min(1).max(120),
+      area: z.string().max(120).optional(),
+      website: z.string().max(300).optional(),
+      capacity: z.number().int().nonnegative().nullable().optional(),
+      instagram: z.string().max(120).optional(),
+      bio: z.string().max(2000).optional(),
+      businessType: z.string().max(120).optional(),
+      registrationNumber: z.string().max(120).optional(),
+      entityType: z.string().max(120).optional(),
+    }),
+    documents: z.array(onboardingDocumentSchema),
+
+    missingDocuments: z.array(z.string()),
+    submittedAt: z.iso.datetime().nullable(),
+    reviewedBy: opaqueIdSchema.nullable(),
+    reviewedAt: z.iso.datetime().nullable(),
+    reviewNote: z.string().nullable(),
+    provisionedOrganizationId: opaqueIdSchema.nullable(),
+    version: z.number().int().positive(),
+    createdAt: z.iso.datetime(),
+    updatedAt: z.iso.datetime(),
+  }),
+  organization: z.object({
+    id: opaqueIdSchema,
+    name: z.string().min(1).max(200),
+    slug: z.string().min(1).max(60),
+    ownerId: opaqueIdSchema,
+    platformFeePercent: z.number().int().nonnegative().max(100),
+    status: z.enum(['active', 'suspended', 'archived']),
+    version: z.number().int().positive(),
+    createdAt: z.iso.datetime(),
+    updatedAt: z.iso.datetime(),
+  }),
+});
+export type ApproveOnboardingResult = z.infer<typeof approveOnboardingResultSchema>;
+
+/* ─── Tiered admin authority ─────────────────────────────────────────────── */
+
+export const adminRoleSchema = z.enum(['super', 'admin', 'ops', 'finance', 'support']);
+
+export const adminActionSchema = z.enum([
+  'EVENT_PAUSE',
+  'EVENT_RESUME',
+  'EVENT_FORCE_PAUSE',
+  'ONBOARDING_APPROVE',
+  'VENUE_SUSPEND',
+  'VENUE_REINSTATE',
+  'ORGANIZATION_SUSPEND',
+  'ORGANIZATION_REINSTATE',
+  'FINANCIAL_REFUND',
+  'PAYOUT_BATCH_RUN',
+  'PAYOUT_COMPLETE',
+  'DISPUTE_RESOLVE',
+  'USER_BAN',
+  'USER_UNBAN',
+  'ADMIN_PROVISION',
+  'ADMIN_ROLE_UPDATE',
+  'COMMISSION_ADJUST',
+  'FINANCIAL_ADJUSTMENT',
+  'PAYOUT_FREEZE',
+  'PAYOUT_RELEASE',
+  'PROMOTER_SUSPEND',
+  'PROMOTER_REINSTATE',
+]);
+
+export const proposalStatusSchema = z.enum(['pending', 'approved', 'rejected', 'cancelled']);
+
+export const platformAdminDtoSchema = z.object({
+  id: opaqueIdSchema,
+  email: z.email(),
+  role: adminRoleSchema,
+  isActive: z.boolean(),
+  version: z.number().int().positive(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+});
+export type PlatformAdminDto = z.infer<typeof platformAdminDtoSchema>;
+
+export const proposedActionDtoSchema = z.object({
+  id: opaqueIdSchema,
+  action: adminActionSchema,
+  proposedBy: opaqueIdSchema,
+  reason: z.string(),
+  payload: z.record(z.string(), z.unknown()),
+  status: proposalStatusSchema,
+  resolvedBy: opaqueIdSchema.nullable(),
+  resolvedAt: z.iso.datetime().nullable(),
+  resolutionReason: z.string().nullable(),
+  version: z.number().int().positive(),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+});
+export type ProposedActionDto = z.infer<typeof proposedActionDtoSchema>;
+
+export const proposeActionSchema = z
+  .object({
+    action: adminActionSchema,
+    reason: z.string().min(1).max(2000),
+    payload: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict();
+export type ProposeActionRequest = z.infer<typeof proposeActionSchema>;
+
+export const resolveProposalSchema = z
+  .object({
+    reason: z.string().max(2000).optional(),
+  })
+  .strict();
+export type ResolveProposalRequest = z.infer<typeof resolveProposalSchema>;
+
+/** Before/after trail of a privileged action. */
+export const adminAuditRecordDtoSchema = z.object({
+  id: opaqueIdSchema,
+  adminId: opaqueIdSchema,
+  // Absent on records written before adminRole existed on this trail --
+  // never backfilled, since a role change since then would misrepresent
+  // what the actor's role actually was at the time of the action.
+  adminRole: z.string().nullable(),
+  action: z.string(),
+  targetType: z.string(),
+  targetId: opaqueIdSchema,
+  /** Live-resolved display name for the target; `null` when unresolvable. */
+  targetName: z.string().nullable(),
+  before: z.record(z.string(), z.unknown()).nullable(),
+  after: z.record(z.string(), z.unknown()).nullable(),
+  reason: z.string().nullable(),
+  occurredAt: z.number().int().nonnegative(),
+});
+export type AdminAuditRecordDto = z.infer<typeof adminAuditRecordDtoSchema>;
+
+/* ─── Admin alerts dashboard ─────────────────────────────────────────────── */
+
+/** Which attention-queue a count refers to. Grows as admin desks ship
+ * (Phase 7: refunds, support SLA). */
+export const adminAlertCategoryKeySchema = z.enum(['pending_proposals', 'pending_onboarding']);
+export type AdminAlertCategoryKey = z.infer<typeof adminAlertCategoryKeySchema>;
+
+/** Visual priority hint for the bell panel, reused by the frontend as-is. */
+export const adminAlertSeveritySchema = z.enum(['normal', 'urgent']);
+
+export const adminAlertCategorySchema = z.object({
+  key: adminAlertCategoryKeySchema,
+  label: z.string(),
+  count: z.number().int().nonnegative(),
+  severity: adminAlertSeveritySchema,
+});
+export type AdminAlertCategory = z.infer<typeof adminAlertCategorySchema>;
+
+/** Snapshot of items needing admin attention. */
+export const adminAlertsResponseSchema = z.object({
+  generatedAt: z.iso.datetime(),
+  categories: z.array(adminAlertCategorySchema),
+});
+export type AdminAlertsResponse = z.infer<typeof adminAlertsResponseSchema>;
+
+export const adminLookupResultItemSchema = z.object({
+  type: z.enum(['venue', 'event', 'organization', 'user']),
+  id: opaqueIdSchema,
+  label: z.string(),
+});
+export type AdminLookupResultItem = z.infer<typeof adminLookupResultItemSchema>;
+
+export const adminLookupResponseSchema = z.object({
+  items: z.array(adminLookupResultItemSchema),
+});
+export type AdminLookupResponse = z.infer<typeof adminLookupResponseSchema>;

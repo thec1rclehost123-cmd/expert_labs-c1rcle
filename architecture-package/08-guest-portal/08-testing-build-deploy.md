@@ -1,0 +1,16 @@
+# 08. Testing, accessibility, performance and deploy
+
+## Tests
+- **Vitest (jsdom):** 38 files, 248 tests, all passing at the last recorded run (`.turbo/turbo-test.log`). Covered: auth route handlers (24 tests in `api/auth/routes.test.ts`), the RSVP route, `proxy-write`, `safe-next-path`, SEO helpers, `proxy.ts`, `booking-mapping`, `CheckoutFlowClient`, `paid-checkout`, `payment-recovery-poll`, `razorpay-checkout`, `wallet-mapping`, `profile-view-model`, `PromoterClickTracker` (the component itself, which nothing renders), page tests for most routes, `production-entity-boundaries.test.tsx`.
+- **Playwright:** only `e2e/smoke.spec.ts` (8 tests on chromium and mobile-safari): home h1, skip-link focus, labelled Primary nav, `/profile` and `/tickets` redirect to login, the login form, forgot and reset page reachability, reset-token stripping. **Not covered end to end:** explore, event, checkout, confirmation, RSVP, the paid flow, tickets, QR. There is no contract or e2e test against a live gateway.
+- **Backend tests** beside each route: discovery (545 lines), `payment-routes` (817), `webhook-routes` (839), plus `scenarios/business-flows.test.ts`.
+- **CI** (`.github/workflows/ci.yml`): PR gate runs format, lint, typecheck, boundaries, `test:coverage`, build; pushes to main/staging run the Playwright matrix (all backend calls mocked) and a post-deploy smoke (staging only, hard-coded `*.vercel.app` URLs).
+
+## Accessibility
+Good: skip link and `<main id="main" tabIndex={-1}>` landmark, labelled Primary navigation, `aria-current` on steps, `role="alert"`/`role="status"` on checkout messages, `aria-pressed` and `aria-expanded` on selectors, a labelled dialog on the ticket modal, a labelled QR, `motion-reduce` classes, `noValidate` login with labels. Gaps: the ticket modal has **no focus trap or Escape handling** (click-outside only); the stepper uses plain buttons without a form-level label; very small (9–10 px) uppercase tracking text and low-contrast `white/25–40` text; `<img>` used 3 times and `unoptimized` Images 7 times.
+
+## Performance notes
+Every page is dynamic (the root layout calls `cookies()`), so `revalidate=300` on `/` is ineffective and `/event/*` relies on the `next.config` Cache-Control override (not verified against Next's dynamic default); one gateway round trip per request that has a cookie (`/api/v2/auth/session`); fan-outs (`/explore` 1 + N, event 3 reads, wallet N browser round trips); the gateway sets no Cache-Control on public GETs; large home videos in `public/` (a desktop party video above budget and unused source JPGs per the handoff doc); unused dependencies.
+
+## Build and deploy
+Vercel project builds with `cd ../.. && pnpm turbo run build --filter=@c1rcle/app-guest-portal`; production branch `main`; dev subdomain `guest.thec1rcle.com` is bound to Preview on `staging` behind Vercel SSO. A Dockerfile exists (standalone, non-root) but its use is unconfirmed. Environment names are in `02-…` and `../13-reference/ENV-MATRIX.md`. The portal needs the gateway CORS allow-list to include its origin for the browser-side wallet and public reads (the tickets page calls the gateway directly with a Bearer token), and the gateway's first request after idle can take 30–40 s on the free Render plan.

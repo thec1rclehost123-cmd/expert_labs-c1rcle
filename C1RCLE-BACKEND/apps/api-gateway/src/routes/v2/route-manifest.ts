@@ -1,0 +1,183 @@
+import { getGatewayConfig, type GatewayConfig } from '../../config/index.js';
+import { createV2Services } from '../../lib/v2-services.js';
+import authContextPlugin from '../../plugins/auth.js';
+
+import adminAnalyticsRoutes from './admin/analytics.js';
+import adminDirectoryRoutes from './admin/directory.js';
+import adminDisputeRoutes from './admin/disputes.js';
+import adminEventActionRoutes from './admin/event-actions.js';
+import adminRoutes from './admin/onboarding-review.js';
+import adminOrderRoutes from './admin/orders.js';
+import adminOrganizationActionRoutes from './admin/organization-actions.js';
+import adminPayoutRoutes from './admin/payouts.js';
+import adminPromotersRoutes from './admin/promoters.js';
+import adminPromotionsRoutes from './admin/promotions.js';
+import adminReconciliationRoutes from './admin/reconciliation.js';
+import adminRefundRoutes from './admin/refunds.js';
+import adminSettingsRoutes from './admin/settings.js';
+import adminSupportRoutes from './admin/support.js';
+import adminTicketRoutes from './admin/tickets.js';
+import adminUserActionRoutes from './admin/user-actions.js';
+import adminVenueActionRoutes from './admin/venue-actions.js';
+import authRoutes from './auth/index.js';
+import otpRoutes from './auth/otp-routes.js';
+import checkoutRoutes from './checkout/checkout-routes.js';
+import paymentRoutes from './checkout/payment-routes.js';
+import webhookRoutes from './checkout/webhook-routes.js';
+import phase5CoverWalletRoutes from './door/cover-wallet-routes.js';
+import doorOpsRoutes from './door/door-ops-routes.js';
+import phase5DoorSaleRoutes from './door/door-sale-routes.js';
+import doorCodeRoutes from './door/event-code-routes.js';
+import phase5ScannerRoutes from './door/scanner-routes.js';
+import financeRoutes from './finance/finance-routes.js';
+import leaderboardRoutes from './finance/leaderboard-routes.js';
+import { internalRoutes } from './internal/index.js';
+import notificationRoutes from './notifications/notifications-routes.js';
+import onboardingRoutes from './onboarding.js';
+import orderRoutes from './orders/orders-routes.js';
+import partnerAnalyticsRoutes from './partner/analytics.js';
+import partnerDiscoveryRoutes from './partner/discover.js';
+import partnerEventCatalogRoutes from './partner/event-catalog.js';
+import partnerEventRoutes from './partner/events.js';
+import partnerOrganizationRoutes from './partner/organizations.js';
+import partnerPartnershipRoutes from './partner/partnerships.js';
+import promoterConnectionRoutes from './partner/promoter-connections.js';
+import partnerReferralLinkRoutes from './partner/referral-links.js';
+import partnerVenueRoutes from './partner/venues.js';
+import phase5Routes from './phase5-routes.js';
+import guestProfileRoutes from './profile.js';
+import publicDiscoveryRoutes from './public/discovery.js';
+import rsvpRoutes from './rsvp/rsvp-routes.js';
+import socialRoutes from './social/social-routes.js';
+import supportIntakeRoutes from './support/intake-routes.js';
+import ticketRoutes from './tickets/ticket-routes.js';
+import walletRoutes from './wallet/wallet-routes.js';
+
+import type { GatewayRuntimeState } from '../../lib/runtime-state.js';
+import type { FastifyInstance } from 'fastify';
+
+export type ReadinessCheck = () => boolean | Promise<boolean>;
+export type ReadinessChecks = Record<string, ReadinessCheck>;
+
+export interface RegisterV2RoutesOptions {
+  config?: GatewayConfig;
+  runtimeState?: GatewayRuntimeState;
+  readinessChecks?: ReadinessChecks;
+}
+
+/**
+ * ─── V2 route manifest ─────────────────────────────────────────────────────────
+ * The single registration surface for all `/api/v2` routes. Phase 4's public
+ * discovery slice (PR1, unauthenticated, under `/public`), checkout/
+ * payments/webhook slice (PR2), and orders/tickets/wallet reads (PR3) are
+ * all LIVE. Ticket transfer/claim/cancel-transfer stay unregistered — the
+ * committed `Entitlement` model has no transfer state to wire against yet
+ * (see `tickets/ticket-routes.ts`'s doc comment); they 404 by absence, never
+ * by a 501 stub (D-006), same as any other genuinely-blocked slice.
+ */
+export async function registerV2Routes(
+  app: FastifyInstance,
+  options: RegisterV2RoutesOptions = {},
+): Promise<void> {
+  const gw = options.config ?? getGatewayConfig();
+  const services = createV2Services();
+  // B10: auth is only real on the firestore driver — built inside
+  // `createV2Services` (which throws `GatewayConfigError` when the firestore
+  // driver lacks credentials), so the staff credential provisioner shares it.
+  const auth = services.auth;
+
+  await app.register(authContextPlugin, {
+    auth,
+    organizations: services.repos().organizations,
+    rotationStore: services.rotationStore,
+  });
+
+  // Path shape: nested org-scoped routes directly under `/api/v2` — no
+  // `/partner` segment. Resolves docs/architecture/decisions.md open question #2 ("manifest
+  // wins") and matches task.md §5 / docs/reference/frontend-api-map.md §2 exactly.
+  // The route files themselves already declare paths like `/organizations`,
+  // `/venues/:venueId`, `/events/:eventId` — removing the old `/partner`
+  // wrapper is the entire fix, no path strings changed in the route files
+  // beyond the events.ts org-scoping already done above.
+  await app.register(
+    async (v2) => {
+      await internalRoutes(v2, {
+        config: gw,
+        runtimeState: options.runtimeState,
+        readinessChecks: options.readinessChecks,
+      });
+      await v2.register(
+        async (a) =>
+          authRoutes(a, {
+            auth,
+            rotationStore: services.rotationStore,
+            organizations: services.organizations,
+          }),
+        { prefix: '/auth' },
+      );
+      await v2.register(otpRoutes, { prefix: '/auth' });
+      // Phase 4 PR1: unauthenticated guest-facing discovery reads — never
+      // nested under the org-scoped/authenticated route group above.
+      await v2.register(publicDiscoveryRoutes, { prefix: '/public' });
+      await partnerOrganizationRoutes(v2);
+      await partnerVenueRoutes(v2);
+      await partnerEventRoutes(v2);
+      await partnerEventCatalogRoutes(v2);
+      await partnerPartnershipRoutes(v2);
+      await partnerDiscoveryRoutes(v2);
+      await partnerAnalyticsRoutes(v2);
+      await partnerReferralLinkRoutes(v2);
+      await promoterConnectionRoutes(v2);
+      // Phase 2: not org-scoped — an applicant has no organization yet, and a
+      // platform admin acts across all of them.
+      await onboardingRoutes(v2);
+      // Guest profile: session-scoped like onboarding — a guest belongs to no org.
+      await guestProfileRoutes(v2);
+      await adminRoutes(v2);
+      await adminRefundRoutes(v2);
+      await adminReconciliationRoutes(v2);
+      await adminPayoutRoutes(v2);
+      await adminDisputeRoutes(v2);
+      await adminDirectoryRoutes(v2);
+      // Phase 7: support desk over the ticket aggregate.
+      await adminSupportRoutes(v2);
+      await adminOrderRoutes(v2);
+      await adminAnalyticsRoutes(v2);
+      await adminTicketRoutes(v2);
+      await adminPromotionsRoutes(v2);
+      await adminPromotersRoutes(v2);
+      await adminVenueActionRoutes(v2);
+      await adminOrganizationActionRoutes(v2);
+      await adminEventActionRoutes(v2);
+      await adminUserActionRoutes(v2);
+      await adminSettingsRoutes(v2);
+      // Phase 4 PR2: guest checkout + payments + Razorpay webhook.
+      await checkoutRoutes(v2);
+      await paymentRoutes(v2);
+      await webhookRoutes(v2);
+      // RSVP: direct free-ticket booking (no provider), same PR2 family.
+      await rsvpRoutes(v2);
+      // Phase 4 PR3: guest order/ticket reads + wallet.
+      await orderRoutes(v2);
+      await ticketRoutes(v2);
+      await walletRoutes(v2);
+      // Phase 5: Door / Scanner / Cover-wallet
+      await doorCodeRoutes(v2);
+      await doorOpsRoutes(v2);
+      await phase5DoorSaleRoutes(v2);
+      await phase5CoverWalletRoutes(v2);
+      await phase5ScannerRoutes(v2);
+      await phase5Routes(v2);
+      // Phase 6: Finance / Ledger / Payouts
+      await financeRoutes(v2);
+      await leaderboardRoutes(v2);
+      // Phase 7: support intake for the guest/requester.
+      await supportIntakeRoutes(v2);
+      // Phase 8: guest follow graph + notification inbox (session-scoped).
+      await socialRoutes(v2);
+      // V2 partner-dashboard inbox (org-tenant recipient).
+      await notificationRoutes(v2);
+    },
+    { prefix: '/api/v2' },
+  );
+}

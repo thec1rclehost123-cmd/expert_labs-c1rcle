@@ -1,0 +1,128 @@
+import type { PartnerDashboardRole, PartnerShellConfig } from './types';
+
+export const PARTNER_SHELL_CONFIG: Readonly<Record<PartnerDashboardRole, PartnerShellConfig>> = {
+  venue: {
+    role: 'venue',
+    eyebrow: 'Venue Studio',
+    navigation: [
+      { label: 'Overview', href: '/venue/overview', icon: 'layout-dashboard', match: 'exact' },
+      {
+        label: 'Events',
+        href: '/venue/events',
+        icon: 'calendar-days',
+        match: 'prefix',
+        permission: 'MANAGE_EVENTS',
+      },
+      {
+        label: 'Partners',
+        href: '/venue/partners',
+        icon: 'users',
+        match: 'exact',
+        permission: 'MANAGE_PARTNERSHIPS',
+      },
+      {
+        label: 'Marketing',
+        href: '/venue/marketing',
+        icon: 'send',
+        match: 'exact',
+        permission: 'MANAGE_PAGE_CONTENT',
+      },
+      {
+        label: 'Presence',
+        href: '/venue/presence',
+        icon: 'globe',
+        match: 'exact',
+        permission: 'MANAGE_PAGE_CONTENT',
+      },
+      {
+        label: 'Finance',
+        href: '/venue/finance',
+        icon: 'wallet-cards',
+        match: 'prefix',
+        permission: 'VIEW_FINANCIALS',
+      },
+      { label: 'Support', href: '/venue/support', icon: 'life-buoy', match: 'prefix' },
+      { label: 'Settings', href: '/venue/settings', icon: 'settings', match: 'exact' },
+    ],
+    primaryAction: { label: 'Create event', href: '/venue/events/create', icon: 'plus' },
+  },
+  host: {
+    role: 'host',
+    eyebrow: 'Host Studio',
+    navigation: [
+      { label: 'Overview', href: '/host/overview', icon: 'layout-dashboard', match: 'exact' },
+      {
+        label: 'Events',
+        href: '/host/events',
+        icon: 'calendar-days',
+        match: 'prefix',
+        permission: 'MANAGE_EVENTS',
+      },
+      {
+        label: 'Partners',
+        href: '/host/partners',
+        icon: 'users',
+        match: 'exact',
+        permission: 'MANAGE_PARTNERSHIPS',
+      },
+      {
+        label: 'Marketing',
+        href: '/host/marketing',
+        icon: 'send',
+        match: 'exact',
+        permission: 'MANAGE_PAGE_CONTENT',
+      },
+      {
+        label: 'Presence',
+        href: '/host/presence',
+        icon: 'globe',
+        match: 'exact',
+        permission: 'MANAGE_PAGE_CONTENT',
+      },
+      {
+        label: 'Finance',
+        href: '/host/finance',
+        icon: 'wallet-cards',
+        match: 'prefix',
+        permission: 'VIEW_FINANCIALS',
+      },
+      { label: 'Support', href: '/host/support', icon: 'life-buoy', match: 'prefix' },
+      { label: 'Settings', href: '/host/settings', icon: 'settings', match: 'exact' },
+    ],
+    primaryAction: { label: 'Start event request', href: '/host/events/create', icon: 'plus' },
+  },
+  promoter: {
+    role: 'promoter',
+    eyebrow: 'Promoter Studio',
+    navigation: [
+      { label: 'Overview', href: '/promoter/overview', icon: 'layout-dashboard', match: 'exact' },
+      {
+        label: 'Events',
+        href: '/promoter/events',
+        icon: 'calendar-days',
+        match: 'prefix',
+      },
+      {
+        label: 'Partners',
+        href: '/promoter/partners',
+        icon: 'users',
+        match: 'exact',
+      },
+      {
+        label: 'Finance',
+        href: '/promoter/finance',
+        icon: 'wallet-cards',
+        match: 'prefix',
+        permission: 'VIEW_FINANCIALS',
+      },
+      {
+        label: 'Links',
+        href: '/promoter/links',
+        icon: 'link',
+        match: 'exact',
+      },
+      { label: 'Settings', href: '/promoter/settings', icon: 'settings', match: 'exact' },
+    ],
+    primaryAction: { label: 'Get link', href: '/promoter/links', icon: 'link' },
+  },
+};

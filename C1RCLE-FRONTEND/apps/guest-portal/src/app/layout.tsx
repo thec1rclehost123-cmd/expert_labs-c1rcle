@@ -1,0 +1,50 @@
+import { cookies } from 'next/headers';
+
+import { getServerSession } from '@c1rcle/auth/server-session';
+
+import { AppShell } from '@/components/app-shell';
+import { SessionProvider } from '@/components/providers/session-provider';
+import { getMetadataBase, publicRobots } from '@/lib/seo/metadata';
+
+import './globals.css';
+
+import type { Metadata, Viewport } from 'next';
+import type { ReactNode } from 'react';
+
+export function generateMetadata(): Metadata {
+  return {
+    metadataBase: getMetadataBase(),
+    title: 'THE C1RCLE | Discover Life Offline',
+    description: 'Discover, book and manage your C1RCLE experiences.',
+    robots: publicRobots(),
+    icons: { icon: [{ url: '/c1rcle-logo.webp', type: 'image/webp', sizes: '128x128' }] },
+    manifest: '/manifest.webmanifest',
+  };
+}
+
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  themeColor: '#000000',
+};
+
+export default async function RootLayout({ children }: { readonly children: ReactNode }) {
+  const session = await getServerSession((await cookies()).toString());
+
+  return (
+    <html lang="en">
+      <body className="min-h-dvh bg-black text-white antialiased">
+        <a
+          href="#main"
+          className="sr-only-focusable absolute left-4 top-4 z-50 rounded-md bg-primary px-4 py-2 text-primary-foreground"
+        >
+          Skip to content
+        </a>
+
+        <SessionProvider initialUser={session}>
+          <AppShell>{children}</AppShell>
+        </SessionProvider>
+      </body>
+    </html>
+  );
+}

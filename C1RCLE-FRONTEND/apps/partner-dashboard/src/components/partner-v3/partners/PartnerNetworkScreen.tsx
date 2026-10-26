@@ -1,0 +1,790 @@
+import Link from 'next/link';
+import { useState } from 'react';
+
+import { useSessionStore } from '@c1rcle/auth';
+
+import { Avatar } from '@/components/partner-v3/Avatar';
+import { Badge } from '@/components/partner-v3/Badge';
+import { Button } from '@/components/partner-v3/Button';
+import { PageContainer } from '@/components/partner-v3/PagePrimitives';
+import { SearchInput } from '@/components/partner-v3/SearchInput';
+import { EmptyState } from '@/components/partner-v3/States';
+
+import { PartnerCard } from './PartnerCard';
+import { PartnerProfilePanel } from './PartnerProfilePanel';
+import { PartnerRequestCard } from './PartnerRequestCard';
+import styles from './partners.module.css';
+import { PartnerStaffEditRoleDialog } from './PartnerStaffEditRoleDialog';
+import { AddStaffButton, PartnerStaffInviteDialog } from './PartnerStaffInviteDialog';
+
+import type {
+  PartnerRelationship,
+  PartnerRelationshipSet,
+  PartnerRequest,
+  PartnerSegment,
+  PartnerSubView,
+  StaffInvite,
+  StaffMember,
+} from '@/data/partner-data-source';
+
+export interface PartnerNetworkData {
+  readonly primary: PartnerRelationshipSet;
+  readonly promoters: PartnerRelationshipSet;
+  readonly staff: readonly StaffMember[];
+}
+
+export interface PartnerRequestActions<TPartner> {
+  readonly pendingRequestId?: string | null;
+  readonly pendingRequestAction?: 'approve' | 'reject' | null;
+  readonly requestErrorId?: string | null;
+  readonly requestError?: string | null;
+  readonly connectingPartnerId?: string | null;
+  readonly connectErrorId?: string | null;
+  readonly connectError?: string | null;
+  readonly onApproveRequest?: ((request: PartnerRequest) => void) | undefined;
+  readonly onRejectRequest?: ((request: PartnerRequest) => void) | undefined;
+  readonly onConnectPartner?: ((partner: TPartner) => void) | undefined;
+}
+
+export interface PartnerNetworkScreenProps {
+  readonly data: PartnerNetworkData;
+  readonly baseHref: string;
+  readonly primarySegment: 'hosts' | 'venues';
+  readonly primaryLabel: 'Hosts' | 'Venues';
+  readonly primarySubLabel: 'My partners' | 'My Venues';
+  readonly segment?: PartnerSegment;
+  readonly subView?: PartnerSubView;
+  readonly search?: string;
+  readonly profileId?: string;
+  readonly showSearch?: boolean;
+  readonly hostAccent?: boolean;
+  /** Server-resolved org, handed to the request-card action islands. */
+  readonly organizationId?: string;
+  readonly pendingRequestId?: string | null;
+  readonly pendingRequestAction?: 'approve' | 'reject' | null;
+  readonly requestErrorId?: string | null;
+  readonly requestError?: string | null;
+  readonly connectingPartnerId?: string | null;
+  readonly connectErrorId?: string | null;
+  readonly connectError?: string | null;
+  readonly onApproveRequest?: ((request: PartnerRequest) => void) | undefined;
+  readonly onRejectRequest?: ((request: PartnerRequest) => void) | undefined;
+  readonly onConnect?: ((partner: PartnerRelationship) => void) | undefined;
+  readonly staffInvites?: readonly StaffInvite[];
+  readonly staffCanManage?: boolean;
+  readonly staffError?: string | null;
+  readonly revokingInviteId?: string | null;
+  readonly revokeErrorId?: string | null;
+  readonly revokeError?: string | null;
+  readonly onRevokeInvite?: ((invite: StaffInvite) => void) | undefined;
+  readonly onStaffChanged?: (() => void) | undefined;
+  readonly studioCapability?: 'venue' | 'host';
+  readonly isAdmin?: boolean;
+  readonly currentUserId?: string | undefined;
+  readonly currentUserEmail?: string | undefined;
+  /** For revoking active members (not invites) */
+  readonly revokingMemberId?: string | null;
+  readonly revokeAccessErrorId?: string | null;
+  readonly revokeAccessError?: string | null;
+  readonly onRevokeMemberAccess?: ((member: StaffMember) => void) | undefined;
+}
+
+interface QueryState {
+  readonly segment: PartnerSegment;
+  readonly subView: PartnerSubView;
+  readonly search: string;
+  readonly profileId: string | undefined;
+}
+
+const filterBySearch = <T extends { readonly name: string }>(
+  records: readonly T[],
+  search: string,
+) => {
+  const normalized = search.trim().toLowerCase();
+  return normalized
+    ? records.filter((record) => record.name.toLowerCase().includes(normalized))
+    : records;
+};
+
+const relationshipRecords = (
+  data: PartnerNetworkData,
+  segment: 'hosts' | 'venues' | 'promoters',
+  subView: PartnerSubView,
+): readonly PartnerRelationship[] =>
+  data[segment === 'promoters' ? 'promoters' : 'primary'][
+    subView === 'connected' ? 'connected' : 'discover'
+  ];
+
+function staffChips(member: StaffMember): readonly string[] {
+  if (member.capabilities && member.capabilities.length > 0) {
+    return member.backendRole
+      ? [member.backendRole, ...member.capabilities]
+      : [...member.capabilities];
+  }
+  return member.permissions;
+}
+
+function formatJoinedDate(isoString?: string): string {
+  if (!isoString) return '';
+  try {
+    const date = new Date(isoString);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  } catch {
+    return '';
+  }
+}
+
+function RevokeAccessConfirmDialog({
+  member,
+  revoking,
+  revokeError,
+  onConfirm,
+  onClose,
+}: {
+  readonly member: StaffMember;
+  readonly revoking: boolean;
+  readonly revokeError: string | null;
+  readonly onConfirm: (member: StaffMember) => void;
+  readonly onClose: () => void;
+}) {
+  return (
+    <div className={styles['dialogRoot']} role="presentation">
+      <button
+        type="button"
+        className={styles['dialogScrim']}
+        aria-label="Close revoke access dialog"
+        onClick={onClose}
+      />
+      <section
+        className={[styles['staffDialog'], styles['revokeConfirmDialog']].join(' ')}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="revoke-access-title"
+      >
+        <div className={styles['dialogHeader']}>
+          <div>
+            <span className={styles['sectionKicker']}>Team access</span>
+            <h2 id="revoke-access-title">Revoke access?</h2>
+          </div>
+        </div>
+        <div className={styles['revokeConfirmBody']}>
+          <p>
+            This will remove <span className={styles['revokeConfirmName']}>{member.name}</span> from
+            your organization. They will immediately lose all access.
+          </p>
+          <p>Current role: {member.role}</p>
+        </div>
+        {revokeError ? (
+          <p className={styles['revokeErrorNotice']} role="alert">
+            {revokeError}
+          </p>
+        ) : null}
+        <div className={styles['revokeConfirmActions']}>
+          <Button type="button" variant="secondary" onClick={onClose} disabled={revoking}>
+            Cancel
+          </Button>
+          <button
+            type="button"
+            className={styles['buttonDanger']}
+            disabled={revoking}
+            onClick={() => {
+              onConfirm(member);
+            }}
+          >
+            {revoking ? 'Revoking…' : 'Revoke access'}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function StaffList({
+  staff,
+  invites,
+  search,
+  canManage,
+  isAdmin = canManage,
+  currentUserId,
+  currentUserEmail,
+  organizationId,
+  onStaffChanged,
+  staffError,
+  revokingInviteId,
+  revokeErrorId,
+  revokeError,
+  onRevokeInvite,
+  revokingMemberId,
+  revokeAccessErrorId,
+  revokeAccessError,
+  onRevokeMemberAccess,
+}: {
+  readonly staff: readonly StaffMember[];
+  readonly invites: readonly StaffInvite[];
+  readonly search: string;
+  readonly canManage: boolean;
+  readonly isAdmin?: boolean;
+  readonly currentUserId?: string | undefined;
+  readonly currentUserEmail?: string | undefined;
+  readonly organizationId?: string | undefined;
+  readonly onStaffChanged?: (() => void) | undefined;
+  readonly staffError: string | null;
+  readonly revokingInviteId: string | null;
+  readonly revokeErrorId: string | null;
+  readonly revokeError: string | null;
+  readonly onRevokeInvite?: ((invite: StaffInvite) => void) | undefined;
+  readonly revokingMemberId: string | null;
+  readonly revokeAccessErrorId: string | null;
+  readonly revokeAccessError: string | null;
+  readonly onRevokeMemberAccess?: ((member: StaffMember) => void) | undefined;
+}) {
+  const sessionState = useSessionStore();
+  const sessionUser = sessionState.session?.user;
+  const effectiveUserId = currentUserId ?? sessionUser?.id;
+  const effectiveUserEmail = currentUserEmail ?? sessionUser?.email;
+  const [editingMember, setEditingMember] = useState<StaffMember | null>(null);
+  const [revokingMemberCandidate, setRevokingMemberCandidate] = useState<StaffMember | null>(null);
+  const [reinvitingCandidate, setReinvitingCandidate] = useState<StaffInvite | null>(null);
+  const normalized = search.trim().toLowerCase();
+  const members = filterBySearch(staff, search);
+  const pendingInvites = invites.filter(
+    (invite) =>
+      invite.status === 'pending' &&
+      (!normalized || invite.email.toLowerCase().includes(normalized)),
+  );
+
+  const activeMemberEmails = new Set(staff.map((m) => m.email?.toLowerCase()).filter(Boolean));
+  const pendingInviteEmails = new Set(
+    invites.filter((i) => i.status === 'pending').map((i) => i.email.toLowerCase()),
+  );
+
+  const revokedMap = new Map<string, StaffInvite>();
+  for (const invite of invites) {
+    if (invite.status === 'revoked') {
+      const emailLower = invite.email.toLowerCase();
+      if (!activeMemberEmails.has(emailLower) && !pendingInviteEmails.has(emailLower)) {
+        if (!revokedMap.has(emailLower)) {
+          revokedMap.set(emailLower, invite);
+        }
+      }
+    }
+  }
+
+  const revokedStaff = Array.from(revokedMap.values()).filter(
+    (invite) => !normalized || invite.email.toLowerCase().includes(normalized),
+  );
+
+  if (staffError) {
+    return <EmptyState title="Couldn't load staff" description={staffError} />;
+  }
+
+  if (staff.length === 0 && pendingInvites.length === 0 && revokedStaff.length === 0) {
+    return (
+      <EmptyState
+        title="No staff yet"
+        description="Invite your team by email — they appear here once they accept."
+      />
+    );
+  }
+
+  if (
+    normalized &&
+    members.length === 0 &&
+    pendingInvites.length === 0 &&
+    revokedStaff.length === 0
+  ) {
+    return (
+      <EmptyState title="No staff found" description="Try a different name or clear the search." />
+    );
+  }
+
+  return (
+    <div className={styles['staffSection']}>
+      {pendingInvites.length > 0 ? (
+        <section>
+          <h2 className={styles['requestSectionHeading']}>Pending invites</h2>
+          <div className={styles['requestList']}>
+            {pendingInvites.map((invite) => (
+              <article className={styles['requestCard']} key={invite.id}>
+                <div className={styles['partnerIdentity']}>
+                  <Avatar name={invite.email} />
+                  <div>
+                    <div className={styles['requestNameRow']}>
+                      <h3>{invite.email}</h3>
+                      <Badge tone="neutral">Invite sent</Badge>
+                    </div>
+                    <p>
+                      {invite.role}
+                      {invite.capabilities.length > 0 ? ` · ${invite.capabilities.join(', ')}` : ''}
+                    </p>
+                    {revokeErrorId === invite.id && revokeError ? (
+                      <p role="alert">{revokeError}</p>
+                    ) : null}
+                  </div>
+                </div>
+                {canManage && onRevokeInvite ? (
+                  <div className={styles['requestActions']}>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      disabled={revokingInviteId === invite.id}
+                      onClick={() => {
+                        onRevokeInvite(invite);
+                      }}
+                    >
+                      {revokingInviteId === invite.id ? 'Revoking…' : 'Revoke'}
+                    </Button>
+                  </div>
+                ) : null}
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {revokedStaff.length > 0 ? (
+        <section>
+          <h2 className={styles['requestSectionHeading']}>
+            Revoked access ({revokedStaff.length})
+          </h2>
+          <div className={styles['requestList']}>
+            {revokedStaff.map((item) => (
+              <article className={styles['requestCard']} key={item.id}>
+                <div className={styles['partnerIdentity']}>
+                  <Avatar name={item.email} />
+                  <div>
+                    <div className={styles['requestNameRow']}>
+                      <h3>{item.email}</h3>
+                      <Badge tone="warning">Revoked</Badge>
+                    </div>
+                    <p>
+                      {item.role}
+                      {item.capabilities.length > 0 ? ` · ${item.capabilities.join(', ')}` : ''}
+                    </p>
+                  </div>
+                </div>
+                {canManage ? (
+                  <div className={styles['requestActions']}>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      onClick={() => {
+                        setReinvitingCandidate(item);
+                      }}
+                    >
+                      Add again
+                    </Button>
+                  </div>
+                ) : null}
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {members.length > 0 ? (
+        <div className={styles['staffGrid']}>
+          {members.map((member) => {
+            const isSameUser =
+              Boolean(effectiveUserId) &&
+              (member.userId === effectiveUserId || member.id === effectiveUserId);
+            const isSameEmail =
+              Boolean(effectiveUserEmail) &&
+              member.email?.toLowerCase() === effectiveUserEmail?.toLowerCase();
+            const isYou = isSameUser || isSameEmail;
+            return (
+              <article className={styles['staffCard']} key={member.id}>
+                <div className={styles['staffCardHeader']}>
+                  <div className={styles['partnerIdentity']}>
+                    <Avatar name={member.name} />
+                    <div>
+                      <div className={styles['staffNameRow']}>
+                        <h3>{member.name}</h3>
+                        {isYou ? (
+                          <Badge tone="accent" className={styles['youTag']}>
+                            You
+                          </Badge>
+                        ) : null}
+                      </div>
+                      <p className={styles['staffRoleText']}>{member.role}</p>
+                    </div>
+                  </div>
+                  <Badge tone="success">{member.status}</Badge>
+                </div>
+                <div className={styles['permissionChips']}>
+                  {staffChips(member).map((chip) => (
+                    <span key={chip}>{chip}</span>
+                  ))}
+                </div>
+                <div className={styles['staffDetails']}>
+                  {member.email ? (
+                    <p className={styles['staffDetailItem']}>
+                      <span className={styles['staffDetailLabel']}>Email:</span> {member.email}
+                    </p>
+                  ) : null}
+                  {member.joinedAt ? (
+                    <p className={styles['staffDetailItem']}>
+                      <span className={styles['staffDetailLabel']}>Joined:</span>{' '}
+                      {formatJoinedDate(member.joinedAt)}
+                    </p>
+                  ) : null}
+                </div>
+                {isAdmin ? (
+                  <div className={styles['staffCardActions']}>
+                    {member.backendRole === 'owner' ? (
+                      <span className={styles['ownerBadge']} title="Owner role cannot be changed">
+                        Owner (Primary)
+                      </span>
+                    ) : (
+                      <>
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          onClick={() => {
+                            setEditingMember(member);
+                          }}
+                        >
+                          Edit role
+                        </Button>
+                        {!isYou && onRevokeMemberAccess ? (
+                          <div className={styles['staffCardActionsRight']}>
+                            <button
+                              type="button"
+                              className={styles['buttonDanger']}
+                              disabled={revokingMemberId === (member.userId ?? member.id)}
+                              title="Revoke this member's access"
+                              onClick={() => {
+                                setRevokingMemberCandidate(member);
+                              }}
+                            >
+                              {revokingMemberId === (member.userId ?? member.id)
+                                ? 'Revoking…'
+                                : 'Revoke access'}
+                            </button>
+                            {revokeAccessErrorId === (member.userId ?? member.id) &&
+                            revokeAccessError ? (
+                              <p role="alert" className={styles['revokeErrorNotice']}>
+                                {revokeAccessError}
+                              </p>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                ) : null}
+              </article>
+            );
+          })}
+        </div>
+      ) : normalized ? (
+        <EmptyState
+          title="No staff found"
+          description="Try a different name or clear the search."
+        />
+      ) : null}
+      {!canManage ? (
+        <p className={styles['dialogNotice']}>
+          Only team members with staff-management access can invite or revoke staff.
+        </p>
+      ) : null}
+      {editingMember ? (
+        <PartnerStaffEditRoleDialog
+          member={editingMember}
+          onClose={() => {
+            setEditingMember(null);
+          }}
+          {...(onStaffChanged ? { onUpdated: onStaffChanged } : {})}
+          {...(organizationId ? { organizationId } : {})}
+        />
+      ) : null}
+      {revokingMemberCandidate ? (
+        <RevokeAccessConfirmDialog
+          member={revokingMemberCandidate}
+          revoking={
+            revokingMemberId === (revokingMemberCandidate.userId ?? revokingMemberCandidate.id)
+          }
+          revokeError={
+            revokeAccessErrorId === (revokingMemberCandidate.userId ?? revokingMemberCandidate.id)
+              ? revokeAccessError
+              : null
+          }
+          onClose={() => {
+            setRevokingMemberCandidate(null);
+          }}
+          onConfirm={(member) => {
+            onRevokeMemberAccess?.(member);
+            setRevokingMemberCandidate(null);
+          }}
+        />
+      ) : null}
+      {reinvitingCandidate ? (
+        <PartnerStaffInviteDialog
+          initialEmail={reinvitingCandidate.email}
+          initialRole={
+            reinvitingCandidate.role === 'admin' ||
+            reinvitingCandidate.role === 'manager' ||
+            reinvitingCandidate.role === 'member'
+              ? reinvitingCandidate.role
+              : 'member'
+          }
+          defaultCapability={
+            reinvitingCandidate.capabilities.includes('venue')
+              ? 'venue'
+              : reinvitingCandidate.capabilities.includes('host')
+                ? 'host'
+                : undefined
+          }
+          {...(organizationId ? { organizationId } : {})}
+          onClose={() => {
+            setReinvitingCandidate(null);
+          }}
+          onInvited={() => {
+            setReinvitingCandidate(null);
+            onStaffChanged?.();
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+export function PartnerNetworkScreen({
+  data,
+  baseHref,
+  primarySegment,
+  primaryLabel,
+  primarySubLabel,
+  segment = primarySegment,
+  subView = 'connected',
+  search = '',
+  profileId,
+  showSearch = true,
+  hostAccent = false,
+  organizationId,
+  pendingRequestId = null,
+  pendingRequestAction = null,
+  requestErrorId = null,
+  requestError = null,
+  connectingPartnerId = null,
+  connectErrorId = null,
+  connectError = null,
+  onApproveRequest,
+  onRejectRequest,
+  onConnect,
+  staffInvites = [],
+  staffCanManage = true,
+  staffError = null,
+  revokingInviteId = null,
+  revokeErrorId = null,
+  revokeError = null,
+  onRevokeInvite,
+  onStaffChanged,
+  studioCapability,
+  isAdmin = staffCanManage,
+  currentUserId,
+  currentUserEmail,
+  revokingMemberId = null,
+  revokeAccessErrorId = null,
+  revokeAccessError = null,
+  onRevokeMemberAccess,
+}: PartnerNetworkScreenProps) {
+  const state: QueryState = { segment, subView, search, profileId };
+  const partnerSet =
+    segment === 'staff' ? null : segment === primarySegment ? data.primary : data.promoters;
+  const records =
+    segment === 'hosts' || segment === 'venues' || segment === 'promoters'
+      ? filterBySearch(relationshipRecords(data, segment, subView), search)
+      : [];
+  const requests =
+    partnerSet && subView === 'requests'
+      ? [
+          ...filterBySearch(partnerSet.requests.incoming, search),
+          ...filterBySearch(partnerSet.requests.outgoing, search),
+        ]
+      : [];
+  const profile = partnerSet
+    ? [...partnerSet.connected, ...partnerSet.discover].find((item) => item.id === profileId)
+    : undefined;
+  const rootClass = hostAccent ? styles['hostPartners'] : '';
+  const hrefFor = (overrides: Partial<QueryState> = {}) => {
+    const next = { ...state, ...overrides };
+    const params = new URLSearchParams();
+    if (next.segment !== primarySegment) params.set('tab', next.segment);
+    if (next.segment !== 'staff' && next.subView !== 'connected') params.set('view', next.subView);
+    if (next.search) params.set('search', next.search);
+    if (next.profileId) params.set('profile', next.profileId);
+    const query = params.toString();
+    return `${baseHref}${query ? `?${query}` : ''}`;
+  };
+  const segmentItems = [
+    { value: primarySegment, label: primaryLabel },
+    { value: 'promoters' as const, label: 'Promoters' },
+    { value: 'staff' as const, label: 'Staff' },
+  ];
+  const subViewItems = [
+    { value: 'connected' as const, label: primarySubLabel },
+    { value: 'discover' as const, label: 'Discover' },
+    { value: 'requests' as const, label: 'Requests' },
+  ];
+
+  return (
+    <PageContainer>
+      <div className={rootClass}>
+        <header className={styles['partnersHeader']}>
+          <div>
+            <span className={styles['sectionKicker']}>Network</span>
+            <h1>Partners</h1>
+            <p>The venues, promoters &amp; staff you run nights with.</p>
+          </div>
+          {segment === 'staff' ? (
+            <AddStaffButton
+              {...(hostAccent ? { buttonClassName: styles['hostPrimaryButton'] } : {})}
+              {...(studioCapability ? { defaultCapability: studioCapability } : {})}
+              {...(onStaffChanged ? { onInvited: onStaffChanged } : {})}
+              {...(organizationId ? { organizationId } : {})}
+              disabled={!staffCanManage}
+              disabledTitle="You need staff-management access to invite staff"
+            />
+          ) : null}
+        </header>
+        <nav className={styles['segmentTabs']} aria-label="Partner type">
+          {segmentItems.map((item) => (
+            <Link
+              key={item.value}
+              href={hrefFor({ segment: item.value, subView: 'connected', profileId: undefined })}
+              className={segment === item.value ? styles['segmentTabActive'] : ''}
+              aria-current={segment === item.value ? 'page' : undefined}
+            >
+              {item.label}
+            </Link>
+          ))}
+        </nav>
+        {segment !== 'staff' ? (
+          <nav className={styles['subTabs']} aria-label={`${segment} partner views`}>
+            {subViewItems.map((item) => (
+              <Link
+                key={item.value}
+                href={hrefFor({ subView: item.value, profileId: undefined })}
+                className={subView === item.value ? styles['subTabActive'] : ''}
+                aria-current={subView === item.value ? 'page' : undefined}
+              >
+                {item.label}
+              </Link>
+            ))}
+          </nav>
+        ) : null}
+        {showSearch ? (
+          <form className={styles['partnerToolbar']} action={baseHref} method="get">
+            <input type="hidden" name="tab" value={segment} />
+            {segment !== 'staff' ? <input type="hidden" name="view" value={subView} /> : null}
+            <SearchInput
+              name="search"
+              defaultValue={search}
+              placeholder={segment === 'staff' ? 'Search staff' : 'Search partners'}
+              aria-label={segment === 'staff' ? 'Search staff' : 'Search partners'}
+            />
+            <Button type="submit" variant="secondary">
+              Search
+            </Button>
+            {search ? (
+              <Link
+                className={styles['clearSearch']}
+                href={hrefFor({ search: '', profileId: undefined })}
+              >
+                Clear
+              </Link>
+            ) : null}
+          </form>
+        ) : null}
+        {subView === 'requests' && segment !== 'staff' ? (
+          requests.length ? (
+            <div className={styles['requestList']}>
+              {requests.map((request) => (
+                <PartnerRequestCard
+                  key={`${request.direction}-${request.id}`}
+                  request={request}
+                  hostAccent={hostAccent}
+                  pendingRequestId={pendingRequestId ?? null}
+                  pendingRequestAction={pendingRequestAction ?? null}
+                  requestErrorId={requestErrorId ?? null}
+                  requestError={requestError ?? null}
+                  onApproveRequest={onApproveRequest}
+                  onRejectRequest={onRejectRequest}
+                  {...(organizationId ? { organizationId } : {})}
+                />
+              ))}
+            </div>
+          ) : (
+            <EmptyState
+              title="No requests found"
+              description="Incoming and outgoing partner requests will appear here."
+            />
+          )
+        ) : segment === 'staff' ? (
+          <StaffList
+            staff={data.staff}
+            invites={staffInvites}
+            search={search}
+            canManage={staffCanManage}
+            isAdmin={isAdmin}
+            staffError={staffError}
+            revokingInviteId={revokingInviteId}
+            revokeErrorId={revokeErrorId}
+            revokeError={revokeError}
+            {...(currentUserId ? { currentUserId } : {})}
+            {...(currentUserEmail ? { currentUserEmail } : {})}
+            {...(organizationId ? { organizationId } : {})}
+            {...(onRevokeInvite ? { onRevokeInvite } : {})}
+            {...(onStaffChanged ? { onStaffChanged } : {})}
+            revokingMemberId={revokingMemberId}
+            revokeAccessErrorId={revokeAccessErrorId}
+            revokeAccessError={revokeAccessError}
+            {...(onRevokeMemberAccess ? { onRevokeMemberAccess } : {})}
+          />
+        ) : records.length ? (
+          <div className={styles['partnerGrid']}>
+            {records.map((partner) => (
+              <PartnerCard
+                key={partner.id}
+                partner={partner}
+                href={hrefFor({ profileId: partner.id })}
+                hostAccent={hostAccent}
+                connecting={connectingPartnerId === partner.id}
+                connectError={connectErrorId === partner.id ? (connectError ?? null) : null}
+                onConnect={onConnect}
+              />
+            ))}
+          </div>
+        ) : (
+          <EmptyState
+            title="No partners found"
+            description="Try a different search or explore the discover view."
+            action={
+              <Link
+                className={styles['emptyLink']}
+                href={hrefFor({ search: '', subView: 'discover', profileId: undefined })}
+              >
+                Browse discover
+              </Link>
+            }
+          />
+        )}
+        {profile ? (
+          <PartnerProfilePanel
+            partner={profile}
+            closeHref={hrefFor({ profileId: undefined })}
+            {...(hostAccent ? { primaryButtonClassName: styles['hostPrimaryButton'] } : {})}
+            hostAccent={hostAccent}
+            connecting={connectingPartnerId === profile.id}
+            connectError={connectErrorId === profile.id ? (connectError ?? null) : null}
+            onConnect={onConnect}
+          />
+        ) : null}
+      </div>
+    </PageContainer>
+  );
+}

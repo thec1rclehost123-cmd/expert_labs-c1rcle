@@ -1,0 +1,222 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  assertCsrf,
+  assertPathId,
+  assertSameOrigin,
+  forwardToGateway,
+  mintCsrfToken,
+  passThroughGatewayError,
+  rescopeSessionCookies,
+  stripProtoKeys,
+} from './auth-proxy';
+
+vi.mock('@c1rcle/config', () => ({
+  getClientEnv: () => ({
+    NEXT_PUBLIC_API_BASE_URL: 'https://api.example.com',
+    NEXT_PUBLIC_APP_NAME: 'partner-dashboard',
+    NEXT_PUBLIC_APP_ID: 'partner',
+    NEXT_PUBLIC_ENVIRONMENT: 'development',
+    NEXT_PUBLIC_SENTRY_DSN: null,
+  }),
+  resetEnvCacheForTests: vi.fn(),
+}));
+
+const APP_ORIGIN = 'http://localhost:3001';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+function request(headers: Record<string, string>): NextRequest {
+  return new NextRequest(`${APP_ORIGIN}/api/auth/refresh`, { method: 'POST', headers });
+}
+
+describe('assertSameOrigin', () => {
+  it('allows a same-origin request', () => {
+    expect(assertSameOrigin(request({ origin: APP_ORIGIN }))).toBeNull();
+  });
+
+  it('allows a request with no Origin header (server-to-server / same-origin GET)', () => {
+    expect(assertSameOrigin(request({}))).toBeNull();
+  });
+
+  it('rejects a cross-origin Origin', async () => {
+    const res = assertSameOrigin(request({ origin: 'http://evil.example' }));
+    expect(res?.status).toBe(403);
+    await expect(res?.json()).resolves.toMatchObject({ code: 'forbidden' });
+  });
+
+  it('rejects Sec-Fetch-Site: cross-site', () => {
+    expect(assertSameOrigin(request({ 'sec-fetch-site': 'cross-site' }))?.status).toBe(403);
+  });
+});
+
+describe('assertCsrf', () => {
+  it('passes when the cookie and header match', () => {
+    const req = request({ 'x-csrf-token': 'tok-123', cookie: 'partner.c1rcle.csrf=tok-123' });
+    expect(assertCsrf(req)).toBeNull();
+  });
+
+  it('rejects a mismatch', () => {
+    const req = request({ 'x-csrf-token': 'tok-123', cookie: 'partner.c1rcle.csrf=different' });
+    expect(assertCsrf(req)?.status).toBe(403);
+  });
+
+  it('rejects a missing token', () => {
+    expect(assertCsrf(request({ cookie: 'partner.c1rcle.csrf=tok-123' }))?.status).toBe(403);
+    expect(assertCsrf(request({ 'x-csrf-token': 'tok-123' }))?.status).toBe(403);
+    expect(assertCsrf(request({}))?.status).toBe(403);
+  });
+});
+
+describe('stripProtoKeys', () => {
+  it('removes __proto__ / constructor / prototype at any depth', () => {
+    const input = JSON.parse(
+      '{"email":"a@b.com","nested":{"__proto__":{"polluted":true},"ok":1},"list":[{"constructor":"x","y":2}]}',
+    ) as Record<string, unknown>;
+
+    const cleaned = stripProtoKeys(input) as {
+      email: string;
+      nested: Record<string, unknown>;
+      list: Record<string, unknown>[];
+    };
+
+    expect(cleaned.email).toBe('a@b.com');
+    expect(Object.prototype.hasOwnProperty.call(cleaned.nested, '__proto__')).toBe(false);
+    expect(cleaned.nested['ok']).toBe(1);
+    expect(cleaned.list[0]).not.toHaveProperty('constructor');
+    expect(cleaned.list[0]?.['y']).toBe(2);
+  });
+});
+
+describe('mintCsrfToken', () => {
+  it('returns a fresh base64url token each call', () => {
+    const a = mintCsrfToken();
+    const b = mintCsrfToken();
+    expect(a).not.toBe(b);
+    expect(a).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(a.length).toBeGreaterThanOrEqual(42);
+  });
+});
+
+describe('rescopeSessionCookies', () => {
+  it('re-emits gateway cookies host-only with HttpOnly + SameSite=Lax, Domain dropped', () => {
+    const gatewayResponse = new Response(null, { status: 200 });
+    gatewayResponse.headers.append(
+      'set-cookie',
+      'better-auth.session_token=abc123; Path=/; HttpOnly; Domain=api.c1rcle.test; Max-Age=604800; SameSite=None; Secure',
+    );
+
+    const out = new NextResponse(null, { status: 200 });
+    const names = rescopeSessionCookies(gatewayResponse, out);
+
+    expect(names).toEqual(['better-auth.session_token']);
+    const setCookie = out.headers.get('set-cookie') ?? '';
+    expect(setCookie).toContain('better-auth.session_token=abc123');
+    expect(setCookie.toLowerCase()).toContain('httponly');
+    expect(setCookie.toLowerCase()).toContain('samesite=lax');
+    expect(setCookie.toLowerCase()).not.toContain('domain=');
+  });
+
+  it('does not double-encode a value containing reserved characters (regression: this broke every /refresh with a real Better Auth token)', () => {
+    // A real Better Auth session token is base64 — it contains `/` and `=`, which
+    // the gateway's own `Set-Cookie` already percent-encodes once. Passing that
+    // encoded string straight into `res.cookies.set()` (which encodes again) is
+    // exactly the bug: the browser ends up storing/replaying a token that never
+    // matches the original, so `POST /api/auth/refresh` 401s every time.
+    const rawToken =
+      'AcdMb7pFISI1UyXTcorZLBeXYwURG1At.TJZdUTST1bVFtrlsvP7EYKlqcRTk/u/4t32xhZM26LI=';
+    const gatewayResponse = new Response(null, { status: 200 });
+    gatewayResponse.headers.append(
+      'set-cookie',
+      `better-auth.session_token=${encodeURIComponent(rawToken)}; Path=/; HttpOnly; Max-Age=604800`,
+    );
+
+    const out = new NextResponse(null, { status: 200 });
+    rescopeSessionCookies(gatewayResponse, out);
+
+    const setCookie = out.headers.get('set-cookie') ?? '';
+    const match = /better-auth\.session_token=([^;]+)/.exec(setCookie);
+    const emitted = match?.[1] ?? '';
+
+    // Exactly one layer of encoding: decoding once must recover the original token...
+    expect(decodeURIComponent(emitted)).toBe(rawToken);
+    // ...and decoding it a second time must be a no-op — proof it wasn't encoded twice.
+    expect(decodeURIComponent(decodeURIComponent(emitted))).toBe(rawToken);
+  });
+
+  it('strips the __Secure- prefix so the browser stores the cookie on an http dev origin', () => {
+    const gatewayResponse = new Response(null, { status: 200 });
+    gatewayResponse.headers.append(
+      'set-cookie',
+      '__Secure-better-auth.session_token=abc123; Max-Age=604800; Path=/; HttpOnly; Secure; SameSite=Lax',
+    );
+
+    const out = new NextResponse(null, { status: 200 });
+    const names = rescopeSessionCookies(gatewayResponse, out);
+
+    expect(names).toEqual(['better-auth.session_token']);
+    const setCookie = out.headers.get('set-cookie') ?? '';
+    expect(setCookie).toContain('better-auth.session_token=abc123');
+    expect(setCookie).not.toContain('__Secure-');
+  });
+});
+
+describe('forwardToGateway', () => {
+  it('re-adds the __Secure- twin of the session cookie for production gateways', async () => {
+    const sent = { cookie: '' };
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        sent.cookie = (init?.headers as Record<string, string> | undefined)?.['cookie'] ?? '';
+        return Promise.resolve(
+          new Response(JSON.stringify({ status: 200, code: 'ok', message: 'ok', requestId: 'r' }), {
+            status: 200,
+          }),
+        );
+      }),
+    );
+
+    await forwardToGateway('/api/v2/auth/session', {
+      method: 'GET',
+      cookie: 'c1rcle.csrf=tok; better-auth.session_token=sess_abc',
+    });
+
+    expect(sent.cookie).toContain('better-auth.session_token=sess_abc');
+    expect(sent.cookie).toContain('__Secure-better-auth.session_token=sess_abc');
+  });
+});
+
+describe('passThroughGatewayError', () => {
+  it('passes a well-formed flat envelope through unchanged', async () => {
+    const res = passThroughGatewayError(
+      401,
+      JSON.stringify({ code: 'unauthorized', message: 'Authentication failed', status: 401 }),
+    );
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toMatchObject({
+      code: 'unauthorized',
+      message: 'Authentication failed',
+    });
+  });
+
+  it('synthesises a generic envelope for a non-JSON body', async () => {
+    const res = passThroughGatewayError(502, '<html>Bad Gateway</html>');
+    expect(res.status).toBe(502);
+    await expect(res.json()).resolves.toMatchObject({ code: 'server' });
+  });
+});
+
+describe('assertPathId', () => {
+  it('accepts opaque gateway ids', () => {
+    expect(assertPathId('app_01H-x_Y')).toBeNull();
+  });
+
+  it.each(['../admin', '..%2Fadmin', 'a/b', '', 'a?b=1', 'a b'])('rejects %j', (id) => {
+    expect(assertPathId(id)?.status).toBe(400);
+  });
+});

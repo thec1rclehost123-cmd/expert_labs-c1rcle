@@ -1,0 +1,582 @@
+import { buildV2ErrorResponse } from '@c1rcle/contracts';
+import {
+  signupRequestSchema,
+  loginRequestSchema,
+  changePasswordSchema,
+  authBridgeResponseSchema,
+  invitationDtoSchema,
+  paginatedSchema,
+  sessionSchema,
+  noContentSchema,
+  forgotPasswordRequestSchema,
+  resetPasswordRequestSchema,
+  passwordResetAckSchema,
+} from '@c1rcle/contracts/client';
+
+import type { OrganizationService } from '@c1rcle/core/application';
+import type { StaffRotationStore } from '@c1rcle/core/domain';
+
+import { validateV2Response } from '../../../lib/v2-response-validation.js';
+import { toWebHeaders, type BetterAuthInstance } from '../../../plugins/auth.js';
+import { invitationToDto } from '../partner/organizations.js';
+
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { z } from 'zod';
+
+/**
+ * ─── B10 auth bridge routes ─────────────────────────────────────────────────
+ * Thin routes over Better Auth's server API (`auth.api.*`, called directly —
+ * not proxied through `auth.handler`) so the JSON shape stays exactly the
+ * frontend contract (`{user, accessToken, expiresAt}` / `Session{user,
+ * expiresAt}`), never Better Auth's native response shape. The httpOnly
+ * session cookie Better Auth sets is forwarded through untouched; the access
+ * token is the Bearer plugin's session token (`set-auth-token` header) — no
+ * separate JWT minted (resolves decisions.md open question #3).
+ *
+ * Not registered when `auth` is null (`STORAGE_DRIVER=memory`) — see
+ * `docs/roadmap/phase-00-foundation.md`.
+ */
+export default async function authRoutes(
+  fastify: FastifyInstance,
+  options: {
+    auth: BetterAuthInstance | null;
+    rotationStore: StaffRotationStore;
+    organizations: OrganizationService;
+  },
+) {
+  const { auth, rotationStore, organizations } = options;
+
+  const invitationListSchema = paginatedSchema(invitationDtoSchema);
+
+  /**
+   * First-login rotation flag for the user. Fail-open on store errors (a
+   * flag-store outage must not lock every user out) — the plugin's request
+   * enforcement fails open the same way.
+   */
+  const readRotationFlag = (userId: string): Promise<boolean> =>
+    rotationStore.isRequired(userId).catch(() => false);
+
+  fastify.post(
+    '/signup',
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '1 minute',
+        },
+      },
+      preHandler: [
+        fastify.validateV2({ body: signupRequestSchema }),
+        fastify.rateLimit('SENSITIVE_COMMAND'),
+      ],
+    },
+    // codeql[js/missing-rate-limiting] rate limiting IS applied via the
+    // preHandler list (fastify.rateLimit('SENSITIVE_COMMAND')). CodeQL cannot
+    // see through the plugin-decorated preHandler.
+    async (request, reply) => {
+      if (!auth) return sendAuthUnavailable(reply, request);
+      const body = request.body as z.infer<typeof signupRequestSchema>;
+      const result = await runAuthFlow(
+        auth,
+        request,
+        reply,
+        () =>
+          auth.api.signUpEmail({
+            // `role` is a required additional field (better-auth's generated
+            // type confirmed this at typecheck time) — always server-set,
+            // never client-supplied (`signupRequestSchema` has no `role` field).
+            body: {
+              email: body.email,
+              password: body.password,
+              name: body.displayName,
+              role: 'partner',
+            },
+            headers: toWebHeaders(request.headers),
+            asResponse: true,
+          }),
+        { readRotationFlag },
+      );
+      if (result === undefined) return reply;
+      const validated = validateV2Response(reply, request, authBridgeResponseSchema, result);
+      if (validated === undefined) return reply;
+      return reply.status(201).send(validated);
+    },
+  );
+
+  fastify.post(
+    '/login',
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '1 minute',
+        },
+      },
+      preHandler: [
+        fastify.validateV2({ body: loginRequestSchema }),
+        fastify.rateLimit('SENSITIVE_COMMAND'),
+      ],
+    },
+    // codeql[js/missing-rate-limiting] rate limiting IS applied via the
+    // preHandler list (fastify.rateLimit('SENSITIVE_COMMAND')). CodeQL cannot
+    // see through the plugin-decorated preHandler.
+    async (request, reply) => {
+      if (!auth) return sendAuthUnavailable(reply, request);
+      const body = request.body as z.infer<typeof loginRequestSchema>;
+      const result = await runAuthFlow(
+        auth,
+        request,
+        reply,
+        () =>
+          auth.api.signInEmail({
+            body: { email: body.email, password: body.password },
+            headers: toWebHeaders(request.headers),
+            asResponse: true,
+          }),
+        // Every client-side login failure returns one constant body — an
+        // unknown email and a wrong password are byte-identical, so there is
+        // no account-existence oracle (spec §11.7 / D-024).
+        { genericClientErrorMessage: 'Authentication failed', readRotationFlag },
+      );
+      if (result === undefined) return reply;
+      const validated = validateV2Response(reply, request, authBridgeResponseSchema, result);
+      if (validated === undefined) return reply;
+      return reply.status(200).send(validated);
+    },
+  );
+
+  // Password reset (scanner/partner self-service). Both routes call the Better
+  // Auth server API directly (never `asResponse` — no cookies involved) and
+  // map thrown `APIError`s through `sendAuthError`. `requestPasswordReset` is
+  // Better Auth's own anti-oracle: unknown emails still resolve to
+  // `{status: true, message}` (verified in better-auth 1.6.26
+  // `dist/api/routes/password.mjs` — it even simulates token work), so these
+  // routes never branch on account existence. The `sendResetPassword` email
+  // callback is wired in `buildBetterAuth` (plugins/auth.ts).
+  fastify.post(
+    '/forgot-password',
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '1 minute',
+        },
+      },
+      preHandler: [
+        fastify.validateV2({ body: forgotPasswordRequestSchema }),
+        fastify.rateLimit('SENSITIVE_COMMAND'),
+      ],
+    },
+    // codeql[js/missing-rate-limiting] rate limiting IS applied via the
+    // preHandler list (fastify.rateLimit('SENSITIVE_COMMAND') — same bucket as
+    // login/OTP). CodeQL cannot see through the plugin-decorated preHandler.
+    async (request, reply) => {
+      if (!auth) return sendAuthUnavailable(reply, request);
+      const body = request.body as z.infer<typeof forgotPasswordRequestSchema>;
+      let validated: unknown;
+      try {
+        const result = await auth.api.requestPasswordReset({
+          body: { email: body.email },
+          headers: toWebHeaders(request.headers),
+        });
+        validated = validateV2Response(reply, request, passwordResetAckSchema, result);
+      } catch (error) {
+        return sendAuthError(reply, request, error);
+      }
+      if (validated === undefined) return reply;
+      return reply.status(200).send(validated);
+    },
+  );
+
+  fastify.post(
+    '/reset-password',
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '1 minute',
+        },
+      },
+      preHandler: [
+        fastify.validateV2({ body: resetPasswordRequestSchema }),
+        fastify.rateLimit('SENSITIVE_COMMAND'),
+      ],
+    },
+    // codeql[js/missing-rate-limiting] rate limiting IS applied via the
+    // preHandler list (fastify.rateLimit('SENSITIVE_COMMAND') — same bucket as
+    // login/OTP). CodeQL cannot see through the plugin-decorated preHandler.
+    async (request, reply) => {
+      if (!auth) return sendAuthUnavailable(reply, request);
+      const body = request.body as z.infer<typeof resetPasswordRequestSchema>;
+      let validated: unknown;
+      try {
+        const result = await auth.api.resetPassword({
+          body: { newPassword: body.newPassword, token: body.token },
+          headers: toWebHeaders(request.headers),
+        });
+        validated = validateV2Response(reply, request, passwordResetAckSchema, result);
+      } catch (error) {
+        return sendAuthError(reply, request, error);
+      }
+      if (validated === undefined) return reply;
+      return reply.status(200).send(validated);
+    },
+  );
+
+  // Better Auth extends session expiry on read within its `updateAge` window
+  // rather than rotating the token string (see phase-00 Session Log) — this
+  // route re-validates the httpOnly cookie and returns the (possibly now
+  // longer-lived) session, which is what "no session breakage on reload" needs.
+  fastify.post(
+    '/refresh',
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '1 minute',
+        },
+      },
+      preHandler: fastify.rateLimit('SENSITIVE_COMMAND'),
+    },
+    async (request, reply) => {
+      if (!auth) return sendAuthUnavailable(reply, request);
+      const session = await auth.api
+        .getSession({ headers: toWebHeaders(request.headers) })
+        .catch(() => null);
+      if (!session?.user) return sendUnauthorized(reply, request);
+      const payload = {
+        user: toUserDto(session.user, await readRotationFlag(session.user.id)),
+        accessToken: session.session.token,
+        expiresAt: toUnixMs(session.session.expiresAt),
+      };
+      const validated = validateV2Response(reply, request, authBridgeResponseSchema, payload);
+      if (validated === undefined) return reply;
+      return reply.status(200).send(validated);
+    },
+  );
+
+  fastify.post('/logout', async (request, reply) => {
+    if (!auth) return sendAuthUnavailable(reply, request);
+    const response = await auth.api.signOut({
+      headers: toWebHeaders(request.headers),
+      asResponse: true,
+    });
+    forwardSetCookie(reply, response);
+    return reply.status(204).send();
+  });
+
+  fastify.get(
+    '/session',
+    {
+      config: {
+        rateLimit: {
+          max: 240,
+          timeWindow: '1 minute',
+        },
+      },
+      preHandler: fastify.rateLimit('AUTH_READ'),
+    },
+    async (request, reply) => {
+      if (!auth) return sendAuthUnavailable(reply, request);
+      const session = await auth.api
+        .getSession({ headers: toWebHeaders(request.headers) })
+        .catch(() => null);
+      if (!session?.user) return sendUnauthorized(reply, request);
+      const payload = {
+        user: toUserDto(session.user, await readRotationFlag(session.user.id)),
+        expiresAt: toUnixMs(session.session.expiresAt),
+      };
+      const validated = validateV2Response(reply, request, sessionSchema, payload);
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
+  fastify.post(
+    '/change-password',
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '1 minute',
+        },
+      },
+      preHandler: [
+        fastify.validateV2({ body: changePasswordSchema }),
+        fastify.rateLimit('SENSITIVE_COMMAND'),
+      ],
+    },
+    async (request, reply) => {
+      if (!auth) return sendAuthUnavailable(reply, request);
+      const session = await auth.api
+        .getSession({ headers: toWebHeaders(request.headers) })
+        .catch(() => null);
+      if (!session?.user) return sendUnauthorized(reply, request);
+      const body = request.body as z.infer<typeof changePasswordSchema>;
+      try {
+        await auth.api.changePassword({
+          body: {
+            currentPassword: body.currentPassword,
+            newPassword: body.newPassword,
+            revokeOtherSessions: true,
+          },
+          headers: toWebHeaders(request.headers),
+        });
+      } catch (error) {
+        const known = error as { status?: number; message?: string };
+        const status = typeof known?.status === 'number' && known.status >= 500 ? 500 : 400;
+        reply.status(status).send(
+          buildV2ErrorResponse({
+            status,
+            message:
+              status === 500
+                ? 'Authentication request failed'
+                : (known?.message ?? 'Current password is incorrect'),
+            requestId: request.id,
+          }),
+        );
+        return reply;
+      }
+      // The rotation is complete even if the flag clear fails to persist —
+      // fail open (the next flag read retries the clear path via re-change).
+      // In practice the clear succeeds and the next session read is clean.
+      await rotationStore.setRequired(session.user.id, false).catch(() => undefined);
+      // `revokeOtherSessions` deliberately killed every session including this
+      // one (a leaked temporary password must not leave live sessions behind),
+      // so the old cookie is dead — sign straight back in with the new
+      // password and hand over the fresh session instead of 401ing on success.
+      const result = await runAuthFlow(
+        auth,
+        request,
+        reply,
+        () =>
+          auth.api.signInEmail({
+            body: { email: session.user.email, password: body.newPassword },
+            headers: toWebHeaders(request.headers),
+            asResponse: true,
+          }),
+        { readRotationFlag },
+      );
+      if (result === undefined) return reply;
+      const validated = validateV2Response(reply, request, authBridgeResponseSchema, result);
+      if (validated === undefined) return reply;
+      return reply.status(200).send(validated);
+    },
+  );
+
+  void noContentSchema; // reserved for the 204 logout response's (absent) body
+
+  // The invitee's own pending invitations, across orgs. Session-email scoped
+  // (no org membership required — that is exactly what the invitee lacks), so
+  // a freshly-provisioned login with zero orgs can discover the invite and
+  // accept it instead of landing on onboarding with nowhere to go.
+  fastify.get(
+    '/invitations/mine',
+    {
+      config: {
+        rateLimit: {
+          max: 240,
+          timeWindow: '1 minute',
+        },
+      },
+      preHandler: fastify.rateLimit('AUTH_READ'),
+    },
+    async (request, reply) => {
+      if (!auth) return sendAuthUnavailable(reply, request);
+      const session = await auth.api
+        .getSession({ headers: toWebHeaders(request.headers) })
+        .catch(() => null);
+      if (!session?.user?.email) return sendUnauthorized(reply, request);
+      const items = await organizations.listMyInvitations(session.user.email).catch(() => null);
+      if (items === null) {
+        reply.status(500).send(
+          buildV2ErrorResponse({
+            status: 500,
+            message: 'Internal server error',
+            requestId: request.id,
+          }),
+        );
+        return reply;
+      }
+      const payload = {
+        items: items.map(invitationToDto),
+        pageInfo: { page: 1, pageSize: 50, total: items.length, hasNextPage: false },
+      };
+      const validated = validateV2Response(reply, request, invitationListSchema, payload);
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+}
+
+/**
+ * Runs a Better Auth `asResponse: true` call, forwards its `Set-Cookie`, and
+ * reshapes the result into `{user, accessToken, expiresAt}`. Returns
+ * `undefined` after the reply has already been sent (error path).
+ */
+async function runAuthFlow(
+  auth: BetterAuthInstance,
+  request: FastifyRequest,
+  reply: FastifyReply,
+  call: () => Promise<Response>,
+  options: {
+    genericClientErrorMessage?: string;
+    readRotationFlag?: (userId: string) => Promise<boolean>;
+  } = {},
+): Promise<{ user: unknown; accessToken: string; expiresAt: number } | undefined> {
+  let response: Response;
+  try {
+    response = await call();
+  } catch (error) {
+    return sendAuthError(reply, request, error, options.genericClientErrorMessage);
+  }
+  if (!response.ok) {
+    return forwardAuthErrorResponse(reply, request, response, options.genericClientErrorMessage);
+  }
+
+  forwardSetCookie(reply, response);
+  const accessToken = response.headers.get('set-auth-token');
+
+  // Re-read the session through the just-set cookie for a reliably-shaped
+  // {session, user} — sidesteps depending on signUpEmail/signInEmail's own
+  // (loosely documented) body shape.
+  const followUpHeaders = toWebHeaders(request.headers);
+  const cookiePair = response.headers.getSetCookie()[0]?.split(';')[0];
+  if (cookiePair) followUpHeaders.set('cookie', cookiePair);
+  const session = await auth.api.getSession({ headers: followUpHeaders }).catch(() => null);
+  if (!session?.user) return sendUnauthorized(reply, request);
+
+  return {
+    user: toUserDto(session.user, (await options.readRotationFlag?.(session.user.id)) ?? false),
+    accessToken: accessToken ?? session.session.token,
+    expiresAt: toUnixMs(session.session.expiresAt),
+  };
+}
+
+function forwardSetCookie(reply: FastifyReply, response: Response): void {
+  for (const cookie of response.headers.getSetCookie()) {
+    void reply.header('set-cookie', cookie);
+  }
+}
+
+async function forwardAuthErrorResponse(
+  reply: FastifyReply,
+  request: FastifyRequest,
+  response: Response,
+  genericClientErrorMessage?: string,
+): Promise<undefined> {
+  // 401 is preserved rather than collapsed into 400. A client has to be able to
+  // tell "your password is wrong" (retry, same body) apart from "your payload is
+  // malformed" (fix the request) — and `errorCodeForStatus` only produces the
+  // `unauthorized` code at 401. Collapsing it also broke the D-024 guarantee's
+  // own shape: the anti-oracle constant message is still identical for every
+  // credential failure, so nothing about account existence leaks.
+  const status =
+    response.status === 422 || response.status === 401
+      ? response.status
+      : response.status >= 500
+        ? 500
+        : 400;
+  let message = 'Authentication request failed';
+  if (genericClientErrorMessage !== undefined && status < 500) {
+    // Login path: discard Better Auth's own message and return one constant for
+    // every 4xx, so the response cannot distinguish "no such user" from "wrong
+    // password" (account-existence oracle — spec §11.7 / D-024).
+    message = genericClientErrorMessage;
+  } else {
+    try {
+      const body = (await response.json()) as { message?: string };
+      if (body?.message) message = body.message;
+    } catch {
+      // Non-JSON error body — keep the generic message.
+    }
+  }
+  reply.status(status).send(
+    buildV2ErrorResponse({
+      status,
+      message,
+      requestId: request.id,
+    }),
+  );
+  return undefined;
+}
+
+function sendAuthError(
+  reply: FastifyReply,
+  request: FastifyRequest,
+  error: unknown,
+  genericClientErrorMessage?: string,
+): undefined {
+  const known = error as { status?: number; message?: string };
+  const status = typeof known?.status === 'number' ? known.status : 400;
+  const message =
+    genericClientErrorMessage !== undefined && status < 500
+      ? genericClientErrorMessage
+      : (known?.message ?? 'Authentication request failed');
+  reply.status(status).send(
+    buildV2ErrorResponse({
+      status,
+      message,
+      requestId: request.id,
+    }),
+  );
+  return undefined;
+}
+
+function sendUnauthorized(reply: FastifyReply, request: FastifyRequest): undefined {
+  reply.status(401).send(
+    buildV2ErrorResponse({
+      status: 401,
+      code: 'unauthorized',
+      message: 'No active session',
+      requestId: request.id,
+    }),
+  );
+  return undefined;
+}
+
+function sendAuthUnavailable(reply: FastifyReply, request: FastifyRequest): undefined {
+  // STORAGE_DRIVER=memory: no persistent store backs auth (see module doc).
+  reply.status(503).send(
+    buildV2ErrorResponse({
+      status: 503,
+      code: 'server',
+      message: 'Auth is not available on the memory storage driver',
+      requestId: request.id,
+    }),
+  );
+  return undefined;
+}
+
+function toUnixMs(value: unknown): number {
+  return new Date(value as string | number | Date).getTime();
+}
+
+function toUserDto(
+  user: { id: string; email: string; name: string; image?: string | null },
+  mustChangePassword: boolean,
+): {
+  id: string;
+  email: string;
+  displayName: string;
+  role: 'guest' | 'partner' | 'admin';
+  avatarUrl: string | null;
+  mustChangePassword: boolean;
+} {
+  return {
+    id: user.id,
+    email: user.email,
+    displayName:
+      user.name && user.name.length > 0 ? user.name : (user.email.split('@')[0] ?? 'User'),
+    // Phase 0 scope is partner-dashboard auth only; guest/admin auth are
+    // later phases (docs/roadmap/ROADMAP.md) and will need a real role source.
+    role: 'partner',
+    // `avatarUrl` is `z.url().nullable()` — Better Auth's Firestore-backed
+    // user record stores an unset image as `''`, not `null`/`undefined`, so
+    // `?? null` alone let a non-URL empty string through and 500'd every
+    // login/signup for an account with no avatar (validateV2Response's
+    // schema check failing after a successful auth).
+    avatarUrl: user.image && user.image.length > 0 ? user.image : null,
+    mustChangePassword,
+  };
+}

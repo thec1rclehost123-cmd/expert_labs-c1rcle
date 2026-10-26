@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C1RCLE Partner Dashboard: visual guide</title>
+<style>
+:root{--bg:#fff;--fg:#1b1f24;--muted:#57606a;--line:#d0d7de;--card:#f6f8fa}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9da7b3;--line:#30363d;--card:#161b22}}
+body{background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:1.9rem} h2{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--line);font-size:1.35rem}
+code{background:var(--card);padding:.1em .35em;border-radius:4px;font-size:.9em}
+figure{margin:1rem 0;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--card);overflow-x:auto}
+.mermaid{background:transparent;margin:0}
+table{border-collapse:collapse;margin:1rem 0;display:block;overflow-x:auto} th,td{border:1px solid var(--line);padding:6px 10px;text-align:left} th{background:var(--card)}
+p,li{color:var(--fg)} hr{border:0;border-top:1px solid var(--line);margin:1.5rem 0} a{color:#0969da}
+.note{color:var(--muted);font-size:.9rem}
+</style></head><body><main>
+<p class="note">Confidential. Share only under NDA. Diagrams are drawn by the Mermaid library loaded from a CDN, so an internet connection is needed to see them.</p>
+<h1 id="00-partner-dashboard-visual-guide">00. Partner dashboard: visual guide</h1>
+<p>Start here if you prefer pictures. Each diagram links back to the detailed file that explains it. Colours are consistent everywhere:</p>
+<ul><li>🟩 <strong>green</strong> = live against the real gateway</li><li>🟨 <strong>yellow</strong> = fixture or partial (sample data, or only part works)</li><li>🟥 <strong>red</strong> = defect or risk (see <code>13-status-gaps-and-roadmap.md</code>)</li><li>⬜ <strong>grey</strong> = infrastructure or neutral step</li></ul>
+<p>How to view the diagrams: GitHub, VS Code (Markdown Preview Mermaid Support), or paste a block into <a href="https://mermaid.live.">https://mermaid.live.</a> A browser version is in <code>visual-guide.html</code> (needs internet for the Mermaid library).</p>
+<p>Contents: 1 System map · 2 Studios and navigation · 3 Screen status map · 4 Sign-in and workspace flow · 5 How access is derived · 6 Who enforces what · 7 BFF vs direct requests · 8 Backend request lifecycle · 9 Onboarding · 10 Event create and publish · 11 Event lifecycle · 12 Slot requests · 13 Partnerships and promoter connections · 14 Promoter earnings chain · 15 Staff invitations · 16 Finance and payouts · 17 Data loading and failures · 18 Fixture to live roadmap · 19 Defect map</p>
+<hr>
+<h2 id="1-system-map-who-talks-to-whom">1. System map: who talks to whom</h2>
+<p>Files: <code>02-frontend-architecture.md</code>, <code>09-backend-api-reference.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  U["Partner user&lt;br/&gt;(venue, host, promoter)"] --&gt; PD
+  subgraph Browser_and_Vercel["Dashboard (Next.js on Vercel)"]
+    PD["Pages and client hooks"]
+    BFF["BFF route handlers&lt;br/&gt;/api/auth, /api/bff"]
+    PX["proxy.ts&lt;br/&gt;cookie check + CSP nonce"]
+  end
+  PD --&gt;|same-origin cookie + CSRF| BFF
+  PD --&gt;|"Bearer token (direct)"| GW
+  PX -.guards page routes.-&gt; PD
+  BFF --&gt;|cookie forwarded| GW
+  subgraph Render["Gateway (Render, free plan)"]
+    NG["nginx edge"] --&gt; GW["Fastify /api/v2&lt;br/&gt;auth, RBAC, rate limit,&lt;br/&gt;idempotency"]
+    GW --&gt; CORE["packages/core&lt;br/&gt;services + rules"]
+  end
+  CORE --&gt; FS[("Firestore")]
+  CORE --&gt; ST[("Cloud Storage&lt;br/&gt;posters, KYC")]
+  PD -.phone OTP only.-&gt; FB["Firebase Auth&lt;br/&gt;(client)"]
+  CORE --&gt; RS["Resend email"]
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef infra fill:#eeeeee,stroke:#888,color:#111
+  class PD,BFF,GW,CORE live
+  class PX,NG,FS,ST,FB,RS infra</pre></figure>
+<h2 id="2-studios-and-navigation">2. Studios and navigation</h2>
+<p>One shell, three studios. What differs is the nav and the primary action. Files: <code>01-product-model.md</code>, <code>03-routes-and-screens.md</code>.</p>
+<figure><pre class="mermaid">flowchart TB
+  A["Access response&lt;br/&gt;partnerType"] --&gt; V{"partnerType?"}
+  V --&gt;|venue| VS["Venue Studio&lt;br/&gt;action: Create event"]
+  V --&gt;|host| HS["Host Studio&lt;br/&gt;action: Start event request"]
+  V --&gt;|promoter| PS["Promoter Studio&lt;br/&gt;action: Get link"]
+  VS --&gt; VN["Overview · Events · Slot requests · Partners · Marketing · Presence · Finance · Support · Settings"]
+  HS --&gt; HN["Overview · Events · Slot requests · Partners · Marketing · Presence · Finance · Support · Settings"]
+  PS --&gt; PN["Overview · Events · Guests · Analytics · Finance · Partners · Leaderboard"]
+  VN --&gt; HID["Server tabVisibility can hide tabs&lt;br/&gt;(null = show all, false = hide)"]
+  HN --&gt; HID
+  PN --&gt; HID
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class VS,HS,PS,VN,HN,PN,HID live</pre></figure>
+<p>Calendar and Door are real routes that are not in the menu. "Presence" is in the menu but has no page.</p>
+<h2 id="3-screen-status-map-what-is-real-today">3. Screen status map: what is real today</h2>
+<p>Files: <code>03-routes-and-screens.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph LIVE["🟩 Live (real gateway data)"]
+    L1["Login · Signup · Onboarding"]
+    L2["Overview (venue, host)"]
+    L3["Finance (all studios)"]
+    L4["Calendar and availability"]
+    L5["Slot requests"]
+    L6["Partners + promoter connections"]
+    L7["Staff + invitations"]
+    L8["Support tickets"]
+    L9["Event create (publish workflow)"]
+  end
+  subgraph FIX["🟨 Fixture (sample data)"]
+    F1["Events list"]
+    F2["Event detail + tabs"]
+    F3["Event edit (Save does nothing)"]
+    F4["Door mode (read only)"]
+    F5["Marketing"]
+    F6["Settings"]
+    F7["Promoter: overview, events, guests, analytics, leaderboard"]
+    F8["Topbar notifications + search"]
+  end
+  subgraph GONE["🟥 Missing or broken"]
+    M1["Presence: no page"]
+    M2["Event analytics: skeleton"]
+    M3["Overview event links: 404"]
+  end
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef fix fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class L1,L2,L3,L4,L5,L6,L7,L8,L9 live
+  class F1,F2,F3,F4,F5,F6,F7,F8 fix
+  class M1,M2,M3 bad</pre></figure>
+<p>The old <code>/venue</code>, <code>/host</code>, <code>/promoter</code>, <code>/partner-network</code> pages are redirected (HTTP 307) into these screens and are dead code.</p>
+<h2 id="4-sign-in-to-landing-page">4. Sign-in to landing page</h2>
+<p>Files: <code>04-auth-rbac-and-access.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Open /login"]) --&gt; P1["Pick studio, enter credentials"]
+  P1 --&gt; BFF["POST /api/auth/login&lt;br/&gt;(BFF sets cookie + CSRF)"]
+  BFF --&gt; OK{"Login OK?"}
+  OK --&gt;|no| ERR["Show error, stay on login"]
+  OK --&gt;|yes| MCP{"mustChangePassword?"}
+  MCP --&gt;|yes| CP["/change-password"]
+  CP --&gt; ORGS
+  MCP --&gt;|no| ORGS["Load organizations + access for each"]
+  ORGS --&gt; N{"How many organizations?"}
+  N --&gt;|0| INV{"Pending invitation?"}
+  INV --&gt;|yes| ACC["Accept invitation page"]
+  INV --&gt;|no| ONB["/onboard wizard"]
+  N --&gt;|1| SET["Set active org"]
+  N --&gt;|many| PICK["/partner/select-organization"]
+  PICK --&gt; SET
+  SET --&gt; MATCH{"Org studio matches the studio chosen?"}
+  MATCH --&gt;|no| MIS["Error: stay signed in"]
+  MATCH --&gt;|yes| LAND["Land on first visible tab"]
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class BFF,SET,LAND,ORGS live
+  class ERR,MIS bad</pre></figure>
+<p>Note: if <code>?next=</code> is present the workspace match is skipped. <code>/change-password</code> does not validate its <code>next</code> parameter (open redirect).</p>
+<h2 id="5-how-access-is-derived-and-where-promoters-break">5. How access is derived (and where promoters break)</h2>
+<p>Files: <code>04-auth-rbac-and-access.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  M["Member of organization&lt;br/&gt;role: owner, admin, manager, member&lt;br/&gt;capabilities: host, venue, promoter"] --&gt; T["partnerType = first of venue, host, promoter&lt;br/&gt;(no capabilities means venue)"]
+  M --&gt; R{"Organization role"}
+  R --&gt;|owner or admin| O["Partner role OWNER"]
+  R --&gt;|manager| MG["Partner role MANAGER"]
+  R --&gt;|member| ST["Partner role STAFF"]
+  T --&gt; TB{"partnerType"}
+  O --&gt; TB
+  MG --&gt; TB
+  ST --&gt; TB
+  TB --&gt;|venue| V["Venue table: OWNER 16 permissions, MANAGER 11, STAFF 3"]
+  TB --&gt;|host| H["Host table: OWNER 9, MANAGER 4, STAFF 2"]
+  TB --&gt;|promoter| PR{"Role is PROMOTER or TEAM_LEAD?"}
+  PR --&gt;|"never: roles above can't produce them"| OKP["Promoter permissions"]
+  PR --&gt;|"owner, manager, staff"| EMPTY["permissions = empty list"]
+  V --&gt; OUT["Access response:&lt;br/&gt;permissions + tabVisibility"]
+  H --&gt; OUT
+  EMPTY --&gt; OUT
+  OKP --&gt; OUT
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class EMPTY,PR bad
+  class OUT live</pre></figure>
+<p>Roles FINANCE_ADMIN, SECURITY, DOOR, COHOST, PROMOTER and TEAM_LEAD cannot be produced by this path.</p>
+<h2 id="6-who-enforces-what-security-layers">6. Who enforces what (security layers)</h2>
+<p>Files: <code>02-frontend-architecture.md</code>, <code>04-auth-rbac-and-access.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  REQ(["User action in the browser"]) --&gt; L1["Layer 1: proxy.ts&lt;br/&gt;session cookie present? (UX only)"]
+  L1 --&gt;|no| LOGIN["Redirect to /login"]
+  L1 --&gt;|yes| L2["Layer 2: PartnerStudioFrame&lt;br/&gt;studio matches partner type?&lt;br/&gt;tab not hidden by tabVisibility?&lt;br/&gt;(client-side only)"]
+  L2 --&gt;|blocked| MSG["'Not available' message"]
+  L2 --&gt;|ok| L3["Layer 3: API call&lt;br/&gt;BFF (cookie + CSRF) or direct Bearer"]
+  L3 --&gt; L4["Layer 4: Gateway&lt;br/&gt;session, X-Organization-Id membership,&lt;br/&gt;requirePermission, path org = actor org"]
+  L4 --&gt;|deny| E403["403 or 404"]
+  L4 --&gt;|allow| SVC["Service rules + idempotency"]
+  classDef weak fill:#fff3b0,stroke:#b58900,color:#111
+  classDef strong fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class L1,L2 weak
+  class L3,L4,SVC strong</pre></figure>
+<p>Only layer 4 is a real security boundary. Layers 1 and 2 are convenience. The payout button, for example, is not hidden by role in the UI; the gateway refuses non-owners.</p>
+<h2 id="7-bff-or-direct-how-a-request-leaves-the-browser">7. BFF or direct: how a request leaves the browser</h2>
+<p>Files: <code>02-frontend-architecture.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  A(["Browser needs data"]) --&gt; B{"Where does the code run?"}
+  B --&gt;|"Server component (page load)"| S["createServerApiClient&lt;br/&gt;forwards cookie to gateway"]
+  B --&gt;|Browser| C{"Which feature?"}
+  C --&gt;|"Orgs, access, onboarding,&lt;br/&gt;slot requests, support"| BFF["bffClient: same-origin /api/bff&lt;br/&gt;cookie + CSRF header"]
+  C --&gt;|"Calendar, partners, staff,&lt;br/&gt;publish, payouts, phone verify"| D["apiClient: direct to gateway&lt;br/&gt;Authorization: Bearer (in memory)"]
+  BFF --&gt; G["Gateway /api/v2"]
+  D --&gt; G
+  S --&gt; G
+  D -.401.-&gt; RF["Refresh token once, retry, else logout"]
+  BFF -.401.-&gt; LO["Clear session, go to /login"]
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class BFF,D,S live</pre></figure>
+<p>The direct path needs the gateway to allow the dashboard origin (CORS) and the page CSP to allow the gateway origin.</p>
+<h2 id="8-what-happens-to-a-request-inside-the-gateway">8. What happens to a request inside the gateway</h2>
+<p>Files: <code>09-backend-api-reference.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  IN(["HTTP request"]) --&gt; NG["nginx: host allow-list, edge rate limit, body 1 MB"]
+  NG --&gt; CORS["CORS: exact origins"]
+  CORS --&gt; AU["Auth hook: session + X-Organization-Id membership"]
+  AU --&gt; PW{"Password rotation owed?"}
+  PW --&gt;|yes, route not allowed| E1["403 passwordChangeRequired"]
+  PW --&gt;|no| RL["Rate limit by class"]
+  RL --&gt;|over| E2["429"]
+  RL --&gt; VAL["validateV2: zod body, query, params, headers"]
+  VAL --&gt;|invalid| E3["422 fieldErrors"]
+  VAL --&gt; PERM["requirePermission + path org must equal actor org"]
+  PERM --&gt;|no| E4["403"]
+  PERM --&gt; IDM{"Mutation with Idempotency-Key?"}
+  IDM --&gt;|"same key, same body"| REP["Replay stored response"]
+  IDM --&gt;|"same key, different body or in flight"| E5["409"]
+  IDM --&gt;|new| SVC["Service call: rules, state machine, compare-and-set"]
+  SVC --&gt;|"domain error"| MAP["Mapped to 400, 404, 409"]
+  SVC --&gt; OUT["Validate response with zod, event to outbox"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class E1,E2,E3,E4,E5,MAP bad
+  class OUT,REP ok</pre></figure>
+<h2 id="9-onboarding-from-application-to-approval">9. Onboarding: from application to approval</h2>
+<p>Files: <code>05-feature-onboarding-kyc.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["/onboard"]) --&gt; R["Step 1: Choose role: venue, host, promoter"]
+  R --&gt; SU["Step 2: Sign up (409 means already registered: log in and resume)"]
+  SU --&gt; EO["Step 3: Email OTP"]
+  EO --&gt; PO["Step 4: Phone OTP (Firebase, reCAPTCHA off outside production)"]
+  PO --&gt; ET{"Step 5: Entity type"}
+  ET --&gt;|individual| D1["Step 6: Details form"]
+  ET --&gt;|business| D1
+  D1 --&gt; AS["Autosave (PATCH with If-Match)"]
+  D1 --&gt; K{"Entity type?"}
+  K --&gt;|individual| KI["KYC: id front, id back, selfie"]
+  K --&gt;|business| KB["KYC: registration certificate&lt;br/&gt;then signatory id front, id back, selfie"]
+  KI --&gt; SUB["Submit"]
+  KB --&gt; SUB
+  SUB --&gt; W["Status: submitted. App polls every 10 s"]
+  W --&gt; AD{"Admin decision"}
+  AD --&gt;|approve| ORG["Organization created with plan fee 15, 12 or 10 percent&lt;br/&gt;(+ starter venue for venue type)"]
+  AD --&gt;|"request changes"| CH["changes_requested: back to details or KYC&lt;br/&gt;(reviewer note not shown yet)"]
+  CH --&gt; SUB
+  AD --&gt;|reject| REJ["rejected: final"]
+  ORG --&gt; GO["User routed to their studio"]
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class ORG,GO live
+  class REJ bad
+  class CH warn</pre></figure>
+<p>Approval is blocked unless every required document is verified by an admin. The admin side is documented in <code>../07-admin-console/05-flow-onboarding-kyc.md</code>.</p>
+<h2 id="10-event-create-and-publish-a-chain-of-calls-that-can-stop-half-way">10. Event create and publish: a chain of calls that can stop half-way</h2>
+<p>Files: <code>06-feature-calendar-slots-events.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Fill the event form: basics, promoters, review"]) --&gt; P["Step 1: Upload poster (signed URL, max 5 MB)"]
+  P --&gt; E["Step 2: Create event (draft)"]
+  E --&gt; T["Step 3: Create each ticket tier, one by one"]
+  T --&gt; C{"Custom compensation?"}
+  C --&gt;|yes| PA["Step 4: Patch event with tier ids (If-Match)"]
+  C --&gt;|no| AS
+  PA --&gt; AS["Step 5: Assign each promoter"]
+  AS --&gt; RV["Step 6: Review"]
+  RV --&gt; PB["Step 7: Publish"]
+  PB --&gt; OK(["Event live. Go to calendar"])
+  P -.fail.-&gt; F1["Nothing created yet. Retry is safe"]
+  E -.fail.-&gt; F2["Nothing created. Retry is safe"]
+  T -.fail.-&gt; F3["Partial draft exists"]
+  AS -.fail.-&gt; F3
+  RV -.fail.-&gt; F3
+  PB -.fail.-&gt; F3
+  F3 --&gt; RT["Retry replays each step with the same keys&lt;br/&gt;(no cleanup of the half-built draft)"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class F3 bad
+  class OK ok</pre></figure>
+<p>Publish rules: the event must pass review first, and compensation must be valid (standard needs a rate, salary needs an amount, custom needs a rate for every eligible tier). It does not check that a venue, a tier, a future date or a poster exist.</p>
+<h2 id="11-event-lifecycle-and-the-gap">11. Event lifecycle and the gap</h2>
+<p>Files: <code>06-feature-calendar-slots-events.md</code>.</p>
+<figure><pre class="mermaid">stateDiagram-v2
+  direction LR
+  [*] --&gt; draft
+  draft --&gt; review
+  review --&gt; draft
+  review --&gt; published: publish (via scheduled)
+  published --&gt; sales_paused
+  sales_paused --&gt; published
+  published --&gt; started
+  started --&gt; ended
+  ended --&gt; archived
+  draft --&gt; cancelled
+  review --&gt; cancelled
+  published --&gt; cancelled
+  sales_paused --&gt; cancelled
+  note right of started: Nothing in the app moves an event here or to ended or archived. Only an admin force-complete reaches ended</pre></figure>
+<h2 id="12-slot-request-host-asks-a-venue-for-a-date">12. Slot request: host asks a venue for a date</h2>
+<p>Files: <code>06-feature-calendar-slots-events.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph HOST["Host studio"]
+    H1["Draft event + choose venue and slot"] --&gt; H2["Submit for approval"]
+  end
+  H2 --&gt;|"creates draft event, then slot request"| SR["Slot request: pending"]
+  subgraph VENUE["Venue studio"]
+    V1["Incoming list"] --&gt; V2{"Decision"}
+  end
+  SR --&gt; V1
+  V2 --&gt;|accept| ACC["accepted"]
+  V2 --&gt;|reject| REJ["rejected (final)"]
+  ACC --&gt; HC["Host may cancel: cancelled"]
+  SR -.host cannot withdraw a pending request.-&gt; X["Gap"]
+  ACC -.-&gt; G1["Gap: calendar and event are not updated, nobody is notified"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class X,G1 bad
+  class SR,ACC ok</pre></figure>
+<p>Create does not check that the venue exists, that a partnership exists, or that the event belongs to the host.</p>
+<h2 id="13-partnerships-and-promoter-connections">13. Partnerships and promoter connections</h2>
+<p>Files: <code>07-feature-partners-staff-promoters.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Find a partner (Discover tab, first 200 only)"]) --&gt; RQ["Send request"]
+  RQ --&gt; PEND["pending"]
+  PEND --&gt; D{"Counterparty decides"}
+  D --&gt;|approve| ACT["active"]
+  D --&gt;|reject| REJ["rejected (final)"]
+  PEND --&gt;|either side| BLK["blocked (final)"]
+  ACT --&gt;|either side| END["ended (final)"]
+  ACT --&gt;|either side| BLK
+  ACT --&gt; VS["Partnership only: set venue share 0 to 50 percent"]
+  ACT --&gt; RV["Promoter connection only: promoter can revoke"]
+  PEND -.-&gt; NT["Request notifies the other side.&lt;br/&gt;Approve and reject do not notify the requester"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class ACT,VS,RV ok
+  class REJ,BLK,END bad</pre></figure>
+<p>Who may answer: any member can approve or reject (permission is only organisation.read). Who may start a request: owner, admin or manager (member cannot).</p>
+<h2 id="14-promoter-earnings-chain">14. Promoter earnings chain</h2>
+<p>Files: <code>07-feature-partners-staff-promoters.md</code>, <code>01-product-model.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  C["Promoter connection&lt;br/&gt;(active)"] --&gt; A["Promoter assignment on an event&lt;br/&gt;commission terms frozen&lt;br/&gt;default 15 percent"]
+  A --&gt; L["Referral link per event&lt;br/&gt;(code + vanity slug, signed)"]
+  L --&gt; G["Guest buys ticket through link"]
+  G --&gt; AT["Attribution saved on the order"]
+  AT --&gt; CM["Commission = rate x amount, rounded down&lt;br/&gt;none on free orders"]
+  CM --&gt; PF["Promoter finance and payout"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class C,A,L,G,AT,CM ok
+  class PF warn</pre></figure>
+<p>A referral link created without an assignment auto-creates a 0 percent assignment. Promoter screens in the dashboard are still on sample data.</p>
+<h2 id="15-staff-invitation">15. Staff invitation</h2>
+<p>Files: <code>07-feature-partners-staff-promoters.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  O(["Owner or admin: invite email + role"]) --&gt; I["Invitation saved (pending, 14 days)"]
+  I --&gt; U{"Account exists for this email?"}
+  U --&gt;|no| NA["Create login with temporary password&lt;br/&gt;force password change"]
+  U --&gt;|yes| EX["No account changes"]
+  NA --&gt; EM["Email: accept link + temporary password"]
+  EX --&gt; EM2["Email: accept link"]
+  EM --&gt; L["Invitee opens accept link"]
+  EM2 --&gt; L
+  L --&gt; SI["Sign in, change password if forced"]
+  SI --&gt; AC["Accept: added as member with role and capabilities"]
+  AC --&gt; LAND["Lands in the organization studio"]
+  AC -.-&gt; W["Gap: accepting never checks the signed-in email matches the invitation"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class W bad
+  class LAND ok</pre></figure>
+<h2 id="16-finance-balance-to-payout">16. Finance: balance to payout</h2>
+<p>Files: <code>08-feature-finance-overview-support.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Open Finance"]) --&gt; LD["Load: balance, ledger, payouts, bank accounts, orders"]
+  LD --&gt; F{"Load ok?"}
+  F --&gt;|no| FF["Failure screen: signed-out, no org, forbidden, or API error with retry"]
+  F --&gt;|yes| SH["Show balance (available, pending, reserved, held)"]
+  SH --&gt; B{"Bank account on file?"}
+  B --&gt;|no| NB["Payout request disabled.&lt;br/&gt;Save bank details button is disabled in the UI"]
+  B --&gt;|yes| AMT{"Available at least 100 rupees?"}
+  AMT --&gt;|no| NA["Payout request disabled"]
+  AMT --&gt;|yes| RQ["Request payout (one idempotency key per attempt)"]
+  RQ --&gt; GT{"Gateway checks"}
+  GT --&gt;|"payouts switched off"| E503["503: payouts disabled"]
+  GT --&gt;|"not owner or admin"| E403["403"]
+  GT --&gt;|ok| OK["Payout requested. Admin processes it (see admin console)"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class FF,E503,E403 bad
+  class OK,SH ok</pre></figure>
+<h2 id="17-how-pages-load-data-and-fail">17. How pages load data and fail</h2>
+<p>Files: <code>08-feature-finance-overview-support.md</code>, <code>02-frontend-architecture.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph SERVER["Server pages (overview, finance)"]
+    A["Loader runs on server with cookie"] --&gt; B{"Result"}
+    B --&gt;|data| C["Render"]
+    B --&gt;|"typed failure"| D["signed-out, no-organization, forbidden, api"]
+    D --&gt;|api only| R["Retry button: router.refresh"]
+  end
+  subgraph CLIENT["Client screens (calendar, partners, slot requests)"]
+    E["Wait for session hydrated"] --&gt; F["fetch with abort + retry counter"]
+    F --&gt; G{"Result"}
+    G --&gt;|data| H["Render"]
+    G --&gt;|error| I["Error text + retry"]
+  end
+  subgraph QUIET["Quiet failures"]
+    J["Support list: any error becomes empty list"]
+    K["Onboarding autosave: silent"]
+    L["Org whose access call fails is dropped"]
+  end
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class J,K,L bad</pre></figure>
+<h2 id="18-fixture-to-live-suggested-order">18. Fixture to live: suggested order</h2>
+<p>Files: <code>13-status-gaps-and-roadmap.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  S1["Step 1: Events list + detail&lt;br/&gt;from real events"] --&gt; S2["Step 2: Event edit wired to PATCH"]
+  S2 --&gt; S3["Step 3: Fix overview links&lt;br/&gt;(studio prefix)"]
+  S3 --&gt; S4["Step 4: Notifications inbox&lt;br/&gt;(branch exists) + search"]
+  S4 --&gt; S5["Step 5: Promoter studio screens&lt;br/&gt;+ fix promoter access"]
+  S5 --&gt; S6["Step 6: Settings, marketing, door mode"]
+  S6 --&gt; S7["Step 7: Atomic publish&lt;br/&gt;(single server call)"]
+  S7 --&gt; S8["Step 8: Calendar semantics&lt;br/&gt;(slots on accept, UTC fix)"]
+  S8 --&gt; S9["Step 9: Delete legacy trees,&lt;br/&gt;add real end-to-end smoke test"]
+  classDef step fill:#e8f0fe,stroke:#4a6fa5,color:#111
+  class S1,S2,S3,S4,S5,S6,S7,S8,S9 step</pre></figure>
+<h2 id="19-defect-map-where-the-risk-sits">19. Defect map: where the risk sits</h2>
+<p>Files: <code>13-status-gaps-and-roadmap.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  ROOT(["Partner dashboard risks"]) --&gt; SEC["Security"]
+  ROOT --&gt; DAT["Data truthfulness"]
+  ROOT --&gt; WF["Workflow"]
+  ROOT --&gt; OPS["Operations"]
+  SEC --&gt; S1["Open redirect on change-password next"]
+  SEC --&gt; S2["Support POST routes: no CSRF"]
+  SEC --&gt; S3["Invitation accept: no email check"]
+  SEC --&gt; S4["reCAPTCHA off on preview deploys"]
+  DAT --&gt; D1["Events list and detail are fixtures"]
+  DAT --&gt; D2["Promoter /access returns no permissions"]
+  DAT --&gt; D3["Analytics up to about 10 min stale"]
+  DAT --&gt; D4["Overview links 404"]
+  WF --&gt; W1["Publish is not atomic"]
+  WF --&gt; W2["Calendar auto-creates a venue on read"]
+  WF --&gt; W3["Block times saved as UTC"]
+  WF --&gt; W4["Slot accept does not update calendar"]
+  OPS --&gt; O1["Gateway cold start 30 to 40 s"]
+  OPS --&gt; O2["Legacy trees: 40k dead lines, tests still run"]
+  OPS --&gt; O3["No real end-to-end test"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class S1,S2,S3,S4,D2 bad
+  class D1,D3,D4,W1,W2,W3,W4,O1,O2,O3 warn</pre></figure>
+</main>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({startOnLoad:true, theme: dark ? "dark" : "default", securityLevel:"loose", flowchart:{htmlLabels:true, useMaxWidth:true}});
+</script></body></html>

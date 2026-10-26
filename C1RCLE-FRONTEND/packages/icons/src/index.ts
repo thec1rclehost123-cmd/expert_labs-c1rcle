@@ -1,0 +1,139 @@
+/**
+ * The single icon surface for the platform.
+ *
+ * Applications never install an icon library. They import from here, which
+ * means the icon set can be swapped, subset, or self-hosted in one place
+ * instead of in three applications.
+ *
+ * Adding an icon: re-export it below with a semantic name describing what it
+ * *means* in the product, not what it looks like.
+ */
+export {
+  AlertCircle as AlertIcon,
+  ArrowLeft as BackIcon,
+  ArrowRight as ForwardIcon,
+  Bell as NotificationIcon,
+  Building2 as PartnerIcon,
+  Calendar as CalendarIcon,
+  Check as CheckIcon,
+  ChevronDown as ChevronDownIcon,
+  CircleUser as AccountIcon,
+  Copy as CopyIcon,
+  ExternalLink as ExternalLinkIcon,
+  Eye as VisibleIcon,
+  EyeOff as HiddenIcon,
+  Filter as FilterIcon,
+  Home as HomeIcon,
+  Info as InfoIcon,
+  LayoutDashboard as DashboardIcon,
+  LoaderCircle as SpinnerIcon,
+  LogOut as SignOutIcon,
+  Menu as MenuIcon,
+  Moon as DarkModeIcon,
+  PanelLeft as NavigationSideIcon,
+  PanelTop as NavigationTopIcon,
+  Plus as AddIcon,
+  Search as SearchIcon,
+  Settings as SettingsIcon,
+  Shield as AdminIcon,
+  Sun as LightModeIcon,
+  Trash2 as DeleteIcon,
+  TriangleAlert as WarningIcon,
+  Users as UsersIcon,
+  X as CloseIcon,
+} from 'lucide-react';
+
+/**
+ * Venue Studio icon set.
+ *
+ * The partner-facing venue dashboard covers ticketing, door operations,
+ * payouts and multi-channel messaging, so it needs a wider vocabulary than the
+ * shared chrome above. Same rule applies: names describe product meaning.
+ */
+export {
+  Archive as ArchiveIcon,
+  ArrowDownToLine as WithdrawIcon,
+  ArrowUpRight as OpenInPlaceIcon,
+  BatteryFull as BatteryIcon,
+  CalendarCheck as ScheduledPayoutIcon,
+  CalendarClock as RequestPayoutIcon,
+  CalendarPlus as EmptyDateIcon,
+  ChevronLeft as PreviousIcon,
+  ChevronRight as NextIcon,
+  ChevronUp as ChevronUpIcon,
+  ChevronsUpDown as SortableIcon,
+  CircleCheckBig as ApprovedIcon,
+  CircleX as RejectedIcon,
+  ClipboardList as IncidentIcon,
+  Clock as TimeIcon,
+  DoorOpen as DoorModeIcon,
+  Download as ExportIcon,
+  Ellipsis as RowActionsIcon,
+  Globe as GuestPortalIcon,
+  GripVertical as DragHandleIcon,
+  Hammer as UnderConstructionIcon,
+  Heart as FavouriteIcon,
+  Hourglass as PendingIcon,
+  Image as ImageIcon,
+  Landmark as BankIcon,
+  Link as LinkIcon,
+  List as ListViewIcon,
+  Lock as LockedIcon,
+  LayoutGrid as GalleryViewIcon,
+  Mail as EmailIcon,
+  MailOpen as MarkUnreadIcon,
+  MapPin as LocationIcon,
+  Maximize2 as ExpandIcon,
+  Megaphone as AnnouncementIcon,
+  MessageCircle as WhatsAppIcon,
+  MessageSquare as SmsIcon,
+  Mic as MicIcon,
+  PartyPopper as PublishIcon,
+  Pencil as EditIcon,
+  Phone as PhoneIcon,
+  Pin as PinIcon,
+  Power as DisconnectIcon,
+  Receipt as OrderIcon,
+  RefreshCw as RefreshIcon,
+  Reply as ReplyIcon,
+  RotateCcw as RefundIcon,
+  ScanLine as ScanIcon,
+  Send as SendIcon,
+  Signal as SignalIcon,
+  SlidersHorizontal as AdvancedSetupIcon,
+  Smartphone as MobileAppIcon,
+  Square as UncheckedIcon,
+  SquareCheck as CheckedIcon,
+  Star as RatingIcon,
+  StickyNote as NoteIcon,
+  Ticket as TicketIcon,
+  TrendingUp as TrendUpIcon,
+  User as GuestIcon,
+  UserPlus as InviteIcon,
+  Video as VideoIcon,
+  Wifi as WifiIcon,
+  CreditCard as CreditCardIcon,
+  Wallet as WalletIcon,
+  Wine as BottleServiceIcon,
+  LifeBuoy as SupportIcon,
+} from 'lucide-react';
+
+/**
+ * Onboarding / landing icon set.
+ *
+ * These are the icon needs of the partner onboarding wizard and the
+ * pre-login marketing/landing surfaces. Same rule as the sets above:
+ * names describe product meaning, which lets the underlying lucide asset
+ * be swapped without touching call sites.
+ */
+export {
+  Zap as InstantIcon,
+  CheckCircle2 as VerifiedTickIcon,
+  Briefcase as BusinessIcon,
+  ShieldCheck as ComplianceIcon,
+  Sparkles as AssistantIcon,
+  Building as CompanyIcon,
+} from 'lucide-react';
+
+export type { LucideProps as IconProps } from 'lucide-react';
+export {};

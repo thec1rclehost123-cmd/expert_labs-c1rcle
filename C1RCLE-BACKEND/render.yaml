@@ -1,0 +1,146 @@
+# ─── Render Blueprint ─────────────────────────────────────────────────────────
+# Declarative description of a Render web service. This file is a handoff
+# example: replace the service name and domain with your own, then adopt it via
+# Render dashboard -> Blueprints -> New Blueprint Instance.
+#
+# Every secret is `sync: false`, which means Render keeps the dashboard value and
+# never reads one from this file. No credential belongs in this repository.
+
+services:
+  - type: web
+    name: c1rcle-api
+    runtime: docker
+    # The live service builds the SIDECAR image: nginx is the public edge and the
+    # gateway listens on 127.0.0.1 behind it (deploy/docker/sidecar-entrypoint.sh).
+    dockerfilePath: ./deploy/docker/Dockerfile.sidecar
+    dockerContext: .
+    # The live service is on the free plan, which spins down when idle (the first
+    # request after a pause takes ~40 s). Use `starter` or above before real
+    # customers pay. Changing the plan here only takes effect once this Blueprint
+    # is adopted.
+    plan: free
+    region: singapore
+    branch: staging
+    # Deploys are CI-GATED: Render does NOT build or deploy on push
+    # (autoDeploy is false). The ci.yml `deploy` job triggers Render only after
+    # CI OK and the Security pipeline (`Security OK`) both pass for the pushed
+    # commit, then smoke-tests the result. The live service tracks `staging`;
+    # keep this Blueprint's `branch` in step when it is adopted.
+    autoDeploy: false
+
+    # The gateway's liveness probe. It is the only unauthenticated endpoint
+    # guaranteed to answer before any dependency is wired.
+    healthCheckPath: /api/v2/internal/health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # PORT is injected by Render (10000) and read by the sidecar entrypoint, which
+      # starts the gateway on SIDECAR_FASTIFY_PORT behind nginx. Do not set PORT here.
+      - key: SIDECAR_FASTIFY_PORT
+        value: '8081'
+      - key: LOG_LEVEL
+        value: info
+
+      # Persistence. `firestore` makes FIREBASE_CLIENT_EMAIL and
+      # FIREBASE_PRIVATE_KEY hard-required — the gateway fails at cold start
+      # without them rather than silently falling back to in-memory storage.
+      - key: STORAGE_DRIVER
+        value: firestore
+      - key: FIRESTORE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
+      - key: FIREBASE_STORAGE_BUCKET
+        sync: false
+
+      # Better Auth. BETTER_AUTH_SECRET has a development default of
+      # 'dev-only-change-me' in the schema, which will NOT fail validation in
+      # production — it must be a real 32+ character random value here.
+      - key: BETTER_AUTH_SECRET
+        sync: false
+      - key: BETTER_AUTH_URL
+        value: https://api.example.com
+
+      # Browser origins allowed to call this API cross-origin (CORS) and trusted by
+      # Better Auth. Comma-separated exact https origins, no wildcards. Currently:
+      # the guest portal, partner dashboard and admin console on Vercel. Not secret,
+      # but kept in the dashboard because it changes with frontend domains.
+      # BETTER_AUTH_TRUSTED_ORIGINS defaults to this list when unset; the live
+      # service sets both to the same value.
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: BETTER_AUTH_TRUSTED_ORIGINS
+        sync: false
+      - key: PUBLIC_API_URL
+        value: https://api.example.com
+      # nginx (the sidecar's public edge) is the only trusted proxy hop.
+      - key: TRUSTED_PROXY_CIDRS
+        value: 127.0.0.1/32
+      - key: NGINX_PROFILE
+        value: staging
+      - key: NGINX_SERVER_NAME
+        value: api.example.com
+      - key: NGINX_FORWARDED_PROTO
+        value: https
+      - key: NGINX_READINESS_ALLOWLIST_LINES
+        value: 127.0.0.1/32 1;
+      # Token CI presents to read /api/v2/internal/version. Also a GitHub secret.
+      - key: NGINX_READINESS_TOKEN
+        sync: false
+
+      # Phase 5 door scanning. The HMAC key behind rotating ticket QRs and
+      # signed offline admission manifests — forging it forges entry to a paid
+      # event, so production refuses to boot without a real 32+ character
+      # value (apps/api-gateway/src/config/index.ts).
+      - key: MAGIC_TICKET_SECRET
+        sync: false
+
+      # At-rest key for bank-account numbers (AES-256-GCM). Production refuses
+      # to boot without a real 32+ character value. Set it BEFORE the deploy
+      # that ships this requirement. Older records stay readable (they fall
+      # back to the legacy key), but new writes are sealed with this one — keep
+      # it stable and backed up, since losing it makes those records unreadable.
+      - key: ENCRYPTION_KEY
+        sync: false
+
+      # Rate limiting defaults to an in-memory sliding window (per instance,
+      # resets on restart). To share it across instances, provision a Redis,
+      # set REDIS_URL to its rediss:// address and RATE_LIMIT_STORE=redis;
+      # if Redis is unreachable the gateway falls back to memory and readiness
+      # reports `redis: down`. Production rejects a localhost REDIS_URL then.
+      - key: REDIS_URL
+        sync: false
+      - key: RATE_LIMIT_STORE
+        value: memory
+
+      # Payout release gate: off until the funds flow, provider and tax approvals are on
+      # file (see your own payout approval policy). Change only with sign-off.
+      - key: PAYOUTS_ENABLED
+        value: 'false'
+
+      # Phase 4 payments. Optional in the schema; required once the checkout
+      # and webhook routes are registered.
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+
+      # Email OTP delivery (signup verification). Without a valid RESEND_API_KEY
+      # the OTP route 500s in production instead of emailing the code. Live value
+      # lives in the Render dashboard (sync: false).
+      - key: RESEND_API_KEY
+        sync: false
+
+      # HMAC key for hashing email-OTP codes at rest. Hard-required in production
+      # (config fails boot without it). Live value lives in the Render dashboard.
+      - key: EMAIL_OTP_SECRET
+        sync: false
+
+      # RENDER_GIT_COMMIT is injected by Render automatically. It is surfaced at
+      # /api/v2/internal/version so CI can tell a finished deploy apart from the
+      # previous build still serving traffic. Do not set it manually.

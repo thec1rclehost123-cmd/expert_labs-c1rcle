@@ -1,0 +1,340 @@
+import { InvalidOperationError } from '../errors.js';
+import { transitionStatus } from '../fsm.js';
+import { newVersionedEntity, bumpVersion } from '../identity.js';
+
+import type { EntityId, VersionedEntity } from '../identity.js';
+
+/**
+ * ─── Event aggregate + explicit state machine ────────────────────────────────
+ * Replaces V1's `lifecycle`/`status` string soup with one typed status and an
+ * explicit allowed-transitions table. Every transition is validated; the same
+ * transition is an idempotent no-op (safe to retry).
+ *
+ *   DRAFT → REVIEW → SCHEDULED → PUBLISHED ⇄ SALES_PAUSED → STARTED → ENDED → ARCHIVED
+ *   any-remaining → CANCELLED (terminal)
+ */
+
+export type EventStatus =
+  | 'draft'
+  | 'review'
+  | 'scheduled'
+  | 'published'
+  | 'sales_paused'
+  | 'started'
+  | 'ended'
+  | 'archived'
+  | 'cancelled';
+
+export const EVENT_STATUSES: readonly EventStatus[] = [
+  'draft',
+  'review',
+  'scheduled',
+  'published',
+  'sales_paused',
+  'started',
+  'ended',
+  'archived',
+  'cancelled',
+];
+
+/**
+ * Explicit allowed-transitions table. `null` entry = no valid source. This is
+ * the single source of truth — adding a transition requires editing this map.
+ */
+export const EVENT_TRANSITIONS: Readonly<Record<EventStatus, readonly EventStatus[]>> = {
+  draft: ['review', 'cancelled'],
+  review: ['scheduled', 'draft', 'cancelled'],
+  scheduled: ['published', 'started', 'cancelled'],
+  published: ['sales_paused', 'started', 'cancelled'],
+  sales_paused: ['published', 'started', 'cancelled'],
+  started: ['ended'],
+  ended: ['archived'],
+  archived: [],
+  cancelled: [],
+};
+
+/** Terminal statuses: no outbound transitions and no attribute mutation. */
+const TERMINAL_EVENT_STATUSES: readonly EventStatus[] = ['cancelled', 'archived'];
+
+export function isTerminalEventStatus(status: EventStatus): boolean {
+  return TERMINAL_EVENT_STATUSES.includes(status);
+}
+
+/**
+ * Rejects attribute updates on a terminal event. `EVENT_TRANSITIONS` already
+ * freezes status changes, but `updateEvent` (title/pricing/promo/…) would
+ * otherwise still rewrite a cancelled or archived event.
+ */
+function assertEventMutable(event: Event): void {
+  if (isTerminalEventStatus(event.status)) {
+    throw new InvalidOperationError(`A ${event.status} event is terminal and cannot be modified`);
+  }
+}
+
+export interface TicketTierRef {
+  tierId: EntityId;
+  priceInPaise: number;
+  quantity: number;
+}
+
+export type CompensationModel = 'standard' | 'custom' | 'salary';
+export type SalaryPeriod = 'per_event' | 'per_day' | 'per_month';
+
+export interface EventCompensation {
+  model: CompensationModel;
+  globalRatePercent: number | null;
+  tierRates: Record<string, number>;
+  salaryAmountPaise: number | null;
+  salaryPeriod: SalaryPeriod | null;
+  salaryNotes: string | null;
+}
+
+export interface Event extends VersionedEntity {
+  id: EntityId;
+  organizationId: EntityId;
+  venueId: EntityId | null;
+  /**
+   * URL-safe public identifier — V1 events always carried one and the public
+   * surface addresses events by `idOrSlug`. Server-derived at create
+   * (`slugify(title)`), overridable via update.
+   */
+  slug: string;
+  title: string;
+  /** Public blurb shown to guests. */
+  summary: string;
+  /** Full public description. */
+  description: string;
+  imageUrl: string | null;
+  /** ISO-8601 timestamps. */
+  startAt: string;
+  endAt: string | null;
+  status: EventStatus;
+  /** Caching visibility derived from status (public vs internal). */
+  isPublic: boolean;
+  /** Opaque tags — presentation only. */
+  tags: string[];
+  /** Base price when a single price is offered. */
+  startingPricePaise: number | null;
+  isFree: boolean;
+  /** Reason/meta recorded when CANCELLED. */
+  cancellationReason: string | null;
+  compensation?: EventCompensation | null;
+  /**
+   * Total people the room legally holds, for the door's occupancy gauge.
+   *
+   * Nullable on purpose: many events genuinely have no fixed cap, and a
+   * fabricated default (the old scanner UI hardcoded 500) tells door staff a
+   * confident number nobody set. `null` means "not configured" and the door
+   * shows occupancy without a limit rather than inventing one.
+   *
+   * This is NOT ticket inventory. Tier quantities decide what can be sold;
+   * capacity decides when the fire marshal stops the night.
+   */
+  capacity: number | null;
+  /**
+   * True while the current `sales_paused` state was forced by a platform
+   * admin rather than the partner pausing their own sales. Lets partner UI
+   * tell an admin halt apart from a self-pause instead of showing the same
+   * "paused" badge for both (v1's `adminStore.js:509` did this with the
+   * same flag name).
+   */
+  adminOverride: boolean;
+}
+
+export interface CreateEventInput {
+  id: EntityId;
+  organizationId: EntityId;
+  venueId: EntityId;
+  title: string;
+  summary?: string;
+  description?: string;
+  imageUrl?: string | null;
+  startAt: string;
+  endAt?: string | null;
+  tags?: string[];
+  compensation?: EventCompensation | null;
+  capacity?: number | null;
+  now?: Date;
+}
+
+/** Slugify like V1 (`events.ts` slug convention): lowercase, `-` for spaces.
+ *
+ * The dash trim is a plain index scan, not a regex. `/^-+|-+$/g` and even a
+ * lone `/-+$/` are quadratic in the length of the input: the engine retries
+ * the `-+` run from every start position and only then fails the `$` anchor.
+ * A title is partner-supplied, so that shape is reachable in principle and
+ * CodeQL reports it as `js/polynomial-redos`. The scan below is linear.
+ *
+ * The result is unchanged: it strips the whole run of leading and trailing
+ * dashes, exactly what the `g`-flagged alternation did.
+ */
+export function slugifyEventTitle(title: string): string {
+  return trimDashes(
+    title
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, '-'),
+  ).slice(0, 80);
+}
+
+function trimDashes(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && value[start] === '-') start += 1;
+  while (end > start && value[end - 1] === '-') end -= 1;
+  return value.slice(start, end);
+}
+
+export function createEvent(input: CreateEventInput): Event {
+  const now = input.now ?? new Date();
+  return {
+    id: input.id,
+    organizationId: input.organizationId,
+    venueId: input.venueId,
+    slug: slugifyEventTitle(input.title) || input.id,
+    title: input.title,
+    status: 'draft',
+    isPublic: false,
+    summary: input.summary ?? '',
+    description: input.description ?? '',
+    imageUrl: input.imageUrl ?? null,
+    startAt: input.startAt,
+    endAt: input.endAt ?? null,
+    tags: input.tags ?? [],
+    startingPricePaise: 0,
+    isFree: true,
+    cancellationReason: null,
+    compensation: input.compensation ?? null,
+    capacity: input.capacity ?? null,
+    adminOverride: false,
+    ...newVersionedEntity(now),
+  };
+}
+
+interface EventChanges {
+  slug?: string;
+  title?: string;
+  summary?: string;
+  description?: string;
+  imageUrl?: string | null;
+  startAt?: string;
+  endAt?: string | null;
+  tags?: string[];
+  startingPricePaise?: number;
+  isFree?: boolean;
+  compensation?: EventCompensation | null;
+  capacity?: number | null;
+}
+
+/** Controlled attribute update (no status changes here). Bumps version. */
+export function updateEvent(event: Event, changes: EventChanges, now?: Date): Event {
+  assertEventMutable(event);
+  const stamped = bumpVersion(event, now ?? new Date());
+  return { ...stamped, ...changes };
+}
+
+/**
+ * Validates a status transition against the table. Throws
+ * `StateTransitionError` for illegal moves; same-state is a no-op returning
+ * the unchanged status.
+ */
+export function transitionEventStatus(from: EventStatus, to: EventStatus): EventStatus {
+  return transitionStatus(from, to, EVENT_TRANSITIONS);
+}
+
+/**
+ * Applies a validated transition to an event. Idempotent: asking for the
+ * current status returns the event unchanged (retry-safe).
+ */
+export function transitionEvent(event: Event, to: EventStatus, now?: Date): Event {
+  if (event.status === to) return event;
+  if (event.status === 'cancelled') {
+    throw new InvalidOperationError('A cancelled event is terminal');
+  }
+  // Validate BEFORE mutating; StateTransitionError bubbles as a domain error.
+  const next = transitionStatus(event.status, to, EVENT_TRANSITIONS);
+  const stamped = bumpVersion(event, now ?? new Date());
+  return {
+    ...stamped,
+    status: next,
+    isPublic: computeIsPublic(next),
+    // Any real status change clears an admin override — `adminPauseEvent`
+    // re-sets it explicitly right after calling this. A self-pause or a
+    // partner's own resume should never carry a stale override flag.
+    adminOverride: false,
+  };
+}
+
+export function cancelEvent(event: Event, reason: string, now?: Date): Event {
+  if (event.status === 'cancelled') return event;
+  transitionStatus(event.status, 'cancelled', EVENT_TRANSITIONS);
+  const stamped = bumpVersion(event, now ?? new Date());
+  return { ...stamped, status: 'cancelled', isPublic: false, cancellationReason: reason };
+}
+
+const PAUSABLE_STATUSES: readonly EventStatus[] = ['published', 'sales_paused'];
+
+/**
+ * Admin pause (`EVENT_PAUSE`, TIER1 — any admin, merely logged). Only
+ * reachable from `published`/already-`sales_paused`: the terminal-state
+ * guard is the FSM table itself (`sales_paused` has no inbound edge from
+ * `draft`/`scheduled`/`started`/`ended`/`archived`/`cancelled`), but this
+ * explicit check gives a clear message instead of a generic
+ * `StateTransitionError` — v1's equivalent guard (`adminStore.js:500-502`)
+ * used the same "cannot pause a completed or past event" wording.
+ */
+export function adminPauseEvent(event: Event, now?: Date): Event {
+  if (!PAUSABLE_STATUSES.includes(event.status)) {
+    throw new InvalidOperationError('Cannot pause a completed, past, or cancelled event');
+  }
+  if (event.status === 'sales_paused') {
+    if (event.adminOverride) return event;
+    return { ...bumpVersion(event, now ?? new Date()), adminOverride: true };
+  }
+  return { ...transitionEvent(event, 'sales_paused', now), adminOverride: true };
+}
+
+/** Admin resume (`EVENT_RESUME`, TIER1). Reverses `adminPauseEvent`. */
+export function adminResumeEvent(event: Event, now?: Date): Event {
+  if (!PAUSABLE_STATUSES.includes(event.status)) {
+    throw new InvalidOperationError('Cannot resume a completed, past, or cancelled event');
+  }
+  return transitionEvent(event, 'published', now);
+}
+
+/**
+ * Sources an admin may force-complete from. This is the one *admin-only* FSM
+ * edge — it is deliberately NOT in the public `EVENT_TRANSITIONS` table, which
+ * only allows `started → ended` automatically. A partner must never force-end
+ * their own event; only a platform admin may, so the edge is enforced here by
+ * this explicit guard (same pattern as the `PAUSABLE_STATUSES` guard above
+ * rather than a duplicated public-edge entry).
+ */
+const FORCE_COMPLETABLE_STATUSES: readonly EventStatus[] = ['published', 'sales_paused', 'started'];
+
+/**
+ * Admin force-complete (`EVENT_FORCE_PAUSE`, TIER1 — any admin, merely
+ * logged). The admin-only FSM edge that force-ends a past event whose
+ * lifecycle never transitioned on its own (a sales window that closed days
+ * ago but is still `published`, a `started` event that never hit `ended`,
+ * etc.). Stamps `adminOverride` so the admin trail records the end was forced,
+ * and clears `isPublic` exactly like a natural `ended`.
+ */
+export function adminForceCompleteEvent(event: Event, now?: Date): Event {
+  if (event.status === 'ended') return event;
+  if (!FORCE_COMPLETABLE_STATUSES.includes(event.status)) {
+    throw new InvalidOperationError(
+      'Cannot force-complete a draft, review, scheduled, completed, archived, or cancelled event',
+    );
+  }
+  const stamped = bumpVersion(event, now ?? new Date());
+  return { ...stamped, status: 'ended', isPublic: false, adminOverride: true };
+}
+
+function computeIsPublic(status: EventStatus): boolean {
+  return status === 'published' || status === 'sales_paused' || status === 'started';
+}
+
+export function isPublicStatus(status: EventStatus): boolean {
+  return computeIsPublic(status);
+}
