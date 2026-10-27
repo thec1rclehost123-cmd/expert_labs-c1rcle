@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C1RCLE Scanner App: visual guide</title>
+<style>
+:root{--bg:#fff;--fg:#1b1f24;--muted:#57606a;--line:#d0d7de;--card:#f6f8fa}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9da7b3;--line:#30363d;--card:#161b22}}
+body{background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:1.9rem} h2{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--line);font-size:1.35rem}
+code{background:var(--card);padding:.1em .35em;border-radius:4px;font-size:.9em}
+figure{margin:1rem 0;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--card);overflow-x:auto}
+.mermaid{background:transparent;margin:0}
+table{border-collapse:collapse;margin:1rem 0;display:block;overflow-x:auto} th,td{border:1px solid var(--line);padding:6px 10px;text-align:left} th{background:var(--card)}
+p,li{color:var(--fg)} hr{border:0;border-top:1px solid var(--line);margin:1.5rem 0} a{color:#0969da}
+.note{color:var(--muted);font-size:.9rem}
+</style></head><body><main>
+<p class="note">Confidential. Share only under NDA. Diagrams are drawn by the Mermaid library loaded from a CDN, so an internet connection is needed to see them.</p>
+<h1 id="00-scanner-app-visual-guide">00. Scanner app: visual guide</h1>
+<p>Start here if you prefer pictures. Each diagram points to the detailed file that explains it. Colours are consistent:</p>
+<ul><li>🟩 <strong>green</strong> = works and is enforced</li><li>🟨 <strong>yellow</strong> = partial, manual, or a decision is pending</li><li>🟥 <strong>red</strong> = defect or risk (see <code>12-status-gaps-and-roadmap.md</code> and <code>11-threat-model-and-security-findings.md</code>)</li><li>⬜ <strong>grey</strong> = infrastructure or neutral step</li></ul>
+<p>How to view: GitHub, VS Code (Markdown Preview Mermaid Support), or paste a block into <a href="https://mermaid.live.">https://mermaid.live.</a> A browser version is in <code>visual-guide.html</code> (needs internet for the Mermaid library).</p>
+<p>Contents: 1 System map · 2 App states · 3 Event-day workflow · 4 Three credentials · 5 Who may call what · 6 Scan decision · 7 QR verification · 8 Admission rules · 9 Couple tickets · 10 Override, deny and manual check-in · 11 Door entry options · 12 Cover wallet charge · 13 Wallet lifecycle · 14 Device lifecycle · 15 Realtime stats · 16 Offline today · 17 New offline design · 18 Offline build status · 19 Defect map · 20 Fix order</p>
+<hr>
+<h2 id="1-system-map">1. System map</h2>
+<p>Files: <code>02-app-architecture.md</code>, <code>09-backend-api-reference.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  ST["Door staff&lt;br/&gt;handset"] --&gt; APP
+  subgraph Handset["Scanner app (Expo)"]
+    APP["Screens: scan, door, guests, stats, wallet"]
+    MEM["Staff token&lt;br/&gt;(memory only)"]
+    SEC["Secure storage:&lt;br/&gt;device id, shift token, venue"]
+  end
+  GUEST["Guest phone&lt;br/&gt;rotating ticket QR or wallet QR"] -.shown to camera.-&gt; APP
+  APP --&gt;|"Bearer + X-Organization-Id&lt;br/&gt;+ X-Scanner-Session-Token"| GW
+  subgraph Render["Gateway (Render)"]
+    NG["nginx"] --&gt; GW["Fastify /api/v2/door/*&lt;br/&gt;auth, RBAC, rate limit, idempotency"]
+    GW --&gt; CORE["Door services&lt;br/&gt;scan, sales, wallets, stats"]
+  end
+  CORE --&gt; FS[("Firestore&lt;br/&gt;entitlements, scan ledger,&lt;br/&gt;sessions, devices, wallets")]
+  CORE -.stats stream (SSE).-&gt; APP
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef infra fill:#eeeeee,stroke:#888,color:#111
+  class APP,GW,CORE live
+  class MEM,SEC,NG,FS,GUEST infra</pre></figure>
+<h2 id="2-app-states-where-the-user-can-be">2. App states: where the user can be</h2>
+<p>Files: <code>02-app-architecture.md</code>.</p>
+<figure><pre class="mermaid">stateDiagram-v2
+  direction LR
+  [*] --&gt; checking
+  checking --&gt; logged_out: no staff token
+  logged_out --&gt; needs_pairing: login ok, device not paired
+  logged_out --&gt; needs_redeem: login ok, device paired
+  needs_pairing --&gt; needs_redeem: device registered
+  needs_redeem --&gt; active_session: door code accepted
+  active_session --&gt; needs_redeem: shift expires (12 h) or Switch event
+  active_session --&gt; logged_out: Log out or app restart
+  needs_redeem --&gt; logged_out: Log out or app restart
+  note right of logged_out: Staff token lives in memory only, so every cold start returns here. Re-checked every 60 s</pre></figure>
+<h2 id="3-event-day-workflow">3. Event-day workflow</h2>
+<p>Files: <code>01-product-model-and-workflow.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  M(["Manager: mint a door code&lt;br/&gt;type, gate, max devices, expiry"]) --&gt; S1["Staff sign in"]
+  S1 --&gt; S2["Pick tonight's event (IST date)"]
+  S2 --&gt; S3{"Handset paired?"}
+  S3 --&gt;|no| P["Register device (needs door.manage today)"]
+  S3 --&gt;|yes| S4
+  P --&gt; S4["Enter door code + optional GPS fix"]
+  S4 --&gt; G{"Server checks: code valid? device cap? within 500 m?"}
+  G --&gt;|no| E["Shift refused with a message"]
+  G --&gt;|yes| SH["Shift open: 12 h session token (shown once)"]
+  SH --&gt; W["During the night"]
+  W --&gt; A1["Scan tickets"]
+  W --&gt; A2["Manual guest check-in"]
+  W --&gt; A3["Door sales, walk-ins, dine-ins"]
+  W --&gt; A4["Cover tab charges"]
+  W --&gt; A5["Watch live occupancy"]
+  W --&gt; A6["Heartbeat every 60 s"]
+  SH -.lost phone.-&gt; L["Manager unbinds device: sessions revoked"]
+  SH --&gt; END(["Shift ends after 12 h or manager revokes the code"])
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class SH,W ok
+  class P warn
+  class E bad</pre></figure>
+<p>Logout and "end shift" in the app are client-only: the server session stays valid until it expires or is revoked.</p>
+<h2 id="4-the-three-credentials">4. The three credentials</h2>
+<p>Files: <code>04-credentials-sessions-devices.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph C1["Staff login"]
+    A1["Email + password"] --&gt; A2["7-day access token&lt;br/&gt;memory only, no refresh"]
+  end
+  subgraph C2["Device identity"]
+    B1["Generated once on the handset&lt;br/&gt;scanner_ + 32 hex"] --&gt; B2["Registered per organization&lt;br/&gt;can be unbound by a manager"]
+  end
+  subgraph C3["Scanner session"]
+    D1["Door code C1R-XXXXXXXX"] --&gt; D2["POST /door/sessions"] --&gt; D3["Token scn_...&lt;br/&gt;12 h, shown once, only its hash is stored"]
+  end
+  A2 --&gt; USE["Most door calls need login AND scanner token"]
+  D3 --&gt; USE
+  B2 --&gt; USE
+  USE -.-&gt; W["Token is not tied to the user who opened it"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class A2,B2,D3,USE ok
+  class W bad</pre></figure>
+<h2 id="5-who-may-call-what">5. Who may call what</h2>
+<p>Files: <code>04-credentials-sessions-devices.md</code>, <code>09-backend-api-reference.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  R(["Door API call"]) --&gt; Q{"Which kind of route?"}
+  Q --&gt;|"Scan, lookup, confirm, staff-deny, heartbeat,&lt;br/&gt;wallet QR and charge, ticket sale, offline"| T1["Login + scanner token&lt;br/&gt;+ session permission (canScan, canCharge, canDoorEntry)"]
+  Q --&gt;|"Door codes, devices, cover-wallet admin"| T2["Login + door.manage&lt;br/&gt;(owner, admin, manager)"]
+  Q --&gt;|"Override, manual check-in, walk-in, dine-in, wallet debit"| T3["Login + ticket.override&lt;br/&gt;(owner, admin, manager)"]
+  Q --&gt;|"Events, guests, sales, attendance"| T4["Login + venue.read&lt;br/&gt;(any member)"]
+  Q --&gt;|"Open shift, read session, read check-in,&lt;br/&gt;mint ticket QR, stats"| T5["Login only"]
+  T5 -.-&gt; RISK["Any member can open a shift with a code,&lt;br/&gt;read check-ins with guest names,&lt;br/&gt;and mint a valid QR for any ticket of the org"]
+  T2 -.-&gt; R2["Device registration needs door.manage,&lt;br/&gt;but the app asks every staff member to pair"]
+  T3 -.-&gt; R3["Walk-in and dine-in need this role,&lt;br/&gt;app only checks the session flag"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class T1,T2,T3,T4 ok
+  class T5 ok
+  class RISK,R2,R3 bad</pre></figure>
+<h2 id="6-what-happens-when-a-guest-is-scanned-online">6. What happens when a guest is scanned (online)</h2>
+<p>Files: <code>03-screens-and-scan-flow.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  C(["Camera reads a QR"]) --&gt; D{"Same payload as the last scan?"}
+  D --&gt;|yes| IGN["Ignored until the sheet is dismissed"]
+  D --&gt;|no| N{"Device online?"}
+  N --&gt;|no| OFF["Offline card: entry denied until connectivity returns"]
+  N --&gt;|yes| LK["POST /door/lookup (read only)"]
+  LK --&gt; AA{"Lookup invalid, or auto-admit on?"}
+  AA --&gt;|yes| CI["POST /door/check-ins"]
+  AA --&gt;|no| PV["Preview sheet: guest, tier, people.&lt;br/&gt;Staff taps ADMIT"]
+  PV --&gt; CI
+  CI --&gt; R{"Server result"}
+  R --&gt;|consumed| OK["Green: admitted + haptic + recent entry"]
+  R --&gt;|denied| NO["Red: reason pill + haptic + recent entry"]
+  R --&gt;|confirmation_required| CP["Couple confirmation card"]
+  NO --&gt; OV{"Role can override?"}
+  OV --&gt;|yes| OVR["OVERRIDE with a reason"]
+  OV --&gt;|"member"| STOP["No override button action"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class OK ok
+  class NO,OFF bad
+  class CP,OVR warn</pre></figure>
+<p>A timeout is 60 s by default, so a bad network can hold the screen for up to a minute before the offline card appears.</p>
+<h2 id="7-how-the-server-checks-a-qr-and-the-hole">7. How the server checks a QR (and the hole)</h2>
+<p>Files: <code>05-qr-and-admission.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  P(["qrPayload string"]) --&gt; S{"Split on colon:&lt;br/&gt;exactly 3 non-empty parts?"}
+  S --&gt;|"no (e.g. a plain ticket id)"| BARE["Treated as a bare ticket id&lt;br/&gt;NO signature check"]
+  S --&gt;|yes| SIG{"Signature matches claimed window&lt;br/&gt;or the one before?"}
+  SIG --&gt;|no| DEN1["Denied: invalid_signature"]
+  SIG --&gt;|yes| WIN{"Claimed window within 60 s of now?"}
+  WIN --&gt;|no| DEN2["Denied: replayed screenshot"]
+  WIN --&gt;|yes| OKQ["Ticket id accepted&lt;br/&gt;(valid for about 90 to 120 s)"]
+  BARE --&gt; ADM["Admission rules"]
+  OKQ --&gt; ADM
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class OKQ ok
+  class BARE bad
+  class DEN1,DEN2 bad</pre></figure>
+<p>Anyone who knows or sees a ticket id (the holder's own wallet screens expose it) can present it without the rotating code. The docs say bare ids are never accepted; the code accepts them.</p>
+<h2 id="8-admission-rules-in-order">8. Admission rules, in order</h2>
+<p>Files: <code>05-qr-and-admission.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  A(["Ticket id from the QR"]) --&gt; T["Start one Firestore transaction (claimAdmission)"]
+  T --&gt; E1{"Ticket exists?"}
+  E1 --&gt;|no| X1["Denied: invalid_signature"]
+  E1 --&gt;|yes| E2{"Ticket is for this event?"}
+  E2 --&gt;|no| X2["Denied: wrong_event (no details leaked)"]
+  E2 --&gt;|yes| E3{"Ticket void?"}
+  E3 --&gt;|yes| X3["Denied: void_ticket"]
+  E3 --&gt;|no| E4{"Refund in progress?"}
+  E4 --&gt;|yes| X3
+  E4 --&gt;|no| E5{"Seats left? (scanCount below allowed)"}
+  E5 --&gt;|no| X4["Denied: already_used"]
+  E5 --&gt;|yes| OKK["Spend the seat, write entitlement"]
+  OKK --&gt; L["Write scan ledger row, update device and code counters, audit"]
+  X1 --&gt; L2["Write denied ledger row"]
+  X2 --&gt; L2
+  X3 --&gt; L2
+  X4 --&gt; L2
+  L -.-&gt; GAP1["Ledger write is a separate step:&lt;br/&gt;a crash between them spends a seat with no row"]
+  OKK -.-&gt; GAP2["Not checked: entry time windows, venue capacity"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class OKK,L ok
+  class X1,X2,X3,X4,L2 bad
+  class GAP1,GAP2 warn</pre></figure>
+<h2 id="9-couple-tickets-two-seats-two-steps">9. Couple tickets (two seats, two steps)</h2>
+<p>Files: <code>03-screens-and-scan-flow.md</code>, <code>05-qr-and-admission.md</code>.</p>
+<figure><pre class="mermaid">sequenceDiagram
+  participant S as Staff handset
+  participant G as Gateway
+  S-&gt;&gt;G: POST /door/check-ins (couple QR)
+  G-&gt;&gt;G: ticket has exactly 2 seats and none used
+  G--&gt;&gt;S: confirmation_required + signed token (30 s) + seats
+  S-&gt;&gt;S: Card: both guests present? YES or NO, 30 s countdown from server time
+  alt YES
+    S-&gt;&gt;G: POST /door/check-ins/confirm (token, confirmed true)
+    G-&gt;&gt;G: verify token (ticket, event, session, device, scan count), claim 2 seats in one transaction
+    G--&gt;&gt;S: consumed (both admitted)
+  else NO
+    S-&gt;&gt;G: POST /door/check-ins/confirm (confirmed false)
+    G--&gt;&gt;S: denied: override_required (ticket not spent)
+  else window expires
+    S-&gt;&gt;S: Confirmation window expired, re-scan
+  end
+  Note over S,G: Tickets with 3 or more seats admit one seat per scan. Manual check-in and offline mode skip the confirmation</pre></figure>
+<h2 id="10-override-staff-deny-and-manual-check-in">10. Override, staff-deny and manual check-in</h2>
+<p>Files: <code>05-qr-and-admission.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph DENY["Staff-deny (needs session + bound device)"]
+    D1["Refuse someone without spending the ticket"] --&gt; D2["Ledger row: denied, override_required, admitted 0"]
+  end
+  subgraph OVR["Override (needs ticket.override, no token)"]
+    O1["Pick a denied row + reason"] --&gt; O2["Row becomes overridden, admitted 1&lt;br/&gt;ticket NOT touched"]
+  end
+  subgraph MAN["Manual guest check-in (needs ticket.override)"]
+    M1["Pick a guest on the roster"] --&gt; M2["Same atomic claim, one seat"]
+    M2 --&gt; M3["Skips couple confirmation"]
+  end
+  D2 -.can be overridden.-&gt; O1
+  O2 -.-&gt; W1["Counts as an admission in stats while the ticket stays unspent:&lt;br/&gt;same guest can scan in later and count twice"]
+  O1 -.-&gt; W2["Can override ANY denied row:&lt;br/&gt;invalid signature, void ticket, staff-deny"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class D2,O2,M2 ok
+  class W1,W2,M3 bad</pre></figure>
+<h2 id="11-door-entry-three-ways-to-let-someone-in">11. Door entry: three ways to let someone in</h2>
+<p>Files: <code>06-door-sales-and-cover-wallet.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  F(["Door entry form"]) --&gt; T{"Entry type"}
+  T --&gt;|"Ticket (paid)"| TS["POST /door/ticket-sale&lt;br/&gt;needs a full session, cash only"]
+  T --&gt;|Walk-in| WI["POST /door/walk-in&lt;br/&gt;needs ticket.override"]
+  T --&gt;|Dine-in| DI["POST /door/dine-in&lt;br/&gt;needs ticket.override"]
+  TS --&gt; TS1["Check tier active + stock (read check, can oversell)"]
+  TS1 --&gt; TS2["Create order and tickets, admit each ticket, post to finance ledger"]
+  TS2 -.-&gt; TSW["Couple tier sold here gets 1 seat per unit&lt;br/&gt;steps are not atomic"]
+  WI --&gt; PR["Price = event walk-in tier price"]
+  DI --&gt; PR
+  PR --&gt; PRW["NOT multiplied by number of guests"]
+  PR --&gt; HC["Headcount entry saved (counts toward inside)"]
+  HC --&gt; PAY["Payment mode: cash, card, upi, other&lt;br/&gt;none are verified"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class TS,WI,DI,HC ok
+  class TSW,PRW bad
+  class PAY warn</pre></figure>
+<h2 id="12-cover-wallet-charge">12. Cover wallet charge</h2>
+<p>Files: <code>06-door-sales-and-cover-wallet.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Open Cover Tab (needs a charge session)"]) --&gt; SC["Scan the guest's wallet QR (guest minted it)"]
+  SC --&gt; RV["POST /door/wallet-qr: first name, balance, status"]
+  RV --&gt; ST{"Wallet active?"}
+  ST --&gt;|no| BLK["Items disabled with a note"]
+  ST --&gt;|yes| IT["Pick a preset item set by the venue&lt;br/&gt;(no free amount)"]
+  IT --&gt; AF{"Price within balance?"}
+  AF --&gt;|no| DIS["Item disabled"]
+  AF --&gt;|yes| CH["POST /door/wallet-charge&lt;br/&gt;one idempotency key per tap"]
+  CH --&gt; V{"Server checks"}
+  V --&gt;|"3 charges in the last minute on this device"| VEL["Refused: velocity limit"]
+  V --&gt;|"same key already used"| REP["Replays the earlier charge"]
+  V --&gt;|ok| DONE["Balance debited, transaction recorded"]
+  DONE --&gt; Z{"Balance now zero?"}
+  Z --&gt;|yes| TERM["Wallet terminated, cannot be topped up"]
+  Z --&gt;|no| NEXT["Wallet cleared: scan the QR again for the next charge"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class DONE,REP ok
+  class VEL,BLK,DIS bad
+  class TERM warn</pre></figure>
+<h2 id="13-wallet-lifecycle">13. Wallet lifecycle</h2>
+<p>Files: <code>06-door-sales-and-cover-wallet.md</code>, <code>10-domain-model-and-state-machines.md</code>.</p>
+<figure><pre class="mermaid">stateDiagram-v2
+  direction LR
+  [*] --&gt; active: issued by door.manage with opening balance
+  active --&gt; frozen: freeze
+  frozen --&gt; active: unfreeze
+  active --&gt; terminated: balance reaches 0 or terminate
+  active --&gt; closed
+  terminated --&gt; [*]
+  note right of active: Debits are stored as negative amounts. Reconciliation subtracts them, so it reports a false mismatch</pre></figure>
+<h2 id="14-device-lifecycle-and-the-lost-phone">14. Device lifecycle and the lost phone</h2>
+<p>Files: <code>04-credentials-sessions-devices.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  N(["New handset"]) --&gt; R["Register or auto-bind at shift open"]
+  R --&gt; ACT["Device active"]
+  ACT --&gt; SC["Scans, confirms, staff-deny, heartbeat&lt;br/&gt;(device checked)"]
+  ACT --&gt;|"manager unbinds"| UB["Device unbound + its sessions revoked"]
+  UB --&gt; TRY{"Registers again?"}
+  TRY --&gt;|yes| REF["Refused (403): cannot resurrect itself"]
+  UB --&gt;|"manager reauthorizes"| ACT
+  UB -.-&gt; GAP["Lookup, manifest, sync, wallet and ticket sale do not check the device,&lt;br/&gt;so only the session revocation protects them"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class ACT,SC ok
+  class UB,REF bad
+  class GAP bad</pre></figure>
+<h2 id="15-live-occupancy-path">15. Live occupancy path</h2>
+<p>Files: <code>07-stats-guests-and-realtime.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  APP["Stats screen"] --&gt;|"prime once"| ST["GET /door/stats"]
+  APP --&gt;|"open stream"| SSE["GET /door/stats/stream (SSE)"]
+  SSE --&gt; TICK["Every 3 s: recompute stats,&lt;br/&gt;send a frame only if changed"]
+  TICK --&gt; KA["Keep-alive every 15 s"]
+  TICK --&gt; LIM["Limits: 10 per user, 500 total,&lt;br/&gt;15 minute lifetime"]
+  LIM --&gt;|"stream closes"| RE["App reconnects after 2 s, forever, no backoff"]
+  APP --&gt;|"every 15 s"| SALES["GET /door/sales (heads, tables, amount)"]
+  TICK -.-&gt; COST["Each tick reads all door sales:&lt;br/&gt;cost grows with attendance, voided sales counted"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class APP,ST,SSE,TICK ok
+  class RE,COST warn</pre></figure>
+<p>The stats routes need no scanner token, so the app sending only the organization header is correct.</p>
+<h2 id="16-offline-today-the-app-fails-closed">16. Offline today: the app fails closed</h2>
+<p>Files: <code>08-offline-design-and-status.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Guest scanned, no connection"]) --&gt; N{"Network reachable?"}
+  N --&gt;|no| C["Offline card:&lt;br/&gt;Entry denied until connectivity returns"]
+  N --&gt;|"timeout or network error"| C
+  C --&gt; T["TRY AGAIN, nothing is stored or queued"]
+  C -.-&gt; WHY["Backend offline manifest and sync exist (old design)&lt;br/&gt;but the app never calls them"]
+  WHY --&gt; OLD["Old design cannot work:&lt;br/&gt;device cannot verify a master-secret signature,&lt;br/&gt;and sync re-checks QR against server time&lt;br/&gt;so codes older than about 2 minutes are rejected"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class C,T bad
+  class OLD warn</pre></figure>
+<h2 id="17-new-offline-design-backend-merged-on-staging-app-not-wired">17. New offline design (backend merged on staging, app not wired)</h2>
+<p>Files: <code>08-offline-design-and-status.md</code>.</p>
+<figure><pre class="mermaid">sequenceDiagram
+  participant D as Handset (online, before the event)
+  participant G as Gateway
+  participant X as Guest phone
+  D-&gt;&gt;G: GET /door/offline-manifest (session may scan)
+  G--&gt;&gt;D: signed manifest: per-ticket keys, seats left, public key, keyId, expires in 12 h
+  D-&gt;&gt;D: verify Ed25519 signature, pin keyId, store encrypted
+  Note over D: Connection drops
+  X-&gt;&gt;D: rotating QR (id, window, HMAC with that ticket key)
+  D-&gt;&gt;D: verify HMAC with ticket key, check seats left, spend locally, log scan
+  D-&gt;&gt;D: bare ids and expired manifests are refused
+  Note over D: Connection returns
+  D-&gt;&gt;G: POST /door/offline-sync (batches up to 500, Idempotency-Key, scannedAt per scan)
+  G-&gt;&gt;G: verify QR as of scannedAt, bound scannedAt, atomic claim per scan
+  G--&gt;&gt;D: synced list and conflicts (already used, expired)
+  D-&gt;&gt;D: mark records synced or conflict, show conflicts to staff</pre></figure>
+<h2 id="18-offline-what-is-built-and-where">18. Offline: what is built and where</h2>
+<p>Files: <code>08-offline-design-and-status.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  subgraph BE["Backend"]
+    B1["Derived keys + Ed25519 manifest + bounded sync&lt;br/&gt;PR 138 merged to staging 2026-10-22"]
+    B2["Not on the checked-out branch or main"]
+  end
+  subgraph CT["Contract"]
+    C1["Manifest shape mirrored in frontend&lt;br/&gt;PR 81 merged 2026-10-22"]
+  end
+  subgraph FE["App"]
+    F1["Offline engine: crypto, manifest, decision,&lt;br/&gt;scan log, scanner, sync&lt;br/&gt;PR 82 OPEN, tests included"]
+    F2["Persistent encrypted store"]
+    F3["API calls for manifest and sync"]
+    F4["Scan screen offline branch + venue opt-in setting"]
+    F5["Sync on reconnect + conflict screen"]
+    F6["Revocation list in manifest"]
+  end
+  B1 --&gt; B2
+  B1 --&gt; C1 --&gt; F1
+  F1 --&gt; F2 --&gt; F3 --&gt; F4 --&gt; F5
+  F5 -.later.-&gt; F6
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class B1,C1 ok
+  class F1,B2 warn
+  class F2,F3,F4,F5,F6 bad</pre></figure>
+<h2 id="19-defect-map">19. Defect map</h2>
+<p>Files: <code>12-status-gaps-and-roadmap.md</code>, <code>11-threat-model-and-security-findings.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  ROOT(["Scanner risks"]) --&gt; ENT["Entry integrity"]
+  ROOT --&gt; ACC["Access control"]
+  ROOT --&gt; MON["Door money"]
+  ROOT --&gt; APPQ["App quality"]
+  ROOT --&gt; OFF["Offline"]
+  ENT --&gt; e1["Bare ticket id accepted without signature"]
+  ENT --&gt; e2["QR valid 90 to 120 s, not 30 s"]
+  ENT --&gt; e3["Override can admit any denied row, can double count"]
+  ENT --&gt; e4["Ledger write not atomic with seat spend"]
+  ACC --&gt; a1["Device registration needs door.manage:&lt;br/&gt;member staff cannot pair"]
+  ACC --&gt; a2["Any member can read check-ins and mint QRs"]
+  ACC --&gt; a3["Scanner token not tied to the user"]
+  ACC --&gt; a4["Idempotency keys global across tenants"]
+  MON --&gt; m1["Walk-in price ignores party size"]
+  MON --&gt; m2["Wallet reconciliation sign bug"]
+  MON --&gt; m3["Door ticket sale can oversell, couple tier gets 1 seat"]
+  MON --&gt; m4["Card and UPI accepted without verification"]
+  APPQ --&gt; q1["No tests, no native build pipeline"]
+  APPQ --&gt; q2["Logout does not revoke server session"]
+  APPQ --&gt; q3["Cold start forces re-login"]
+  APPQ --&gt; q4["60 s timeout, decorative settings, sparse accessibility"]
+  OFF --&gt; o1["Required by the business but not wired"]
+  OFF --&gt; o2["No revocation, double admission across gates"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class e1,e3,a1,a2,m2,o1 bad
+  class e2,e4,a3,a4,m1,m3,m4,q1,q2,q3,q4,o2 warn</pre></figure>
+<h2 id="20-suggested-fix-order">20. Suggested fix order</h2>
+<p>Files: <code>12-status-gaps-and-roadmap.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  F1["Step 1: Decide offline model (ADR),&lt;br/&gt;wire PR 82"] --&gt; F2["Step 2: Remove bare-id acceptance,&lt;br/&gt;tighten QR window"]
+  F2 --&gt; F3["Step 3: Fix door permissions&lt;br/&gt;and read access"]
+  F3 --&gt; F4["Step 4: Bind token to user,&lt;br/&gt;enforce device binding, cap session life"]
+  F4 --&gt; F5["Step 5: Money fixes: pricing, verification,&lt;br/&gt;tenant-scoped keys, reconciliation sign"]
+  F5 --&gt; F6["Step 6: App: server logout, token refresh,&lt;br/&gt;tests, native pipeline, device E2E"]
+  F6 --&gt; F7["Step 7: Stats aggregates and caching"]
+  F7 --&gt; F8["Step 8: Refresh stale docs"]
+  classDef step fill:#e8f0fe,stroke:#4a6fa5,color:#111
+  class F1,F2,F3,F4,F5,F6,F7,F8 step</pre></figure>
+</main>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({startOnLoad:true, theme: dark ? "dark" : "default", securityLevel:"loose", flowchart:{htmlLabels:true, useMaxWidth:true}});
+</script></body></html>

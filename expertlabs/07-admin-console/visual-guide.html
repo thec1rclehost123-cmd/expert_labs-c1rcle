@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C1RCLE Admin Console: visual guide</title>
+<style>
+:root{--bg:#fff;--fg:#1b1f24;--muted:#57606a;--line:#d0d7de;--card:#f6f8fa}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9da7b3;--line:#30363d;--card:#161b22}}
+body{background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:1.9rem} h2{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--line);font-size:1.35rem}
+code{background:var(--card);padding:.1em .35em;border-radius:4px;font-size:.9em}
+figure{margin:1rem 0;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--card);overflow-x:auto}
+.mermaid{background:transparent;margin:0}
+table{border-collapse:collapse;margin:1rem 0;display:block;overflow-x:auto} th,td{border:1px solid var(--line);padding:6px 10px;text-align:left} th{background:var(--card)}
+p,li{color:var(--fg)} hr{border:0;border-top:1px solid var(--line);margin:1.5rem 0} a{color:#0969da}
+.note{color:var(--muted);font-size:.9rem}
+</style></head><body><main>
+<p class="note">Confidential. Share only under NDA. Diagrams are drawn by the Mermaid library loaded from a CDN, so an internet connection is needed to see them.</p>
+<h1 id="00-admin-console-visual-guide">00. Admin console: visual guide</h1>
+<p>Start here if you prefer pictures. Each diagram points to the detailed file that explains it. Colours are consistent:</p>
+<ul><li>🟩 <strong>green</strong> = works and is enforced</li><li>🟨 <strong>yellow</strong> = partial, manual, or policy still undecided</li><li>🟥 <strong>red</strong> = defect or risk (see <code>14-status-gaps-and-roadmap.md</code>)</li><li>⬜ <strong>grey</strong> = infrastructure or neutral step</li></ul>
+<p>How to view: GitHub, VS Code (Markdown Preview Mermaid Support), or paste a block into <a href="https://mermaid.live.">https://mermaid.live.</a> A browser version is in <code>visual-guide.html</code> (needs internet for the Mermaid library).</p>
+<p>Contents: 1 System map · 2 Navigation map · 3 Roles and tiers · 4 How the gateway decides · 5 Dual control · 6 Onboarding review · 7 Refunds · 8 Disputes and chargebacks · 9 Payouts and the release gate · 10 Manual adjustment and commission · 11 Reconciliation · 12 Support ticket · 13 What each action really does · 14 Settings: what changes what · 15 Console sign-in and its gaps · 16 Audit trail coverage · 17 Defect map · 18 Suggested fix order</p>
+<hr>
+<h2 id="1-system-map">1. System map</h2>
+<p>Files: <code>02-frontend-architecture.md</code>, <code>11-backend-api-reference.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  A["Admin user"] --&gt; PG
+  subgraph Console["Admin console (Next.js, Vercel)"]
+    PG["27 pages&lt;br/&gt;TanStack Query"]
+    BFF["BFF: /api/auth (login, logout, refresh, session)&lt;br/&gt;/api/health (readiness, version)"]
+  end
+  PG --&gt;|"Bearer token, cross-origin"| GW
+  PG --&gt; BFF
+  BFF --&gt;|"cookie + CSRF, readiness token"| GW
+  subgraph Render["Gateway (Render)"]
+    GW["Fastify /api/v2/admin/*&lt;br/&gt;17 route files"] --&gt; AUTH["AdminAuthorityService&lt;br/&gt;requireAdmin, authorize, record"]
+    AUTH --&gt; SVC["Services: onboarding, refunds, payouts,&lt;br/&gt;reconciliation, support, directory, settings"]
+  end
+  SVC --&gt; FS[("Firestore&lt;br/&gt;v2_admins, proposals, audit,&lt;br/&gt;refunds, payouts, journals ...")]
+  SVC --&gt; RZ["Razorpay&lt;br/&gt;(refund execute, webhook facts)"]
+  SVC --&gt; ST[("Cloud Storage&lt;br/&gt;KYC documents")]
+  SVC --&gt; RS["Resend email"]
+  classDef live fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef infra fill:#eeeeee,stroke:#888,color:#111
+  class PG,BFF,GW,AUTH,SVC live
+  class FS,RZ,ST,RS infra</pre></figure>
+<p>The console is thin: it holds no database access and no policy. Everything is decided at the gateway.</p>
+<h2 id="2-navigation-map-24-desks-in-6-sections">2. Navigation map: 24 desks in 6 sections</h2>
+<p>Files: <code>01-product-model-and-roles.md</code>, <code>03-desks-and-screens.md</code>.</p>
+<figure><pre class="mermaid">flowchart TB
+  NAV["Admin console menu"] --&gt; OV["Overview"]
+  NAV --&gt; AP["Approvals"]
+  NAV --&gt; CO["Commerce"]
+  NAV --&gt; CA["Care"]
+  NAV --&gt; DI["Directory"]
+  NAV --&gt; PL["Platform"]
+  OV --&gt; o1["Overview"] &amp; o2["Analytics"] &amp; o3["Lookup"]
+  AP --&gt; a1["Proposals"] &amp; a2["Onboarding"] &amp; a3["KYC review"]
+  CO --&gt; c1["Orders"] &amp; c2["Tickets"] &amp; c3["Promotions"] &amp; c4["Promoters"] &amp; c5["Commissions"]
+  CA --&gt; k1["Support"] &amp; k2["Refunds"] &amp; k3["Disputes"] &amp; k4["Chargebacks"] &amp; k5["Payouts"] &amp; k6["Reconciliation"] &amp; k7["Adjustments"]
+  DI --&gt; d1["Venues"] &amp; d2["Events"] &amp; d3["Users"] &amp; d4["Hosts"]
+  PL --&gt; p1["Admins"] &amp; p2["Audit"] &amp; p3["Health"] &amp; p4["Settings"]
+  classDef sec fill:#e8f0fe,stroke:#4a6fa5,color:#111
+  class OV,AP,CO,CA,DI,PL sec</pre></figure>
+<p>Every desk reads live data. The menu is the same for every signed-in user: it is not filtered by admin role.</p>
+<h2 id="3-roles-and-tiers-who-may-do-what">3. Roles and tiers: who may do what</h2>
+<p>Files: <code>01-product-model-and-roles.md</code>, <code>04-authority-dual-control-audit.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  ACT(["An admin action"]) --&gt; TIER{"Which tier?"}
+  TIER --&gt;|"Tier 1: event pause, resume, force-complete,&lt;br/&gt;all support actions"| T1["Any active admin&lt;br/&gt;(super, admin, ops, finance, support)"]
+  TIER --&gt;|"Tier 2: onboarding decisions, refunds,&lt;br/&gt;payout run and complete, disputes, reconciliation,&lt;br/&gt;suspend or reinstate, ban or unban"| T2["super, admin, ops, finance only&lt;br/&gt;(support is refused)"]
+  TIER --&gt;|"Tier 3: provision admin, change role,&lt;br/&gt;commission, financial adjustment,&lt;br/&gt;payout freeze and release"| T3["super only&lt;br/&gt;AND a different super must approve"]
+  TIER --&gt;|"Platform settings update"| T0["No tier at all&lt;br/&gt;any active admin"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class T1,T2 ok
+  class T3 warn
+  class T0 bad</pre></figure>
+<table><thead><tr><th>Role</th><th>Reads</th><th>Tier 1</th><th>Tier 2</th><th>Tier 3</th></tr></thead><tbody><tr><td>super</td><td>everything</td><td>yes</td><td>yes</td><td>yes (with a second super)</td></tr><tr><td>admin</td><td>everything</td><td>yes</td><td>yes</td><td>no</td></tr><tr><td>ops</td><td>everything</td><td>yes</td><td>yes</td><td>no</td></tr><tr><td>finance</td><td>everything</td><td>yes</td><td>yes</td><td>no</td></tr><tr><td>support</td><td>everything</td><td>yes</td><td><strong>no</strong></td><td>no</td></tr></tbody></table>
+<h2 id="4-how-the-gateway-decides-on-every-admin-request">4. How the gateway decides on every admin request</h2>
+<p>Files: <code>04-authority-dual-control-audit.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  IN(["POST /api/v2/admin/..."]) --&gt; SES{"Valid session?"}
+  SES --&gt;|no| U1["401"]
+  SES --&gt;|yes| RL{"Under 10 mutations per minute?"}
+  RL --&gt;|no| U2["429"]
+  RL --&gt;|yes| IDK{"Idempotency-Key header present?"}
+  IDK --&gt;|no| U3["422 validation error"]
+  IDK --&gt;|yes| ADM{"Record in v2_admins and active?"}
+  ADM --&gt;|no| U1
+  ADM --&gt;|yes| TR{"Role allowed for this action's tier?"}
+  TR --&gt;|no| U4["403 role cannot perform action"]
+  TR --&gt;|yes| HASH{"Seen this key before?"}
+  HASH --&gt;|"same body, done"| REP["Replay stored response"]
+  HASH --&gt;|"different body, running, or failed before"| U5["409"]
+  HASH --&gt;|new| DO["Run the service action"]
+  DO --&gt; AUD["Write audit row (separate step)"]
+  AUD --&gt; OUT(["Response"])
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  class U1,U2,U3,U4,U5 bad
+  class DO,REP,OUT ok</pre></figure>
+<p>A revoked admin gets the same 401 as a non-admin. The audit row is written after the change, not in the same transaction.</p>
+<h2 id="5-dual-control-two-person-rule">5. Dual control (two-person rule)</h2>
+<p>Files: <code>04-authority-dual-control-audit.md</code>, <code>12-domain-model-and-state-machines.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  R(["Super admin A raises a proposal&lt;br/&gt;action + reason + payload"]) --&gt; P["Status: pending"]
+  P --&gt; Q{"Super admin B (not A) decides"}
+  Q --&gt;|reject| RJ["rejected (final)"]
+  Q --&gt;|approve| AP["Status: approved"]
+  P --&gt;|"A cancels"| CN["cancelled (final)"]
+  AP --&gt; EX["Any super runs the execute route&lt;br/&gt;(parameters come from the stored proposal)"]
+  EX --&gt; DONE["Action applied + audit row"]
+  EX -.again, with a new idempotency key.-&gt; DONE2["Applied again"]
+  AP -.never expires.-&gt; OLD["An old approval stays usable forever"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class DONE ok
+  class DONE2,OLD bad</pre></figure>
+<p>Safe design points: the approver cannot be the proposer, and execution reads the stored payload, not the request body. Gaps: no "executed" state, no expiry, and the executor can be the proposer or approver.</p>
+<h2 id="6-onboarding-review-and-kyc">6. Onboarding review and KYC</h2>
+<p>Files: <code>05-flow-onboarding-kyc.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  Q(["Applications queue: submitted"]) --&gt; OPEN["Open application"]
+  OPEN --&gt; DOC["For each document: get signed link, view"]
+  DOC --&gt; DV{"Document decision (Tier 2)"}
+  DV --&gt;|verify| V["document verified"]
+  DV --&gt;|"reject + reason"| X["document rejected"]
+  V --&gt; ALL{"All required documents verified?"}
+  X --&gt; CH["Request changes (note + email to applicant)"]
+  ALL --&gt;|no| CH
+  ALL --&gt;|yes| DEC{"Application decision (Tier 2)"}
+  DEC --&gt;|approve| ORG["Create organization with plan fee 15, 12 or 10 percent&lt;br/&gt;+ starter venue if venue type"]
+  DEC --&gt;|reject| RJ["rejected (final)"]
+  DEC --&gt;|"request changes"| CH
+  CH --&gt; BACK["Applicant edits and resubmits"]
+  BACK --&gt; Q
+  ORG --&gt; END(["Approved: partner can sign in"])
+  DOC -.-&gt; WARN["Signed links are not audited and any role can open them"]
+  ORG -.-&gt; WARN2["Creation is not atomic: retry with a new key could duplicate"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class ORG,END ok
+  class WARN,WARN2 bad</pre></figure>
+<p>Required documents: individual = id front, id back, selfie. Business = registration certificate + signatory id front, id back, selfie.</p>
+<h2 id="7-refund-request-to-settled">7. Refund: request to settled</h2>
+<p>Files: <code>06-flow-refunds-chargebacks-disputes.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Refund request raised (API only, no screen)"]) --&gt; CHK{"Order paid and amount within balance?"}
+  CHK --&gt;|no| E["Rejected with error"]
+  CHK --&gt;|yes| LK["Order locked: refund_requested&lt;br/&gt;target tickets frozen"]
+  LK --&gt; AM{"Amount vs thresholds in settings"}
+  AM --&gt;|"below 500 rupees and no scanned ticket"| Z["0 approvers: status approved at once"]
+  AM --&gt;|"scanned ticket, or below 5,000 rupees"| O1["1 approver: status pending"]
+  AM --&gt;|"5,000 rupees or more"| O2["2 approvers: status pending"]
+  O1 --&gt; D{"Another admin decides"}
+  O2 --&gt; D
+  D --&gt;|reject + reason| RJ["rejected: order restored"]
+  D --&gt;|"all approvals in"| AP["approved"]
+  Z --&gt; AP
+  AP --&gt; EX["Admin presses Execute"]
+  EX --&gt; CL["Claim run (only one wins)"]
+  CL --&gt; PR["Call Razorpay with fixed key refund:id"]
+  PR --&gt; R{"Provider answer"}
+  R --&gt;|"definite failure"| FL["failed: tickets released, order restored. Retry allowed"]
+  R --&gt;|"unclear"| UN["Stays executing: wait for webhook or reconciliation"]
+  R --&gt;|processed| ST["Post journals, order refunded,&lt;br/&gt;tickets voided, settled"]
+  FL --&gt; EX
+  Z -.-&gt; WARN["Settings can lower thresholds to 0 (no tier gate)"]
+  AP -.-&gt; WARN2["No way to cancel an approved refund. Buyer is not notified"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class ST,AP ok
+  class E,RJ,FL,WARN,WARN2 bad
+  class UN warn</pre></figure>
+<p>Open policy questions (finance and legal): who funds a refund of a split order, who bears the provider fee, tax on refunds, treatment if the partner was already paid.</p>
+<h2 id="8-disputes-and-chargebacks-are-two-different-things">8. Disputes and chargebacks are two different things</h2>
+<p>Files: <code>06-flow-refunds-chargebacks-disputes.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph PARTNER["Partner-raised dispute (desk: Disputes)"]
+    P1["Partner disputes a ledger entry"] --&gt; P2["open"]
+    P2 --&gt; P3{"Admin resolves (Tier 2)"}
+    P3 --&gt;|upheld| P4["Writes a refund entry in the legacy ledger&lt;br/&gt;(no journal v2, no order change, no provider call)"]
+    P3 --&gt;|denied| P5["No money movement"]
+  end
+  subgraph PROVIDER["Razorpay chargeback (desk: Chargebacks)"]
+    C1["Buyer disputes with bank"] --&gt; C2["Razorpay webhook"]
+    C2 --&gt; C3["Stored as provider fact&lt;br/&gt;journals: hold, loss, reversal"]
+    C3 --&gt; C4["Console lists it read-only&lt;br/&gt;no evidence upload, no actions"]
+  end
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class P4,C4 warn</pre></figure>
+<p>Undecided: who bears a lost chargeback and its fee, and whether payouts are held while a dispute is open.</p>
+<h2 id="9-payouts-and-the-production-release-gate">9. Payouts and the production release gate</h2>
+<p>Files: <code>07-flow-payouts-and-adjustments.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  PR(["Partner requests payout (min 100 rupees)"]) --&gt; G1{"PAYOUTS_ENABLED?"}
+  G1 --&gt;|"off (production default)"| X1["503 payouts disabled"]
+  G1 --&gt;|on| REQ["Payout: requested&lt;br/&gt;reservation journal posted"]
+  REQ --&gt; BR["Admin: Run batch (Tier 2)"]
+  BR --&gt; G2{"Gate on? reservation journal exists?"}
+  G2 --&gt;|"gate off"| X2["503"]
+  G2 --&gt;|"no reservation"| SK["Skipped with reason"]
+  G2 --&gt;|yes| PRC["processing"]
+  PRC --&gt; CM["Admin: Record transfer (Tier 2)&lt;br/&gt;reference, method, time, proof hash"]
+  CM --&gt; PD["paid + completion journal"]
+  REQ --&gt;|"Freeze (Tier 3, two supers)"| FR["frozen"]
+  PRC --&gt;|"Freeze (Tier 3)"| FR
+  FR --&gt;|"Release (Tier 3, gate on)"| BK["Back to previous status"]
+  REQ --&gt; FL["failed (no admin button)"]
+  PRC --&gt; FL
+  CM -.-&gt; W["Record transfer is NOT behind the gate:&lt;br/&gt;works even when payouts are off"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class PD,REQ ok
+  class X1,X2,W bad
+  class FR,SK,FL warn</pre></figure>
+<p>Before the gate is turned on in production: lawyer-confirmed funds flow (RBI payment aggregator), CA tax treatment (GST, TDS 194-O, TCS 52), Razorpay written approval.</p>
+<h2 id="10-manual-adjustment-and-commission-change-both-need-two-supers">10. Manual adjustment and commission change (both need two supers)</h2>
+<p>Files: <code>07-flow-payouts-and-adjustments.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  subgraph ADJ["Financial adjustment"]
+    A1["Adjustments page: organization id (typed), amount in paise,&lt;br/&gt;credit or debit, reason"] --&gt; A2["Proposal: FINANCIAL_ADJUSTMENT pending"]
+    A2 --&gt; A3["Second super approves on Proposals page"]
+    A3 --&gt; A4["Operator pastes the approved proposal id into the Post form"]
+    A4 --&gt; A5{"Journal v2 is the active read model?"}
+    A5 --&gt;|no| A6["Refused"]
+    A5 --&gt;|yes| A7["Balanced journal posted once&lt;br/&gt;(key = proposal id) + audit"]
+  end
+  subgraph COM["Commission change"]
+    C1["Commissions page: percent 0 to 100 + reason"] --&gt; C2["Proposal: COMMISSION_ADJUST pending"]
+    C2 --&gt; C3["Second super approves"]
+    C3 --&gt; C4["Proposals page: Adjust commission"]
+    C4 --&gt; C5["Organization platform fee percent updated"]
+  end
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class A7,C5 ok
+  class A6 bad</pre></figure>
+<p>Settings also holds a fee rate as a 0 to 1 fraction, but nothing reads it. Only the per-organization percent is used.</p>
+<h2 id="11-reconciliation">11. Reconciliation</h2>
+<p>Files: <code>08-flow-reconciliation.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Admin: Run reconciliation (Tier 2)"]) --&gt; SC["Scan all orders, provider payments,&lt;br/&gt;tickets, payouts in memory"]
+  SC --&gt; CMP["Compare against Razorpay facts and journals"]
+  CMP --&gt; D["Discrepancies created (14 kinds)&lt;br/&gt;state: open, finance_review or support_required"]
+  D --&gt; L["Admin reviews list and evidence"]
+  L --&gt; CH{"Choose"}
+  CH --&gt;|"Recheck (evidence repair)"| RR["Re-runs the whole scan"]
+  RR --&gt; D
+  CH --&gt;|"Needs money correction"| PRP["Raise FINANCIAL_ADJUSTMENT proposal&lt;br/&gt;(manual, not linked in the UI)"]
+  CH --&gt;|Resolve + reason| RS["state: resolved&lt;br/&gt;(data is NOT repaired)"]
+  RS -.next run, data still wrong.-&gt; D
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class D ok
+  class RS warn</pre></figure>
+<p>Kinds include: payment without order, paid order without payment or ticket, ticket without paid order, missing or duplicate or unbalanced journal, amount or currency mismatch, refund or chargeback mismatch, stale pending payment, payout mismatch.</p>
+<h2 id="12-support-ticket-lifecycle">12. Support ticket lifecycle</h2>
+<p>Files: <code>09-flow-support-desk.md</code>.</p>
+<figure><pre class="mermaid">stateDiagram-v2
+  direction LR
+  [*] --&gt; open: guest or partner submits
+  open --&gt; in_progress: assign
+  open --&gt; waiting_on_customer: reply
+  in_progress --&gt; waiting_on_customer: reply
+  waiting_on_customer --&gt; in_progress: customer replies
+  in_progress --&gt; escalated: escalate
+  in_progress --&gt; resolved: resolve with reason
+  escalated --&gt; resolved
+  resolved --&gt; closed: close
+  closed --&gt; open: reopen
+  note right of open: SLA clock starts. Urgent 1h response, 4h resolution. Medium 24h and 72h. Low 72h and 168h</pre></figure>
+<p>Side actions at any time: internal note, priority change (resets SLA), link order, event, venue or user, merge a duplicate into another ticket, soft delete and restore. All support actions are Tier 1, so every admin role can do them.</p>
+<h2 id="13-what-each-action-really-does-enforcement-map">13. What each action really does (enforcement map)</h2>
+<p>Files: <code>10-flow-directory-and-platform-actions.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph BTN["Admin buttons"]
+    B1["Ban user"]
+    B2["Suspend venue or organization"]
+    B3["Maintenance mode"]
+    B4["Platform fee rate"]
+    B5["Pause or force-complete event"]
+    B6["Suspend promoter"]
+  end
+  B1 --&gt; R1["Recorded + audited"]
+  B2 --&gt; R1
+  B3 --&gt; R1
+  B4 --&gt; R1
+  B5 --&gt; R1
+  B6 --&gt; R1
+  R1 --&gt; E1["Hides from public discovery"]
+  B2 --&gt; E1
+  B2 --&gt; E2["Blocks new promoter connections and partnerships"]
+  B5 --&gt; E3["Pause: sales paused. Force-complete: event ends and leaves public view&lt;br/&gt;no refunds, no domain event emitted"]
+  B6 --&gt; E4["Assignments suspended"]
+  B1 -.no enforcement found.-&gt; N1["User can still sign in and buy"]
+  B3 -.no reader found.-&gt; N2["Nothing checks it"]
+  B4 -.not read by checkout.-&gt; N3["Ignored (per-organization percent is used)"]
+  B2 -.-&gt; N4["Checkout, partner writes and login not blocked"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef rec fill:#fff3b0,stroke:#b58900,color:#111
+  class E1,E2,E3,E4 ok
+  class N1,N2,N3,N4 bad
+  class R1 rec</pre></figure>
+<h2 id="14-platform-settings-what-each-field-really-changes">14. Platform settings: what each field really changes</h2>
+<p>Files: <code>10-flow-directory-and-platform-actions.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  ST["PUT /admin/settings/platform&lt;br/&gt;(any active admin, no tier, no dual control)"] --&gt; F1["refundSingleApproverThresholdPaise"]
+  ST --&gt; F2["refundDualApproverThresholdPaise"]
+  ST --&gt; F3["accountingPolicy&lt;br/&gt;settlement delay, reserve, holds"]
+  ST --&gt; F4["maintenanceMode"]
+  ST --&gt; F5["platformFeeRate (0 to 1)"]
+  ST --&gt; F6["featureFlags"]
+  F1 --&gt; U1["Used: decides how many refund approvers"]
+  F2 --&gt; U1
+  F3 --&gt; U2["Used: checkout and payout rules"]
+  F4 --&gt; U3["Not read anywhere"]
+  F5 --&gt; U4["Not read anywhere"]
+  F6 --&gt; U5["Not audited in detail"]
+  U1 -.set to 0.-&gt; RISK["Every refund auto-approved"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class RISK,U3,U4 bad
+  class U1,U2 ok
+  class U5 warn</pre></figure>
+<h2 id="15-console-sign-in-and-its-gaps">15. Console sign-in and its gaps</h2>
+<p>Files: <code>02-frontend-architecture.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  S(["Open any admin URL"]) --&gt; SS{"Server finds a session?"}
+  SS --&gt;|no| RD["Shell shows 'Redirecting to sign in', goes to /login"]
+  SS --&gt;|yes| SH["Full console shell shown&lt;br/&gt;(for any signed-in account)"]
+  RD --&gt; LG["Login form"]
+  LG --&gt; API["Gateway login via BFF"]
+  API --&gt; TOK["Access token in memory, cookie set"]
+  TOK --&gt; SH
+  SH --&gt; CALL["Each desk calls the gateway"]
+  CALL --&gt; CHK{"Is this account an active admin?"}
+  CHK --&gt;|no| FAIL["Calls fail 401: generic error text, no 'not an admin' page"]
+  CHK --&gt;|yes| RL{"Role allowed this action?"}
+  RL --&gt;|no| F403["403: button was visible anyway"]
+  RL --&gt;|yes| OK["Works"]
+  API -.temporary password.-&gt; STUCK["Gateway blocks everything with 403&lt;br/&gt;console has no change-password page"]
+  SH -.idle 30 min.-&gt; OUT["Automatic sign-out"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class OK,TOK ok
+  class FAIL,F403,STUCK bad</pre></figure>
+<h2 id="16-audit-trail-what-is-and-is-not-recorded">16. Audit trail: what is and is not recorded</h2>
+<p>Files: <code>04-authority-dual-control-audit.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  subgraph IN["Recorded"]
+    I1["Proposal raise, approve, reject, cancel"]
+    I2["Executed TIER3 actions"]
+    I3["Refund request, approve, reject, execute"]
+    I4["Onboarding decisions + document verify and reject"]
+    I5["Payout run, complete, freeze, release"]
+    I6["Suspend, ban, pause, force-complete&lt;br/&gt;(without a reason)"]
+    I7["Settings change (partial fields)"]
+    I8["Support actions"]
+    I9["Users and audit CSV exports"]
+  end
+  subgraph OUT["Not recorded or incomplete"]
+    O1["IP and user agent on approve, reject, cancel"]
+    O2["Opening a KYC document link"]
+    O3["Orders, tickets, venues, events, hosts, promotions,&lt;br/&gt;refunds, reconciliation exports"]
+    O4["Refund failures and unclear outcomes"]
+    O5["No-op repeats"]
+    O6["Reason for suspend, ban, pause"]
+    O7["Feature flags and most accounting policy fields"]
+  end
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  class I1,I2,I3,I4,I5,I8,I9 ok
+  class I6,I7 ok
+  class O1,O2,O3,O4,O5,O6,O7 bad</pre></figure>
+<p>The audit row is written after the change, in a separate step. The console does not show the before and after values.</p>
+<h2 id="17-defect-map">17. Defect map</h2>
+<p>Files: <code>14-status-gaps-and-roadmap.md</code>.</p>
+<figure><pre class="mermaid">flowchart TD
+  ROOT(["Admin console risks"]) --&gt; SEC["Authority and security"]
+  ROOT --&gt; MON["Money"]
+  ROOT --&gt; ENF["Not enforced"]
+  ROOT --&gt; UX["Console UX"]
+  SEC --&gt; s1["Settings: no tier, can zero refund thresholds"]
+  SEC --&gt; s2["Approved proposals re-executable, no expiry"]
+  SEC --&gt; s3["Role never used in UI, no middleware"]
+  SEC --&gt; s4["Lookup shows emails to support role"]
+  SEC --&gt; s5["Health endpoints open to anyone reaching the app"]
+  MON --&gt; m1["Record transfer bypasses payouts gate"]
+  MON --&gt; m2["Zero-approver refund: one admin can do all"]
+  MON --&gt; m3["No cancel for approved refund, no fail-payout button"]
+  MON --&gt; m4["Policy undecided: refund and chargeback loss, tax"]
+  ENF --&gt; e1["Ban not enforced"]
+  ENF --&gt; e2["Maintenance mode not read"]
+  ENF --&gt; e3["Suspension only affects discovery and connections"]
+  UX --&gt; u1["Forced password change not handled"]
+  UX --&gt; u2["No pagination, 100 row cap, CSV capped too"]
+  UX --&gt; u3["No confirm on force-complete, refund approve, payout run"]
+  UX --&gt; u4["Generic errors hide the gateway reason"]
+  UX --&gt; u5["No screen to create refund or provision admin"]
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class s1,s2,s3,m1,m2,e1,e2,u1 bad
+  class s4,s5,m3,m4,e3,u2,u3,u4,u5 warn</pre></figure>
+<h2 id="18-suggested-fix-order">18. Suggested fix order</h2>
+<p>Files: <code>14-status-gaps-and-roadmap.md</code>.</p>
+<figure><pre class="mermaid">flowchart LR
+  F1["Step 1: Gate settings update&lt;br/&gt;(dual control) + validate thresholds"] --&gt; F2["Step 2: Proposals: executed status,&lt;br/&gt;single use, expiry"]
+  F2 --&gt; F3["Step 3: Enforce or remove:&lt;br/&gt;ban, maintenance, suspension, fee rate"]
+  F3 --&gt; F4["Step 4: Put complete-payout behind the gate;&lt;br/&gt;add fail-payout and cancel-refund"]
+  F4 --&gt; F5["Step 5: Console: role in session, gate buttons,&lt;br/&gt;password-change page, confirms, pagination"]
+  F5 --&gt; F6["Step 6: Audit: IP on all actions, document links,&lt;br/&gt;exports, before and after view"]
+  F6 --&gt; F7["Step 7: Support list filters on the server"]
+  F7 --&gt; F8["Step 8: Reconciliation: schedule, de-duplicate, targeted retry"]
+  F8 --&gt; F9["Step 9: Decide policies, then consider enabling payouts"]
+  classDef step fill:#e8f0fe,stroke:#4a6fa5,color:#111
+  class F1,F2,F3,F4,F5,F6,F7,F8,F9 step</pre></figure>
+</main>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({startOnLoad:true, theme: dark ? "dark" : "default", securityLevel:"loose", flowchart:{htmlLabels:true, useMaxWidth:true}});
+</script></body></html>

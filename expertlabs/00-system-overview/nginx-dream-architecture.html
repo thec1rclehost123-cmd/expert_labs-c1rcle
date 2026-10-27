@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C1RCLE nginx: the dream architecture</title>
+<style>
+:root{--bg:#fff;--fg:#1b1f24;--muted:#57606a;--line:#d0d7de;--card:#f6f8fa}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9da7b3;--line:#30363d;--card:#161b22}}
+body{background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:1.9rem} h2{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--line);font-size:1.35rem}
+code{background:var(--card);padding:.1em .35em;border-radius:4px;font-size:.9em}
+figure{margin:1rem 0;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--card);overflow-x:auto}
+.mermaid{background:transparent;margin:0}
+table{border-collapse:collapse;margin:1rem 0;display:block;overflow-x:auto} th,td{border:1px solid var(--line);padding:6px 10px;text-align:left} th{background:var(--card)}
+p,li{color:var(--fg)} hr{border:0;border-top:1px solid var(--line);margin:1.5rem 0} a{color:#0969da}
+.note{color:var(--muted);font-size:.9rem}
+</style></head><body><main>
+<p class="note">Confidential. Share only under NDA. Diagrams are drawn by the Mermaid library loaded from a CDN, so an internet connection is needed to see them.</p>
+<h1 id="nginx-the-dream-architecture">nginx: the dream architecture</h1>
+<p><strong>What this document is.</strong> A design proposal for the edge layer of C1RCLE: what nginx should be in the ideal end state, how far today's setup is from it, and the staged path between them. It is written for the Expert Labs team and for the owners who must decide how much to spend. <strong>What it is not.</strong> It is not a record of decisions. The "dream" parts are <strong>proposals</strong>; nothing in the Horizon 1–3 sections is built unless this page says so. Where a claim describes the live system it is marked <strong>built</strong>; where it comes from the repo's own plan it is marked <strong>planned</strong>. <strong>Snapshot:</strong> 2026-10-24, based on backend <code>origin/staging</code> (tip <code>5790235</code>, PR #142) plus the unmerged anonymised-logging branch (#143). The backend branch used for most of this package is behind staging and lacks PRs #140–#142; this page describes staging.</p>
+<p>Related: <code>ARCHITECTURE.md</code> (system overview), <code>../11-infrastructure-and-cicd/README.md</code> (infra and CI), repo docs <code>docs/nginx/*</code>, staging-only <code>docs/operations/cloudflare-edge.md</code>, and root <code>cloudflare_plan.md</code>.</p>
+<h2 id="contents">Contents</h2>
+<p>1 Constraints · 2 What exists today · 3 Design principles · 4 The dream, in one picture · 5 Who owns what · 6 The dream nginx in detail · 7 Resilience and failure modes · 8 Three horizons · 9 Current defects (register) · 10 Decisions the owners must make · 11 Stale docs</p>
+<hr>
+<h2 id="1-constraints-that-shape-every-choice">1. Constraints that shape every choice</h2>
+<table><thead><tr><th>Constraint</th><th>Source</th><th>Effect on the design</th></tr></thead><tbody><tr><td>Everything on <strong>free plans</strong> for now (no Workers Paid, Waiting Room, Argo, Load Balancing)</td><td>owner decision 2026-10-18</td><td>Horizon 1 must work with one free Render instance and the free Cloudflare plan</td></tr><tr><td><strong>Compute stays on Vercel (Next apps) and Render (Fastify)</strong>; Cloudflare is the edge</td><td>same</td><td>nginx fronts the <strong>API only</strong>; the BFFs stay on Vercel</td></tr><tr><td><strong>Offline door scanning is required</strong></td><td>same</td><td>the edge must carry manifest and sync traffic reliably and never become a single shared bottleneck at door opening</td></tr><tr><td>Render <strong>free</strong> plan: one instance, sleeps when idle (about 30–40 s cold start), no private services</td><td><code>render.yaml</code>, plan</td><td>the sidecar topology (nginx and Fastify in one container) is the only option today</td></tr><tr><td>Cloudflare free: <strong>5 custom WAF rules, one rate-limit rule</strong> (already used by the leaked-credential check), Bot Fight Mode cannot be skipped, Workers 100k requests/day and 10 ms CPU</td><td><code>cloudflare_plan.md</code></td><td>nginx must carry per-route rate limiting; Workers cannot sit on the request path</td></tr><tr><td>Payments and KYC are regulated flows</td><td>repo docs</td><td>the webhook and upload paths need explicit, protected policy</td></tr></tbody></table>
+<h2 id="2-what-exists-today-built">2. What exists today (built)</h2>
+<figure><pre class="mermaid">flowchart LR
+  V["Visitor"] --&gt; CF["Cloudflare (Free)&lt;br/&gt;DNS, TLS strict, WAF probe rule,&lt;br/&gt;Transform Rule stamps 2 headers"]
+  CF --&gt; RE["Render edge&lt;br/&gt;terminates TLS"]
+  subgraph C["Render container"]
+    NG["nginx on $PORT&lt;br/&gt;host allow-list, origin lock,&lt;br/&gt;rate limits, header washing,&lt;br/&gt;JSON edge errors"]
+    FY["Fastify on 127.0.0.1:8081&lt;br/&gt;auth, CORS, RBAC, idempotency,&lt;br/&gt;in-memory rate limit"]
+    NG --&gt; FY
+  end
+  RE --&gt; NG
+  FY --&gt; FS[("Firestore + Storage")]
+  VC["Vercel BFFs&lt;br/&gt;(guest, partner, admin)"] --&gt;|"API calls"| CF
+  RZ["Razorpay webhook"] --&gt; CF
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef infra fill:#eeeeee,stroke:#888,color:#111
+  class NG,FY ok
+  class CF,RE,FS,VC,RZ infra</pre></figure>
+<p>What nginx does today (<strong>built</strong>, staging): host allow-list (unknown host → connection dropped with 444), optional origin lock (a locked host returns 403 unless Cloudflare's secret header is present), trusts the visitor IP only when that secret verifies, overwrites <code>X-Forwarded-*</code>/<code>X-Real-IP</code>/<code>X-Request-Id</code> and blanks identity-spoofing headers, rate limits (<code>c1rcle_edge_general</code> 10 r/s burst 20, <code>c1rcle_edge_auth</code> 5 r/s burst 10, 100 connections per client, all keyed on the verified client address), 1 MB body cap, 10 s header / 15 s body timeouts, 5/30/30 s proxy timeouts, JSON error envelopes for 413/429/502/503/504 with request id, token-gated readiness and version, an unbuffered SSE location with a 20-minute read timeout for the door stats stream, structured JSON access logs (no query strings) tailed to the container output. What it deliberately does <strong>not</strong> do: no auth decisions, no CORS (that lives in Fastify), no caching (<code>proxy_cache off</code>, and it hides the upstream <code>Cache-Control</code>, forcing <code>no-store</code> on API responses), no retries (<code>proxy_next_upstream off</code>), no load balancing (one upstream). Planned and partly applied on the Cloudflare side: strict TLS, HSTS (1 day), tiered cache, probe-blocking rule, origin lock on <code>api-staging</code> (applied to staging only; production is untouched).</p>
+<h2 id="3-design-principles-for-the-dream">3. Design principles for the dream</h2>
+<p>1. <strong>nginx is the only public listener for the API and is not an application.</strong> It enforces transport, shape and volume; it never decides who a user is or what they may do. (Existing SOTA-1/2 and "not a second application layer".) 2. <strong>Trust is established once, at the outermost layer you control, and everything inside inherits it.</strong> Client identity is *decided* at the edge (verified), carried in a single header nginx writes, and never invented downstream. (SOTA-6.) 3. <strong>No single noisy client can starve another, and nothing can starve the money path.</strong> Webhooks, auth, scanner traffic and public reads get separate budgets. 4. <strong>Every failure produces a readable, correlated answer.</strong> Edge errors carry the request id <strong>and</strong> the CORS headers a browser needs to read them. 5. <strong>Never retry what is not safe to retry.</strong> Mutations are never replayed by the proxy; only provably idempotent public reads may be. 6. <strong>Config is code.</strong> Every rule is in git, rendered from templates, statically checked <strong>and</strong> exercised by a container test in CI; nothing lives only in a dashboard. 7. <strong>Degrade, don't die.</strong> Cold start, a restarting backend and a lost cache must produce a short, honest "warming up" answer, not a closed port. 8. <strong>One cache owner per path.</strong> Either Cloudflare or nginx caches a given route, never both. 9. <strong>Cost-aware.</strong> The dream must have a version that runs on the free plans, a version unlocked by a first paid step, and a full version; each stage is useful on its own.</p>
+<h2 id="4-the-dream-in-one-picture">4. The dream, in one picture</h2>
+<figure><pre class="mermaid">flowchart TB
+  V["Visitors, scanners, Razorpay"] --&gt; CFE
+  subgraph CFE["Cloudflare edge"]
+    DNS["DNS, TLS strict, HSTS, DNSSEC"]
+    WAF["WAF: managed rules, probe block,&lt;br/&gt;Turnstile on abuse-prone routes"]
+    CACHE["Cache rules for public GETs&lt;br/&gt;and static assets"]
+    TR["Transform Rule: stamps verified client IP&lt;br/&gt;+ origin proof (two secrets)"]
+    CRON["Cron Worker: keep-alive, reconcile,&lt;br/&gt;repair trigger"]
+  end
+  CFE --&gt; NGP
+  subgraph NGP["nginx tier"]
+    direction TB
+    L1["Trust + identity: verify origin proof,&lt;br/&gt;decide client IP, mint request id"]
+    L2["Policy per route class:&lt;br/&gt;public read, auth, scanner, webhook,&lt;br/&gt;stream, uploads, admin"]
+    L3["Budgets: per-class rate and connection zones,&lt;br/&gt;webhook zone isolated"]
+    L4["Resilience: pool, passive health,&lt;br/&gt;GET-only retry, graceful drain"]
+    L5["Observability: JSON logs to stdout,&lt;br/&gt;anonymised IP, trace headers"]
+    L1 --&gt; L2 --&gt; L3 --&gt; L4
+    L2 --&gt; L5
+  end
+  NGP --&gt; POOL
+  subgraph POOL["Fastify pool"]
+    F1["Fastify 1"]
+    F2["Fastify 2"]
+  end
+  POOL --&gt; RD[("Redis: rate limits,&lt;br/&gt;stream budgets")]
+  POOL --&gt; FS[("Firestore + Storage")]
+  VC["Vercel BFFs"] --&gt;|"server calls with origin proof"| NGP
+  GIT["Git: templates, rules, tests"] --&gt;|"CI: static check +&lt;br/&gt;container test"| NGP
+  GIT --&gt;|"exported rules"| CFE
+  classDef edge fill:#e8f0fe,stroke:#4a6fa5,color:#111
+  classDef app fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef data fill:#eeeeee,stroke:#888,color:#111
+  class DNS,WAF,CACHE,TR,CRON,L1,L2,L3,L4,L5 edge
+  class F1,F2 app
+  class RD,FS,GIT,VC data</pre></figure>
+<h2 id="5-who-owns-what-the-contract-between-layers">5. Who owns what (the contract between layers)</h2>
+<table><thead><tr><th>Concern</th><th>Cloudflare</th><th>nginx</th><th>Fastify</th><th>Vercel BFF</th></tr></thead><tbody><tr><td>TLS and certificates</td><td>terminates for visitors; strict to origin</td><td>terminates only in the production profile; otherwise trusts the platform</td><td>none</td><td>none</td></tr><tr><td>DDoS, bots, known-bad paths</td><td><strong>owns</strong> (WAF, Bot Fight, probe rule)</td><td>backstop only</td><td>none</td><td>none</td></tr><tr><td>Client identity (IP)</td><td><strong>stamps</strong> the verified address</td><td><strong>decides</strong> (trusts it only with valid proof) and forwards one clean value</td><td>consumes it (<code>trustProxy</code> limited to nginx)</td><td>forwards the visitor IP to the API</td></tr><tr><td>Origin proof</td><td>sends a secret header (later mutual TLS)</td><td><strong>verifies</strong>, locks hosts</td><td>none</td><td>sends its own proof on server calls</td></tr><tr><td>Rate limiting</td><td>one free rule (taken); more on paid</td><td><strong>owns per-route budgets</strong></td><td>per-user and per-org business limits; Redis when scaled</td><td>none</td></tr><tr><td>Caching</td><td><strong>owns</strong> public GETs and static assets</td><td>optional microcache only to stop stampedes, never the same route</td><td>sets correct <code>Cache-Control</code></td><td>owns HTML cache</td></tr><tr><td>CORS and cookies</td><td>none</td><td>none (but must add CORS headers to its own error pages)</td><td><strong>owns CORS</strong></td><td>owns cookies and CSRF</td></tr><tr><td>Request id and tracing</td><td>none</td><td><strong>mints</strong> id and trace header</td><td>accepts only from the trusted proxy</td><td>passes through</td></tr><tr><td>AuthN, AuthZ, tenancy, idempotency</td><td>none</td><td>none</td><td><strong>owns</strong></td><td>none</td></tr><tr><td>Observability</td><td>analytics, WAF events</td><td>structured logs, stdout</td><td>structured logs, audit</td><td>app logs</td></tr></tbody></table>
+<h2 id="6-the-dream-nginx-in-detail">6. The dream nginx in detail</h2>
+<p>Snippets below are <strong>illustrative design sketches, not applied config</strong>. Names follow the existing templates (<code>c1rcle_*</code> zones, <code>$c1rcle_client_ip</code>).</p>
+<h3 id="6-1-trust-and-identity">6.1 Trust and identity</h3>
+<ul><li><strong>Two accepted origin secrets</strong> (current and next) so rotation never causes an outage. Built shape: the map already supports it; the entrypoint, the validator and the Cloudflare rule need a second variable. Today one value is rendered, so rotation means a 403 window.</li><li><strong>Real IP validation:</strong> accept <code>X-C1-Client-IP</code> only if it parses as an IPv4 or IPv6 address (the current pattern accepts any 2–45 characters of hex, colon and dot, so a verified but garbage value would become a rate-limit key).</li><li><strong>Horizon 3:</strong> replace the shared-secret header with <strong>Cloudflare Authenticated Origin Pulls (mutual TLS)</strong> once nginx owns TLS (production profile, requires the first paid step). Keep the header for the client IP only.</li><li><strong>BFF calls:</strong> the Vercel BFFs call the API with their own proof and the visitor IP forwarded (plan item B3.3, open), so server-to-server traffic bypasses Bot Fight Mode on a DNS-only hostname while staying locked.</li><li>Always blank every identity header on ingress and mint <code>X-Request-Id</code> (already built; keep).</li></ul>
+<h3 id="6-2-route-classes-one-policy-per-class">6.2 Route classes (one policy per class)</h3>
+<figure><pre class="mermaid">flowchart TD
+  R(["Request reaches nginx"]) --&gt; H{"Host allowed and origin proof ok?"}
+  H --&gt;|"unknown host"| X1["Drop (444)"]
+  H --&gt;|"locked host, no proof"| X2["403"]
+  H --&gt;|ok| P{"Which path?"}
+  P --&gt;|"/internal/health"| C1["Class: liveness&lt;br/&gt;answered by nginx itself when the pool is warming"]
+  P --&gt;|"/internal/readiness, /version"| C2["Class: ops&lt;br/&gt;token header or 404"]
+  P --&gt;|"/auth/*"| C3["Class: auth&lt;br/&gt;tight zone, tiny body, Turnstile at Cloudflare"]
+  P --&gt;|"/webhooks/payments/*"| C4["Class: webhook&lt;br/&gt;own zone, own body cap, raw body kept,&lt;br/&gt;never starved by other traffic"]
+  P --&gt;|"/door/stats/stream"| C5["Class: stream&lt;br/&gt;unbuffered, long read timeout, per-client cap"]
+  P --&gt;|"/door/* scanner calls"| C6["Class: scanner&lt;br/&gt;high rate, small body, per-device fairness"]
+  P --&gt;|"/public/*"| C7["Class: public read&lt;br/&gt;microcache + stale-while-error,&lt;br/&gt;GET-only retry"]
+  P --&gt;|"/onboarding uploads, signed URLs"| C8["Class: uploads&lt;br/&gt;URL issuing only, bytes go to storage"]
+  P --&gt;|"everything else /api/v2/*"| C9["Class: general&lt;br/&gt;standard zone, no retry"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef bad fill:#ffd6d6,stroke:#c0392b,color:#111
+  classDef new fill:#e8f0fe,stroke:#4a6fa5,color:#111
+  class C1,C4,C6,C7 new
+  class C2,C3,C5,C8,C9 ok
+  class X1,X2 bad</pre></figure>
+<p>Today only auth, stream, readiness/version, health and a catch-all exist. The <strong>new</strong> classes are the gap:</p>
+<ul><li><strong>Webhook class:</strong> today <code>POST /api/v2/webhooks/payments/razorpay</code> falls into the general location, sharing the general rate zone and a 1 MB cap. A busy period or a shared key can 429 the provider. The dream gives it its own zone (so it cannot be starved), its own small body cap, raw-body pass-through (signature verification needs the exact bytes), a tighter timeout, and <strong>no</strong> CORS or cookie handling.</li></ul>
+<pre># illustrative, not applied
+limit_req_zone &quot;razorpay&quot; zone=c1rcle_edge_webhook:1m rate=50r/s;
+location = /api/v2/webhooks/payments/razorpay {
+  limit_req zone=c1rcle_edge_webhook burst=100 nodelay;
+  client_max_body_size 256k;
+  proxy_request_buffering on;          # keep the raw body intact
+  include /etc/nginx/snippets/c1rcle/proxy-common.conf;
+  proxy_pass http://c1rcle_fastify;
+}</pre>
+<ul><li>**Scanner class (<code>/door/*</code>):<strong> door opening can send hundreds of calls from few IPs (one venue, one Wi-Fi). Today they share the general 10 r/s zone per client address. The dream keys scanner budgets on the </strong>scanner session or device** (from a header nginx can see) as well as IP, so a venue behind one NAT does not throttle itself while an attacker is still limited.</li><li><strong>Public read class:</strong> see 6.4.</li><li><strong>Liveness vs readiness split:</strong> liveness is answered by nginx locally (so the platform never kills a healthy edge because Firestore is slow); readiness proxies to Fastify.</li></ul>
+<h3 id="6-3-budgets-and-fairness">6.3 Budgets and fairness</h3>
+<table><thead><tr><th>Zone</th><th>Today (built)</th><th>Dream</th></tr></thead><tbody><tr><td>general</td><td>10 r/s, burst 20, keyed on verified client IP</td><td>same, but per route class, with burst sized to a page load</td></tr><tr><td>auth</td><td>5 r/s, burst 10</td><td>same plus Cloudflare Turnstile before OTP send and login</td></tr><tr><td>webhook</td><td>shares general</td><td><strong>separate</strong>, provider-sized</td></tr><tr><td>scanner</td><td>shares general</td><td><strong>separate</strong>, keyed on device/session + IP</td></tr><tr><td>stream</td><td>shares general, 100 connections per client</td><td>per-client stream cap in nginx <strong>and</strong> a Redis-backed global budget in Fastify (today in-memory and per instance)</td></tr><tr><td>connections</td><td>100 per client</td><td>per class</td></tr></tbody></table>
+<p>The legacy <code>circle-v2-backend.onrender.com</code> hostname (not origin-locked) still keys on the platform hop, so every visitor shares one bucket. The dream removes that hostname (plan item B4.3).</p>
+<h3 id="6-4-caching-one-owner-per-route">6.4 Caching (one owner per route)</h3>
+<ul><li><strong>Cloudflare owns</strong> <code>/_next/static/*</code>-style assets and <code>GET /api/v2/public/*</code> with a short edge TTL (plan phase C1, <strong>planned</strong>, not built), bypassing when <code>Authorization</code> or a session cookie is present.</li><li><strong>nginx owns nothing by default.</strong> Optional <strong>microcache</strong> (1–5 s) only on the public read class to absorb stampedes when Cloudflare misses, with <code>proxy_cache_lock</code> so a thundering herd becomes one upstream request, and <code>proxy_cache_use_stale error timeout updating http_502 http_503</code> so a restarting backend still serves the last good page.</li></ul>
+<pre># illustrative, not applied (Horizon 2)
+proxy_cache_path /var/cache/nginx/c1rcle levels=1:2 keys_zone=c1rcle_public:10m max_size=100m inactive=10m use_temp_path=off;
+location ^~ /api/v2/public/ {
+  proxy_cache c1rcle_public;
+  proxy_cache_key &quot;$host$request_uri&quot;;
+  proxy_cache_valid 200 5s;
+  proxy_cache_lock on;
+  proxy_cache_use_stale error timeout updating http_502 http_503;
+  proxy_cache_bypass $http_authorization $http_cookie;
+  proxy_no_cache $http_authorization $http_cookie;
+  proxy_next_upstream error timeout http_502 http_503;   # GET only location
+  proxy_next_upstream_tries 2;
+  proxy_pass http://c1rcle_fastify;
+}</pre>
+<ul><li>Stop forcing <code>no-store</code> on everything: today <code>proxy_hide_header Cache-Control</code> plus a server-level <code>Cache-Control: no-store</code> stamps every API response. The dream lets Fastify declare cacheability per route and nginx only enforces <code>no-store</code> on authenticated classes.</li><li>Availability and anything user-specific are <strong>never</strong> cached at nginx.</li></ul>
+<h3 id="6-5-upstream-pool-and-retries">6.5 Upstream pool and retries</h3>
+<pre># illustrative, not applied (Horizon 2, needs more than one Fastify instance)
+upstream c1rcle_fastify {
+  zone c1rcle_fastify 64k;
+  least_conn;
+  server fastify-1:8080 max_fails=2 fail_timeout=10s;
+  server fastify-2:8080 max_fails=2 fail_timeout=10s;
+  keepalive 32;
+}</pre>
+<ul><li>Keep <code>proxy_next_upstream off</code> everywhere except the GET-only public location. nginx treats PUT and DELETE as retryable and this API uses both (venue menu, settings, bank accounts), so a blanket retry setting would be unsafe.</li><li>Passive health only (<code>max_fails</code>, <code>fail_timeout</code>); active probing needs a commercial module and is not required.</li><li>SSE and the scanner do not need session stickiness (state lives in Firestore and Redis), but each stream still pins to one instance for its 15-minute lifetime.</li><li>Preconditions before a second instance (from the repo's own load-balancing doc): measured need (p99 or CPU), Redis proven for rate limits, Firestore-backed idempotency (already true), health probing.</li></ul>
+<h3 id="6-6-errors-cors-and-correlation">6.6 Errors, CORS and correlation</h3>
+<ul><li>Edge error pages (413, 429, 502, 503, 504) already return a JSON envelope with <code>requestId</code>. The dream adds <strong>CORS headers to those pages</strong> (rendered from the same allow-list as <code>ALLOWED_ORIGINS</code>) so a browser reads a real 429 instead of an opaque CORS failure; today they carry none because CORS lives only in Fastify.</li><li>Add a <code>Retry-After</code> on 502/503/504 and a distinct <code>edge_warming</code> code for the cold-start window (see 6.7).</li><li>Propagate a W3C <code>traceparent</code> derived from <code>$request_id</code>; Fastify logs it; the Vercel BFF forwards it.</li></ul>
+<h3 id="6-7-cold-start-and-lifecycle">6.7 Cold start and lifecycle</h3>
+<figure><pre class="mermaid">sequenceDiagram
+  participant R as Render
+  participant E as Container entrypoint
+  participant N as nginx
+  participant F as Fastify
+  Note over R,F: Today
+  R-&gt;&gt;E: start container
+  E-&gt;&gt;F: start Fastify on loopback
+  E-&gt;&gt;E: poll health up to 90 s (port still closed)
+  F--&gt;&gt;E: healthy
+  E-&gt;&gt;N: start nginx on the public port
+  R-&gt;&gt;N: first health probe (only now possible)
+  Note over R,F: Dream
+  R-&gt;&gt;E: start container
+  E-&gt;&gt;N: start nginx first on the public port
+  E-&gt;&gt;F: start Fastify on loopback
+  R-&gt;&gt;N: health probe
+  N--&gt;&gt;R: 503 edge_warming + Retry-After (liveness ok)
+  F--&gt;&gt;E: healthy
+  N--&gt;&gt;R: 200 once the pool is ready
+  Note over R,F: Shutdown: nginx quits gracefully, drains, then Fastify stops, and a crash exits non-zero</pre></figure>
+<ul><li>Today the public port is closed for up to <strong>90 s</strong> on a cold boot (observed about 34 s) and the sidecar shell exits <strong>0</strong> after <code>wait -n</code>, hiding crashes from the platform. The dream starts nginx first, answers <code>503 edge_warming</code> while the backend boots, uses a graceful <code>nginx -s quit</code> on SIGTERM, and propagates the failing child's exit code.</li><li>Pin <code>worker_processes</code> to a small fixed number (today <code>auto</code>, which can over-spawn on a shared free CPU).</li><li>Supervise the log tails (today unsupervised, no rotation) or send logs straight to stdout/stderr.</li></ul>
+<h3 id="6-8-security-headers-and-tls">6.8 Security headers and TLS</h3>
+<ul><li>API-only CSP <code>default-src 'none'; frame-ancestors 'none'</code>, <code>X-Frame-Options: DENY</code>, <code>Permissions-Policy</code> empty, <code>Cross-Origin-Resource-Policy: same-site</code>. Today only <code>nosniff</code>, <code>no-referrer</code>, <code>no-store</code> are set.</li><li>Production profile (when nginx owns TLS, Horizon 2+): add <code>ssl_ciphers</code>/<code>ssl_prefer_server_ciphers off</code>, OCSP stapling, HTTP/2, HSTS with <code>includeSubDomains</code> once all subdomains are HTTPS. HTTP/3 stays at Cloudflare.</li><li>Validate the readiness token's characters (today unvalidated and interpolated into a quoted <code>map</code> key: a quote or semicolon would break or inject config; the origin secret is already strictly validated).</li></ul>
+<h3 id="6-9-observability">6.9 Observability</h3>
+<ul><li>Structured JSON access logs (built), <strong>anonymised client address</strong> (#143 is open: IPv4 to /24, IPv6 to /48; note <code>peerIp</code> is still logged in full), request id, route class, upstream timings, <code>originVerified</code>.</li><li>Ship logs to a searchable sink with alerts on 5xx rate, 429 rate per class, cold-start duration, and origin-lock 403 spikes; a dashboard per route class.</li><li>Log retention and privacy policy documented (the access log omits query strings today, which protects tokens).</li></ul>
+<h3 id="6-10-config-as-code-and-testing">6.10 Config as code and testing</h3>
+<ul><li>Every template change passes: the static checker (built, in CI), <strong>and</strong> the Docker integration script (built, <strong>not in CI today</strong>), extended with the missing cases: the SSE location, the webhook class, the 504 path, rotation with two secrets, the CORS-on-error pages, the warming state.</li><li>Export Cloudflare rules to the repo (plan E2) so the dashboard is never the source of truth.</li><li>Include <code>NGINX_ORIGIN_VERIFY_SECRET</code>, <code>NGINX_ORIGIN_LOCKED_SERVER_NAMES</code> and <code>NGINX_ADDITIONAL_SERVER_NAMES</code> in <code>render.yaml</code> as declared (secret ones <code>sync:false</code>); today they live only in the dashboard, so the repo cannot show whether staging is locked.</li><li>Remove the dead <code>NGINX_READINESS_ALLOWLIST_LINES</code> variable.</li></ul>
+<h3 id="6-11-the-full-edge-question">6.11 The full-edge question</h3>
+<p>The repo documents a "full-edge" topology where nginx also fronts the three Next.js BFFs (<code>guest.</code>, <code>partner.</code>, <code>admin.</code>) and the apps move off Vercel. <strong>This dream does not include it.</strong> It conflicts with the owner decision that compute stays on Vercel; the full-edge templates have also drifted (no multi-host support, no origin lock, no rate limits on BFF locations, not in the sidecar image, not exercised by the container test), so adopting them would silently lose protections. Recommendation: keep nginx <strong>API-only</strong>; revisit only if Vercel is abandoned, and then rebuild the full-edge templates on the same shared snippets with the same tests.</p>
+<h2 id="7-resilience-and-failure-modes">7. Resilience and failure modes</h2>
+<figure><pre class="mermaid">flowchart TD
+  F(["Something fails"]) --&gt; W{"What?"}
+  W --&gt;|"Fastify slow or restarting"| A1["nginx returns 502/503 JSON with Retry-After.&lt;br/&gt;Public reads: stale cache served.&lt;br/&gt;Mutations: never retried (idempotency keys make client retry safe)"]
+  W --&gt;|"Cold start after idle"| A2["Port open early, 503 edge_warming,&lt;br/&gt;keep-alive cron removes most cold starts"]
+  W --&gt;|"Redis down"| A3["Rate limits fall back to per-instance memory,&lt;br/&gt;readiness reports redis down"]
+  W --&gt;|"Firestore degraded"| A4["Readiness fails, liveness stays up,&lt;br/&gt;no restart storm"]
+  W --&gt;|"Cloudflare outage"| A5["Locked API hosts refuse direct traffic by design.&lt;br/&gt;Break-glass: unlock the host via env change and redeploy"]
+  W --&gt;|"Origin secret leaks"| A6["Rotate with two accepted secrets, no outage.&lt;br/&gt;Meanwhile spoofable IPs only weaken rate limits"]
+  W --&gt;|"One client floods"| A7["Per-class zones and connection caps limit that client.&lt;br/&gt;Webhook and scanner budgets stay available"]
+  W --&gt;|"nginx crashes"| A8["Container exits non-zero, platform restarts it"]
+  classDef ok fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef warn fill:#fff3b0,stroke:#b58900,color:#111
+  class A1,A2,A3,A4,A7,A8 ok
+  class A5,A6 warn</pre></figure>
+<p>Single points of failure that remain even in Horizon 1: one container (nginx and Fastify restart together), one Render region (Singapore), one Firestore project. Horizons 2 and 3 address the first two.</p>
+<h2 id="8-three-horizons">8. Three horizons</h2>
+<figure><pre class="mermaid">flowchart LR
+  H0["Horizon 0: today&lt;br/&gt;sidecar, one free instance,&lt;br/&gt;origin lock on api-staging,&lt;br/&gt;per-client limits, JSON errors"] --&gt; H1
+  H1["Horizon 1: hardened, free plans&lt;br/&gt;fix the defect register,&lt;br/&gt;webhook + scanner zones,&lt;br/&gt;warming state, CORS on errors,&lt;br/&gt;two secrets, CSP, tests in CI,&lt;br/&gt;Cloudflare cache + keep-alive cron"] --&gt; D1{"Owner decision:&lt;br/&gt;first paid step?"}
+  D1 --&gt;|"yes (real sales)"| H2["Horizon 2: first paid step&lt;br/&gt;Render two-service: public nginx +&lt;br/&gt;private Fastify x2, Redis,&lt;br/&gt;least_conn pool, microcache,&lt;br/&gt;nginx-owned TLS, mutual TLS to origin"]
+  D1 --&gt;|"not yet"| H1
+  H2 --&gt; H3["Horizon 3: the dream&lt;br/&gt;multi-instance across failure domains,&lt;br/&gt;Cloudflare load balancing + health,&lt;br/&gt;managed WAF + queue for drops,&lt;br/&gt;tracing, canary reload,&lt;br/&gt;autoscaling by measured load"]
+  classDef now fill:#d9f7d9,stroke:#2e8b2e,color:#111
+  classDef next fill:#fff3b0,stroke:#b58900,color:#111
+  classDef later fill:#e8f0fe,stroke:#4a6fa5,color:#111
+  class H0 now
+  class H1 next
+  class H2,H3 later</pre></figure>
+<h3 id="horizon-1-inside-today-s-constraints-free-plans-one-container">Horizon 1: inside today's constraints (free plans, one container)</h3>
+<table><thead><tr><th>Item</th><th>What</th><th>Effort</th><th>Depends on</th></tr></thead><tbody><tr><td>H1-1</td><td>Two accepted origin secrets (rotation without outage)</td><td>small</td><td>entrypoint, validator, Cloudflare rule</td></tr><tr><td>H1-2</td><td>Webhook class: own zone, body cap, raw body</td><td>small</td><td>none</td></tr><tr><td>H1-3</td><td>Scanner class keyed on device/session plus IP</td><td>medium</td><td>decide header to key on</td></tr><tr><td>H1-4</td><td>Start nginx first, <code>edge_warming</code> 503, graceful quit, propagate exit code, fixed workers</td><td>medium</td><td>sidecar entrypoint</td></tr><tr><td>H1-5</td><td>CORS headers on edge error pages</td><td>small</td><td>render allow-list into config</td></tr><tr><td>H1-6</td><td>API-only CSP and extra security headers</td><td>small</td><td>none</td></tr><tr><td>H1-7</td><td>Stricter client-IP and readiness-token validation</td><td>small</td><td>none</td></tr><tr><td>H1-8</td><td>Merge #143 anonymised logs; decide on <code>peerIp</code></td><td>small</td><td>privacy decision</td></tr><tr><td>H1-9</td><td>Declare origin and extra-host env in <code>render.yaml</code>; delete the dead variable</td><td>small</td><td>none</td></tr><tr><td>H1-10</td><td>Run the Docker integration test in CI; add the missing cases</td><td>medium</td><td>CI runner with Docker</td></tr><tr><td>H1-11</td><td>Cloudflare cache rules for public GETs and static assets; keep-alive cron Worker</td><td>medium</td><td>plan phase C</td></tr><tr><td>H1-12</td><td>Disable the legacy <code>onrender.com</code> host and forward the visitor IP from the BFFs (B3.3, B4.3)</td><td>medium</td><td>frontend change</td></tr><tr><td>H1-13</td><td>Export Cloudflare rules to the repo</td><td>small</td><td>plan E2</td></tr></tbody></table>
+<p>Exit check: a direct hit without proof returns 403; two secrets accepted during rotation; the webhook survives a general-zone flood in a test; a cold boot opens the port within seconds and shows <code>edge_warming</code>; CI fails if any template or test regresses.</p>
+<h3 id="horizon-2-the-first-paid-step-owner-decision">Horizon 2: the first paid step (owner decision)</h3>
+<p>Needs a paid Render plan (private services, more than one instance). Moves to the documented <strong>two-service</strong> topology: a public nginx web service and a private Fastify service with two or more instances; Redis for rate limits and the stream budget; <code>least_conn</code> pool with passive health; the public-read microcache; nginx-owned TLS (the production profile) enabling <strong>Authenticated Origin Pulls</strong>; per-environment network isolation. Preconditions are the repo's own load-balancing checklist. Exit check: kill one Fastify instance under load and see no user-visible errors beyond in-flight requests.</p>
+<h3 id="horizon-3-the-dream">Horizon 3: the dream</h3>
+<p>Active redundancy across failure domains (second region or provider), Cloudflare load balancing with health checks (paid), managed WAF rule sets and a queue for hot ticket drops (the free-plan Durable Object design is <strong>planned</strong> with a stated ceiling of tens of thousands of queued visitors per day), tracing end to end, canary config reloads with automatic rollback, autoscaling on measured load, and payment-grade audit of every edge decision. Gate: sustained real traffic and the legal, tax and provider approvals that already block turning payouts on.</p>
+<h2 id="9-current-defects-register">9. Current defects (register)</h2>
+<table><thead><tr><th>ID</th><th>Sev</th><th>Finding</th><th>Evidence</th></tr></thead><tbody><tr><td>N-1</td><td>High</td><td>Legacy <code>onrender.com</code> host is not origin-locked: all visitors share one rate-limit bucket (the platform hop), so one noisy client can 429 everyone</td><td>staging <code>client-ip.conf.template</code>; plan B4.3 open</td></tr><tr><td>N-2</td><td>High</td><td>Razorpay webhook has no dedicated location: it shares the general zone (10 r/s, burst 20) and 1 MB cap</td><td><code>api-locations.conf</code> has no webhook location (verified)</td></tr><tr><td>N-3</td><td>Med</td><td>Edge error pages (413, 429, 502–504) carry no CORS headers, so browsers see opaque failures</td><td>CORS only in Fastify</td></tr><tr><td>N-4</td><td>Med</td><td>Cold start: the public port is closed until Fastify is healthy (up to 90 s, observed about 34 s)</td><td><code>sidecar-entrypoint.sh</code> (verified)</td></tr><tr><td>N-5</td><td>Med</td><td>Sidecar exits 0 after <code>wait -n</code>, hiding crashes; nginx stops with a fast TERM; log tails unsupervised and never rotated</td><td>entrypoint (reported)</td></tr><tr><td>N-6</td><td>Med</td><td>Origin secret has a single accepted value: rotation causes a 403 window</td><td><code>cloudflare-edge.md</code></td></tr><tr><td>N-7</td><td>Med</td><td>Verified client IP is only charset/length checked</td><td><code>client-ip.conf.template</code> (reported)</td></tr><tr><td>N-8</td><td>Med</td><td>Readiness token is not charset-validated and is interpolated into a quoted map key</td><td>entrypoint (reported)</td></tr><tr><td>N-9</td><td>Low–Med</td><td>No CSP, frame, permissions or CORP headers on the API; production TLS block lacks cipher policy, OCSP stapling and HTTP/2</td><td>templates (reported)</td></tr><tr><td>N-10</td><td>Low–Med</td><td><code>proxy_hide_header Cache-Control</code> plus server-level <code>no-store</code> forces <code>no-store</code> on all API responses</td><td><code>proxy-common.conf</code> (verified)</td></tr><tr><td>N-11</td><td>Low</td><td><code>worker_processes auto</code> on a small shared CPU</td><td><code>nginx.conf</code> (verified)</td></tr><tr><td>N-12</td><td>Low</td><td>Anonymised logging (#143) still logs <code>peerIp</code> in full</td><td>#143 branch (reported)</td></tr><tr><td>N-13</td><td>Med</td><td>Full-edge templates drifted: no multi-host, no origin lock, no BFF rate limits, not in the sidecar image, untested</td><td>templates (reported)</td></tr><tr><td>N-14</td><td>Low</td><td><code>NGINX_READINESS_ALLOWLIST_LINES</code> in <code>render.yaml</code> is dead; origin and extra-host variables are not declared in the repo</td><td><code>render.yaml</code> (reported)</td></tr><tr><td>N-15</td><td>Med</td><td>The Docker integration test (the only check of real nginx behaviour) is not in CI; the SSE location, webhook path and 504 path have no coverage</td><td>CI config (reported)</td></tr><tr><td>N-16</td><td>Info</td><td>Per-instance in-memory rate limits and stream budgets; <code>RATE_LIMIT_STORE=memory</code> is correct only while there is one instance</td><td><code>render.yaml</code></td></tr></tbody></table>
+<h2 id="10-decisions-the-owners-must-make">10. Decisions the owners must make</h2>
+<p>1. <strong>When is the first paid step?</strong> (Horizon 2 is blocked on it.) Suggested trigger from the plan: when real sales begin. 2. <strong>Keep BFFs on Vercel?</strong> This design says yes (API-only nginx). Confirm, or decide to move compute and accept rebuilding the full-edge templates. 3. <strong>Scanner rate-limit key:</strong> device header, session header, or IP only. Needs a product call on shared venue networks. 4. <strong>Cache owner for public reads:</strong> Cloudflare (recommended) versus nginx microcache. 5. <strong>Break-glass policy</strong> if Cloudflare is down (who may unlock a host, how it is audited). 6. <strong>Log privacy:</strong> keep or drop full <code>peerIp</code>; retention period. 7. <strong>Write the ADR.</strong> No ADR records the sidecar topology or the origin-lock model; the decision lives in a topology doc. This page can be the seed.</p>
+<h2 id="11-stale-documentation-to-know-about">11. Stale documentation to know about</h2>
+<p><code>docs/nginx/issues-and-gaps.md</code> and <code>architecture.md</code> still call the live topology single-service (the sidecar is live); several nginx docs say readiness is IP-gated (it is token-gated); rate-limit keys documented as <code>$binary_remote_addr</code> (staging keys on the verified client IP); Redis and Firestore idempotency are described as missing (both exist; Redis is simply not provisioned); the <code>_freshness.json</code> source list omits <code>proxy-wash-headers.conf</code> and <code>client-ip.conf.template</code>; <code>cloudflare_plan.md</code> is headed "PLAN ONLY" though phases B1–B5 are applied on staging; <code>Dockerfile.sidecar</code> has a comment saying the master needs root while the image runs as a non-root user; <code>render.yaml</code> still names <code>circle-v2-backend.onrender.com</code> for <code>PUBLIC_API_URL</code> and <code>NGINX_SERVER_NAME</code>. Live Render and Cloudflare state could not be inspected in this review (the Render MCP server was unreachable), so anything about the live dashboards is unverified.</p>
+</main>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({startOnLoad:true, theme: dark ? "dark" : "default", securityLevel:"loose", flowchart:{htmlLabels:true, useMaxWidth:true}});
+</script></body></html>
