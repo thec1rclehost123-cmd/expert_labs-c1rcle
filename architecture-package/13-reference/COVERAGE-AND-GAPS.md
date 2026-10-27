@@ -16,7 +16,7 @@ Result of the "check what is missing" audit, 2026-10-24. Method: a mechanical sc
 The scan is a name match: it proves a thing is mentioned, not that it is explained correctly.
 
 ## 2. Package size
-About 92 Markdown files, 92k words, 146 Mermaid diagrams (all parse), 7 browser viewers (`visual-guide.html` for partner, admin, scanner, payments, guest portal; nginx dream architecture).
+99 Markdown files, about 119,000 words, 155 Mermaid diagram blocks (fence structure checked; not re-rendered in this pass), and 6 browser viewers (five `visual-guide.html` files plus the nginx dream architecture).
 
 ## 3. Depth by area
 | Area | Depth | Notes |
@@ -46,4 +46,4 @@ About 92 Markdown files, 92k words, 146 Mermaid diagrams (all parse), 7 browser 
 - The mechanical audit cannot detect a page that mentions a feature but gets it wrong.
 
 ## 6. Handling
-No secret values, account IDs, personal emails or per-person logs are included; environment variables appear by name only. Recommend an NDA before sharing: the package includes unfixed security findings. Nothing has been sent or uploaded.
+No secret values, account IDs, personal emails or per-person logs are included; environment variables appear by name only. A few Firebase project IDs and deployment hostnames remain in configuration examples, which the NDA covers. Recommend an NDA before sharing: the package includes unfixed security findings. A sanitized copy has been uploaded to the owner's private GitHub repository; do not share it outside the NDA.

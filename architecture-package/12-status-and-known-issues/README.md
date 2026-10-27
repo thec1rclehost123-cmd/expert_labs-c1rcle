@@ -42,7 +42,7 @@ Earlier versions of this package listed the payments correctness stack as unmerg
 - Health check path was unset on the live service as of 2026-10-18 (unverified).
 - Rotating `NGINX_ORIGIN_VERIFY_SECRET` currently causes an outage until nginx accepts two secrets (not built).
 - Frontend CI smoke tests hit `*.vercel.app` URLs, not real hostnames; a frontend onboarding test is flaky under CI load.
-- `.mcp.json` files are tracked and contain a developer's local paths; seed scripts embed a development password and assume the real `c1rcle-v2` project.
+- In the original source repositories, `.mcp.json` files carried developer-local paths, and some seed scripts embedded a development password and assumed the real `c1rcle-v2` project. Treat those files as internal tooling; the handoff excludes `.mcp.json` and requires seed credentials via environment variables.
 
 ## 6. Blocked on people, not code
 Funds-flow legal decision (RBI payment-aggregator question, Razorpay Route); CA advice (ticket GST, GST on fees, TDS 194-O, GST TCS s.52); Razorpay's written approval; finance answers in the refund/chargeback record (#131, seven decisions); the offline-scanning ADR; the first paid infrastructure step. The **refund executor exists** (#136): what is undecided is the policy it should apply (who bears refunds, fees and lost chargebacks), not whether it is built.

@@ -48,7 +48,7 @@ The `.html` files draw the diagrams with the Mermaid library loaded from a CDN, 
 ## Important caveats about this snapshot
 - Both repos were on feature branches when this was written (backend `fix/partner-connections-and-events`, frontend `fix/partner-connections-contracts`). Where a page says "Unmerged" it means open PR or branch only; the payments stack and frontend PR #72 work are on staging (see `12-status-and-known-issues/`).
 - Memory and several docs in the repos are point-in-time; where code and docs disagree this package follows the code and notes the drift.
-- No secret values appear here, only environment variable **names**. Account/project identifiers have been left out deliberately.
+- No secret values appear here, only environment variable **names**. A few Firebase project IDs and deployment hostnames remain in configuration examples; treat the whole package as confidential under the NDA.
 
 ## Existing docs in the repos (linked, not duplicated)
 Backend: `docs/architecture/README.md`, `docs/architecture/decisions.md` (D-001..D-030), `docs/ci-cd.md`, `docs/nginx/sidecar-deployment.md`, `docs/api-contracts/*`, `docs/roadmap/ROADMAP.md`.
