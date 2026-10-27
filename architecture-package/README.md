@@ -3,8 +3,6 @@
 Prepared 2026-10-23, deepened and re-verified 2026-10-24 from a read-through of both repositories (`C1RCLE-BACKEND`, `C1RCLE-FRONTEND`) and their existing docs.
 **Confidential. Share only under an NDA.** This package includes known weaknesses and audit findings on purpose (see `12-status-and-known-issues/`).
 
-> **Snapshot note (2026-10-26):** this package describes the original repositories as they stood on 2026-10-23/24. The code snapshot delivered alongside it has since been sanitized: real `.env` files, `.mcp.json`, agent state and the one-off scripts that embedded credentials or real ids have been removed. Where this package says those files are present or hard-code values, read it as a finding about the original repositories, not about the current tree.
-
 ## What C1RCLE is
 A ticketing and nightlife-operations platform for India: venues, hosts (organisers) and promoters run events; guests discover events, buy tickets (Razorpay) and enter through a QR scanner at the door; platform admins run finance, support and oversight.
 
