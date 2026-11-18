@@ -23,6 +23,7 @@ A ticketing and nightlife-operations platform for India: venues, hosts (organise
 | 11 | `11-infrastructure-and-cicd/` | Render, Vercel, nginx, Cloudflare, CI/CD |
 | 12 | `12-status-and-known-issues/` | What is live vs partial vs unmerged; audits; open risks |
 | 13 | `13-reference/` | Generated route, env and collection indexes; services, errors, security and privacy, operations, decisions, glossary, getting started, **coverage and gaps** |
+| - | `VERIFICATION-2026-11-18.md` | **Start here for trust:** what was verified against current code, with evidence, what changed, and what is still unverified. Also `13-reference/PR-LEDGER-2026-11-18.md` (current PR states) |
 | 14 | `14-vendor-handover/` | **New 2026-11-17.** Engineering handover and production-readiness checklist for six backend services (`.docx`), plus the current route list (404 routes) and schema list (95 collections) |
 | - | `_archive-2026-10-24/` | Previous versions of files replaced in the refresh |
 | - | `diagrams/` | Mermaid sources (also embedded in the pages) |

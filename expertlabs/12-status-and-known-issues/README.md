@@ -4,6 +4,8 @@
 
 Snapshot 2026-10-24 (rewritten after the payments, guest portal and cross-cutting deep dives). Included in full at the owner's request. **Keep this folder under NDA.** "Verified" = checked in source or with `gh`/`git` on 2026-10-24; "reported" = from a code read. Each row links to the in-depth set that holds the detail and the evidence.
 
+> **Verification 2026-11-18:** see `../VERIFICATION-2026-11-18.md` for a row-by-row re-check of this page against current code (several rows are fixed or changed there) and `../13-reference/PR-LEDGER-2026-11-18.md` for current PR states. Rows not listed there are still the 2026-10-24 to 2026-11-04 snapshot.
+
 ## 1. Status by component
 | Component | Live | Partial | Unmerged / open | Planned |
 |---|---|---|---|---|

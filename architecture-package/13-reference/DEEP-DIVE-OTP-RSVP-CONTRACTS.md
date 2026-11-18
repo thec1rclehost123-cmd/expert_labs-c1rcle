@@ -1,6 +1,6 @@
 # Deep dive: email OTP, free-ticket RSVP, analytics backfill, contracts and parity
 
-Sources read 2026-10-25: `routes/v2/auth/otp-routes.ts`, `application/auth/email-otp-service.ts`, `domain/models/email-otp.ts`, `routes/v2/rsvp/rsvp-routes.ts`, `checkout-service.ts` (`createRsvp`), `inventory-service.ts`, `scripts/backfill-analytics.ts`, `packages/contracts/*`, `scripts/{contract-parity,export-contracts}.mjs`, FE `partner-dashboard/src/lib/onboarding/otp.ts`. Findings are "verified" when the code path was read end to end, "reasoned" when derived from reading and not reproduced.
+Sources read 2026-10-25: `routes/v2/auth/otp-routes.ts`, `application/auth/email-otp-service.ts`, `domain/models/email-otp.ts`, `routes/v2/rsvp/rsvp-routes.ts`, `checkout-service.ts` (`createRsvp`), `inventory-service.ts`, `apps/api-gateway/src/scripts/backfill-analytics.ts`, `packages/contracts/*`, `scripts/{contract-parity,export-contracts}.mjs`, FE `partner-dashboard/src/lib/onboarding/otp.ts`. Findings are "verified" when the code path was read end to end, "reasoned" when derived from reading and not reproduced.
 
 ## 1. Email OTP
 **Explain it as:** a 6-digit code emailed to an address, used by the partner onboarding wizard to "verify" the email step. It is a standalone mini-service, not part of the sign-up itself.

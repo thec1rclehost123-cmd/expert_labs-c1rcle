@@ -75,3 +75,34 @@ Scanner app: `EXPO_PUBLIC_API_BASE_URL`, `EXPO_PUBLIC_ENV`, `EXPO_PUBLIC_ORGANIZ
 - `FIRESTORE_PROJECT_ID` default `c1rcle-staging` vs `.firebaserc` default `c1rcle-v2`.
 - `NODE_ENV` must be `production`, not `staging` (the schema accepts only development, test, production).
 - `MAGIC_TICKET_SECRET` and `ENCRYPTION_KEY` rotation effects are undocumented in the repo (rotating the first invalidates every QR, manifest and ticket key at once; losing the second makes newly written bank accounts unreadable, while legacy-key records stay readable).
+
+## Changes since this file was generated
+
+Verified 2026-11-18 against backend `staging` @ `3802889`. The gateway reads **54** variables in `apps/api-gateway/src/config/index.ts`; this file listed names as of 2026-10-24.
+
+**Variables read by the gateway now and not named above (20):**
+
+| Name | Schema (first line) |
+|---|---|
+| `BACKGROUND_WORKERS_ENABLED` | `z` |
+| `DEPLOYMENT_ENVIRONMENT` | `z.enum(['production', 'staging', 'local']).optional(),` |
+| `FIREBASE_AUTH_EMULATOR_HOST` | `z.string().min(1).optional(),` |
+| `GUEST_PORTAL_URL` | `z` |
+| `M5_COVER_ACCOUNTING_APPROVED` | `z` |
+| `M5_COVER_ACTIVATION_APPROVED` | `z` |
+| `M5_COVER_MERCHANT_APPROVED` | `z` |
+| `M5_COVER_SALES_ENABLED` | `z` |
+| `M5_ELIGIBILITY_RULES_ENABLED` | `z` |
+| `M5_OFFLINE_MANIFEST_DRAIN_COMPLETE` | `z` |
+| `M5_OFFLINE_TICKET_MANIFESTS_ENABLED` | `z` |
+| `M5_PRIVATE_ACCESS_ENABLED` | `z` |
+| `M5_TICKET_ADDONS_ENABLED` | `z` |
+| `M5_TICKET_TRANSFERS_ENABLED` | `z` |
+| `PROMOTER_AGREEMENT_ARTIFACT` | `z` |
+| `RENDER_EXTERNAL_URL` | `z.string().optional(),` |
+| `RENDER_GIT_BRANCH` | `z.string().optional(),` |
+| `RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST` | `z` |
+| `RESEND_FROM_EMAIL` | `z.string().trim().min(1).optional(),` |
+| `RESEND_NON_PROD_TEST_RECIPIENT` | `z.email().trim().toLowerCase().optional(),` |
+
+Names only; values live in the hosting dashboard. Relevant new behaviour: `PARTNER_DASHBOARD_URL` (optional) builds every absolute partner link (invitation accept, onboarding, promoter); when unset the gateway omits the link. `RATE_LIMIT_STORE` defaults to `memory`; set `redis` plus `REDIS_URL` for limits shared across instances.
