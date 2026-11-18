@@ -36,6 +36,27 @@ const rsvpHeaders = z.looseObject({
 
 export default async function rsvpRoutes(fastify: FastifyInstance) {
   fastify.post(
+    '/rsvp/:orderId/cancel',
+    {
+      preHandler: [
+        fastify.rateLimit('STANDARD_COMMAND'),
+        fastify.validateV2({
+          params: z.object({ orderId: z.string().regex(/^RSVP-[a-f0-9]{32}$/) }),
+        }),
+      ],
+    },
+    async (request, reply) => {
+      const { orderId } = request.params as { orderId: string };
+      try {
+        const order = await services.checkout.cancelRsvp(orderId, services.actor(request));
+        return await reply.send({ order: orderToDto(order) });
+      } catch (error) {
+        return mapDomainError(reply, request, orderId, error);
+      }
+    },
+  );
+
+  fastify.post(
     '/rsvp',
     {
       preHandler: [
@@ -61,8 +82,15 @@ export default async function rsvpRoutes(fastify: FastifyInstance) {
             actor,
             eventId: body.eventId,
             tierId: body.tierId,
+            accessGrantId: body.accessGrantId,
+            eligibilityAttested: body.eligibilityAttested,
+            referralCode: body.referralCode ?? null,
+            referralContextTokens: body.referralContextTokens,
           });
-          const payload = { order: orderToDto(order), entitlements };
+          const payload = {
+            order: orderToDto(order),
+            entitlements,
+          };
           const validated = validateV2Response(reply, request, rsvpResponseSchema, payload);
           if (validated === undefined) throw new Error('v2 response validation failed');
           return { statusCode: 201, body: validated };

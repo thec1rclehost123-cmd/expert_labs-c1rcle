@@ -20,10 +20,15 @@ export type EventStatus =
   | 'scheduled'
   | 'published'
   | 'sales_paused'
+  | 'postponed'
   | 'started'
   | 'ended'
   | 'archived'
   | 'cancelled';
+
+/** Unlisted links are not confidential; code/invited events require an identity-bound grant. */
+export type EventVisibilityMode = 'public' | 'unlisted' | 'code' | 'invited';
+export type EventAddressDisclosure = 'public' | 'after_grant' | 'hidden';
 
 export const EVENT_STATUSES: readonly EventStatus[] = [
   'draft',
@@ -31,6 +36,7 @@ export const EVENT_STATUSES: readonly EventStatus[] = [
   'scheduled',
   'published',
   'sales_paused',
+  'postponed',
   'started',
   'ended',
   'archived',
@@ -44,10 +50,11 @@ export const EVENT_STATUSES: readonly EventStatus[] = [
 export const EVENT_TRANSITIONS: Readonly<Record<EventStatus, readonly EventStatus[]>> = {
   draft: ['review', 'cancelled'],
   review: ['scheduled', 'draft', 'cancelled'],
-  scheduled: ['published', 'started', 'cancelled'],
-  published: ['sales_paused', 'started', 'cancelled'],
-  sales_paused: ['published', 'started', 'cancelled'],
-  started: ['ended'],
+  scheduled: ['published', 'postponed', 'started', 'cancelled'],
+  published: ['sales_paused', 'postponed', 'started', 'cancelled'],
+  sales_paused: ['published', 'postponed', 'started', 'cancelled'],
+  postponed: ['published', 'cancelled'],
+  started: ['ended', 'postponed', 'cancelled'],
   ended: ['archived'],
   archived: [],
   cancelled: [],
@@ -80,6 +87,20 @@ export interface TicketTierRef {
 export type CompensationModel = 'standard' | 'custom' | 'salary';
 export type SalaryPeriod = 'per_event' | 'per_day' | 'per_month';
 
+export interface EventRefundPolicy {
+  kind: 'no_refunds' | 'until_cutoff' | 'organizer_reviewed';
+  cutoffAt?: string | null;
+}
+
+export function assertEventRefundPolicy(policy: EventRefundPolicy | undefined): void {
+  if (!policy) return;
+  if (
+    !['no_refunds', 'until_cutoff', 'organizer_reviewed'].includes(policy.kind) ||
+    (policy.kind === 'until_cutoff' && !Number.isFinite(Date.parse(policy.cutoffAt ?? '')))
+  )
+    throw new InvalidOperationError('A refund-request cutoff must have a valid date');
+}
+
 export interface EventCompensation {
   model: CompensationModel;
   globalRatePercent: number | null;
@@ -89,10 +110,93 @@ export interface EventCompensation {
   salaryNotes: string | null;
 }
 
+/** Server-owned venue and entry information shown on the Guest event detail. */
+export interface EventEntryRules {
+  doorsOpenAt: string | null;
+  lastEntryAt: string | null;
+  reentryAllowed: boolean | null;
+  minimumAge: number | null;
+  idRequired: boolean | null;
+  accessibilityNotes: string | null;
+  dressCode: string | null;
+  alcoholPolicy: string | null;
+  prohibitedItems: string[];
+  supportDetails: string | null;
+}
+
+export interface EventMedia {
+  titleFont?:
+    'classic' | 'eclectic' | 'fancy' | 'digital' | 'literary' | 'impact' | 'modern' | 'condensed';
+  youtubeUrl: string | null;
+  gallery: { url: string; alt: string }[];
+  spotlights: {
+    id: string;
+    title: string;
+    link: string | null;
+    imageUrl: string | null;
+    description: string;
+    startTime: string | null;
+    endTime: string | null;
+  }[];
+}
+
+/** Immutable event-scoped location for a physical venue without a C1RCLE account. */
+export interface ExternalEventLocation {
+  name: string;
+  address: string;
+  city?: string;
+  region?: string;
+  postalCode?: string;
+  country?: string;
+  mapUrl?: string | null;
+  contact: { managerName: string; phone: string; email?: string | null };
+  review: {
+    status: 'pending' | 'approved' | 'rejected';
+    submittedAt: string;
+    reviewedAt: string | null;
+    reviewedBy: EntityId | null;
+    rejectionReason: string | null;
+  };
+}
+
+function assertMediaVisibility(
+  media: EventMedia | undefined,
+  visibility: EventVisibilityMode | undefined,
+) {
+  if (
+    (visibility === 'code' || visibility === 'invited') &&
+    media &&
+    (media.gallery.length || media.spotlights.some((item) => item.imageUrl))
+  ) {
+    throw new InvalidOperationError(
+      'Gallery and spotlight images are currently available for public or unlisted events only',
+    );
+  }
+}
+
+function hasValidExternalContactEmail(value: string): boolean {
+  if (value.length > 254 || /\s/.test(value)) return false;
+  const at = value.indexOf('@');
+  if (at < 1 || at !== value.lastIndexOf('@') || at === value.length - 1) return false;
+  const local = value.slice(0, at);
+  const domain = value.slice(at + 1);
+  if (local.length > 64 || local.startsWith('.') || local.endsWith('.') || local.includes('..'))
+    return false;
+  const labels = domain.split('.');
+  return (
+    labels.length > 1 &&
+    labels.every(
+      (label) =>
+        label.length > 0 && label.length <= 63 && !label.startsWith('-') && !label.endsWith('-'),
+    )
+  );
+}
+
 export interface Event extends VersionedEntity {
   id: EntityId;
   organizationId: EntityId;
   venueId: EntityId | null;
+  externalLocation?: ExternalEventLocation;
   /**
    * URL-safe public identifier — V1 events always carried one and the public
    * surface addresses events by `idOrSlug`. Server-derived at create
@@ -105,11 +209,18 @@ export interface Event extends VersionedEntity {
   /** Full public description. */
   description: string;
   imageUrl: string | null;
+  /** Managed poster key retained only for grant-authorized private reads. */
+  privateImageStoragePath?: string | null;
   /** ISO-8601 timestamps. */
   startAt: string;
   endAt: string | null;
+  lastMaterialChangeAt?: string;
   status: EventStatus;
-  /** Caching visibility derived from status (public vs internal). */
+  /** Missing on legacy records means public. Private modes require a verified grant for detail. */
+  visibilityMode?: EventVisibilityMode;
+  /** Fine-grained venue address access; private legacy events fail closed. */
+  addressDisclosure?: EventAddressDisclosure;
+  /** Discovery visibility derived from event status and visibility mode. */
   isPublic: boolean;
   /** Opaque tags — presentation only. */
   tags: string[];
@@ -118,7 +229,17 @@ export interface Event extends VersionedEntity {
   isFree: boolean;
   /** Reason/meta recorded when CANCELLED. */
   cancellationReason: string | null;
+  /** Last postponement; dates remain historical until explicit rescheduling. */
+  postponement?: {
+    reason: string;
+    initiatedBy: 'host' | 'venue';
+    organizationId: EntityId;
+    at: string;
+  } | null;
+  refundPolicy?: EventRefundPolicy;
   compensation?: EventCompensation | null;
+  entryRules?: EventEntryRules;
+  media?: EventMedia;
   /**
    * Total people the room legally holds, for the door's occupancy gauge.
    *
@@ -144,16 +265,23 @@ export interface Event extends VersionedEntity {
 export interface CreateEventInput {
   id: EntityId;
   organizationId: EntityId;
-  venueId: EntityId;
+  venueId: EntityId | null;
+  externalLocation?: ExternalEventLocation;
   title: string;
   summary?: string;
   description?: string;
   imageUrl?: string | null;
+  privateImageStoragePath?: string | null;
   startAt: string;
   endAt?: string | null;
   tags?: string[];
+  refundPolicy?: EventRefundPolicy;
   compensation?: EventCompensation | null;
   capacity?: number | null;
+  visibilityMode?: EventVisibilityMode;
+  addressDisclosure?: EventAddressDisclosure;
+  entryRules?: EventEntryRules;
+  media?: EventMedia;
   now?: Date;
 }
 
@@ -186,25 +314,50 @@ function trimDashes(value: string): string {
 }
 
 export function createEvent(input: CreateEventInput): Event {
+  assertEventRefundPolicy(input.refundPolicy);
   const now = input.now ?? new Date();
+  if (input.entryRules?.reentryAllowed === true)
+    throw new InvalidOperationError('Automatic re-entry is unavailable in V1');
+  assertMediaVisibility(input.media, input.visibilityMode);
+  if ((input.venueId === null) === (input.externalLocation === undefined)) {
+    throw new InvalidOperationError('Choose either a C1RCLE Venue or an external event location');
+  }
+  if (input.externalLocation) {
+    const location = input.externalLocation;
+    if (!location.name.trim() || !location.address.trim() || !location.contact.managerName.trim())
+      throw new InvalidOperationError('External venue name, address and manager are required');
+    if (!/^\+?[\d\s()-]{10,18}$/.test(location.contact.phone.trim()))
+      throw new InvalidOperationError('Enter a valid external venue manager phone number');
+    if (location.contact.email && !hasValidExternalContactEmail(location.contact.email))
+      throw new InvalidOperationError('Enter a valid external venue manager email');
+  }
   return {
     id: input.id,
     organizationId: input.organizationId,
     venueId: input.venueId,
+    ...(input.externalLocation ? { externalLocation: input.externalLocation } : {}),
     slug: slugifyEventTitle(input.title) || input.id,
     title: input.title,
     status: 'draft',
     isPublic: false,
+    visibilityMode: input.visibilityMode ?? 'public',
+    addressDisclosure:
+      input.addressDisclosure ??
+      (input.visibilityMode === 'code' || input.visibilityMode === 'invited' ? 'hidden' : 'public'),
     summary: input.summary ?? '',
     description: input.description ?? '',
     imageUrl: input.imageUrl ?? null,
+    privateImageStoragePath: input.privateImageStoragePath ?? null,
     startAt: input.startAt,
     endAt: input.endAt ?? null,
     tags: input.tags ?? [],
     startingPricePaise: 0,
     isFree: true,
     cancellationReason: null,
+    refundPolicy: input.refundPolicy ?? { kind: 'organizer_reviewed' },
     compensation: input.compensation ?? null,
+    ...(input.entryRules === undefined ? {} : { entryRules: input.entryRules }),
+    ...(input.media === undefined ? {} : { media: input.media }),
     capacity: input.capacity ?? null,
     adminOverride: false,
     ...newVersionedEntity(now),
@@ -212,25 +365,45 @@ export function createEvent(input: CreateEventInput): Event {
 }
 
 interface EventChanges {
+  venueId?: EntityId;
   slug?: string;
   title?: string;
   summary?: string;
   description?: string;
   imageUrl?: string | null;
+  privateImageStoragePath?: string | null;
   startAt?: string;
   endAt?: string | null;
   tags?: string[];
   startingPricePaise?: number;
   isFree?: boolean;
+  refundPolicy?: EventRefundPolicy;
   compensation?: EventCompensation | null;
   capacity?: number | null;
+  visibilityMode?: EventVisibilityMode;
+  addressDisclosure?: EventAddressDisclosure;
+  entryRules?: EventEntryRules;
+  media?: EventMedia;
 }
 
 /** Controlled attribute update (no status changes here). Bumps version. */
 export function updateEvent(event: Event, changes: EventChanges, now?: Date): Event {
   assertEventMutable(event);
+  assertEventRefundPolicy(changes.refundPolicy);
+  if (changes.entryRules?.reentryAllowed === true)
+    throw new InvalidOperationError('Automatic re-entry is unavailable in V1');
   const stamped = bumpVersion(event, now ?? new Date());
-  return { ...stamped, ...changes };
+  const updated = { ...stamped, ...changes };
+  assertMediaVisibility(updated.media, updated.visibilityMode);
+  return {
+    ...updated,
+    // Preserve legacy/manual hidden state on unrelated edits. Only an explicit
+    // visibility-mode change may recompute the discovery projection.
+    isPublic:
+      changes.visibilityMode === undefined
+        ? event.isPublic
+        : computeIsPublic(updated.status, updated.visibilityMode ?? 'public'),
+  };
 }
 
 /**
@@ -257,7 +430,7 @@ export function transitionEvent(event: Event, to: EventStatus, now?: Date): Even
   return {
     ...stamped,
     status: next,
-    isPublic: computeIsPublic(next),
+    isPublic: computeIsPublic(next, event.visibilityMode ?? 'public'),
     // Any real status change clears an admin override — `adminPauseEvent`
     // re-sets it explicitly right after calling this. A self-pause or a
     // partner's own resume should never carry a stale override flag.
@@ -270,6 +443,85 @@ export function cancelEvent(event: Event, reason: string, now?: Date): Event {
   transitionStatus(event.status, 'cancelled', EVENT_TRANSITIONS);
   const stamped = bumpVersion(event, now ?? new Date());
   return { ...stamped, status: 'cancelled', isPublic: false, cancellationReason: reason };
+}
+
+/** Records an external-location decision; privileged actor checks belong to the application boundary. */
+export function decideExternalLocationReview(
+  event: Event,
+  decision: { approved: boolean; reviewerId: EntityId; reason?: string | null; now?: Date },
+): Event {
+  const location = event.externalLocation;
+  if (!location) throw new InvalidOperationError('Event has no external location to review');
+  if (location.review.status !== 'pending')
+    throw new InvalidOperationError('Only a pending external location can be reviewed');
+  const at = decision.now ?? new Date();
+  const reason = decision.reason?.trim();
+  return {
+    ...bumpVersion(event, at),
+    externalLocation: {
+      ...location,
+      review: {
+        status: decision.approved ? 'approved' : 'rejected',
+        submittedAt: location.review.submittedAt,
+        reviewedAt: at.toISOString(),
+        reviewedBy: decision.reviewerId,
+        rejectionReason: decision.approved
+          ? null
+          : reason && reason.length > 0
+            ? reason
+            : 'Please provide additional venue evidence.',
+      },
+    },
+  };
+}
+
+/** Resubmission retains the historical location snapshot and starts a fresh review cycle. */
+export function resubmitExternalLocation(
+  event: Event,
+  submission: Omit<ExternalEventLocation, 'review'>,
+  now?: Date,
+): Event {
+  const location = event.externalLocation;
+  if (!location || location.review.status !== 'rejected')
+    throw new InvalidOperationError('Only a rejected external location can be resubmitted');
+  const at = now ?? new Date();
+  return {
+    ...bumpVersion(event, at),
+    externalLocation: {
+      ...submission,
+      review: {
+        status: 'pending',
+        submittedAt: at.toISOString(),
+        reviewedAt: null,
+        reviewedBy: null,
+        rejectionReason: null,
+      },
+    },
+  };
+}
+
+/** Freeze the canonical event without erasing its last announced schedule. */
+export function postponeEvent(
+  event: Event,
+  reason: string,
+  initiatedBy: 'host' | 'venue',
+  organizationId: EntityId,
+  now: Date,
+): Event {
+  if (!reason.trim()) throw new InvalidOperationError('A postponement reason is required');
+  if (
+    event.status === 'postponed' &&
+    !(initiatedBy === 'venue' && event.postponement?.initiatedBy !== 'venue')
+  )
+    return event;
+  const updated =
+    event.status === 'postponed'
+      ? bumpVersion(event, now)
+      : transitionEvent(event, 'postponed', now);
+  return {
+    ...updated,
+    postponement: { reason: reason.trim(), initiatedBy, organizationId, at: now.toISOString() },
+  };
 }
 
 const PAUSABLE_STATUSES: readonly EventStatus[] = ['published', 'sales_paused'];
@@ -331,8 +583,14 @@ export function adminForceCompleteEvent(event: Event, now?: Date): Event {
   return { ...stamped, status: 'ended', isPublic: false, adminOverride: true };
 }
 
-function computeIsPublic(status: EventStatus): boolean {
-  return status === 'published' || status === 'sales_paused' || status === 'started';
+function computeIsPublic(
+  status: EventStatus,
+  visibilityMode: EventVisibilityMode = 'public',
+): boolean {
+  return (
+    visibilityMode === 'public' &&
+    (status === 'published' || status === 'sales_paused' || status === 'started')
+  );
 }
 
 export function isPublicStatus(status: EventStatus): boolean {

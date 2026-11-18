@@ -1,6 +1,8 @@
 import { z } from 'zod';
 
-import { opaqueIdSchema } from './shared.js';
+import { orderStatusSchema } from './checkout.js';
+import { venueOperationalEventDtoSchema } from './event.js';
+import { cursorSchema, opaqueIdSchema, pageInfoSchema, paginatedSchema } from './shared.js';
 
 /**
  * ─── Partnerships / Promoters / Referrals / Analytics ─────────────────────────
@@ -40,6 +42,13 @@ export const partnershipDtoSchema = z.object({
   venueName: z.string().min(1).max(200).nullish(),
   venueSlug: z.string().min(1).max(60).nullish(),
   venueCity: z.string().max(100).nullish(),
+  hostPhotoUrl: z.url().nullable().optional(),
+  hostCoverUrl: z.url().nullable().optional(),
+  hostBio: z.string().max(2000).optional(),
+  venuePhotoUrl: z.url().nullable().optional(),
+  venueCoverUrl: z.url().nullable().optional(),
+  venueBio: z.string().max(2000).optional(),
+  venueGenres: z.array(z.string().max(60)).max(20).optional(),
 });
 export type PartnershipDto = z.infer<typeof partnershipDtoSchema>;
 
@@ -85,6 +94,48 @@ export type SetVenueShareRequest = z.infer<typeof setVenueShareRequestSchema>;
 /* ─── Partner access context ─────────────────────────────────────────────── */
 
 export const partnerTypeSchema = z.enum(['venue', 'host', 'promoter']);
+
+/** Bounded, server-computed Promoter acquisitions and settled ticket refunds. */
+export const promoterCampaignSummaryDtoSchema = z.object({
+  linkCount: z.number().int().nonnegative(),
+  clicks: z.number().int().nonnegative(),
+  conversions: z.number().int().nonnegative(),
+  historicalRsvpConversions: z.number().int().nonnegative(),
+  activeRsvpCount: z.number().int().nonnegative(),
+  /** Backward-compatible gross attributed ticket sales alias. */
+  grossAttributedTicketRevenuePaise: z.number().int().nonnegative(),
+  grossAttributedTicketSalesPaise: z.number().int().nonnegative(),
+  refundedAttributedTicketSalesPaise: z.number().int().nonnegative(),
+  netAttributedTicketSalesPaise: z.number().int().nonnegative(),
+  refundValueComplete: z.boolean(),
+  recordedCommissionPaise: z.number().int().nonnegative(),
+  reversedCommissionPaise: z.number().int().nonnegative().nullable(),
+  complete: z.boolean(),
+  hasMoreLinks: z.boolean(),
+  hasMoreOrders: z.boolean(),
+});
+export type PromoterCampaignSummaryDto = z.infer<typeof promoterCampaignSummaryDtoSchema>;
+
+/** Privacy-minimized order projection visible only to its attributed Promoter. */
+export const promoterAttributedOrderDtoSchema = z
+  .object({
+    id: opaqueIdSchema,
+    bookingReference: z.string().nullable(),
+    eventId: opaqueIdSchema,
+    status: orderStatusSchema,
+    ticketCount: z.number().int().nonnegative(),
+    attributedTicketValuePaise: z.number().int().nonnegative(),
+    promoterCommissionPaise: z.number().int().nonnegative(),
+    attributedAt: z.iso.datetime(),
+  })
+  .strict();
+export type PromoterAttributedOrderDto = z.infer<typeof promoterAttributedOrderDtoSchema>;
+export const promoterAttributedOrderListResponseSchema = paginatedSchema(
+  promoterAttributedOrderDtoSchema,
+);
+export type PromoterAttributedOrderListResponse = z.infer<
+  typeof promoterAttributedOrderListResponseSchema
+>;
 
 export const partnerPermissionSchema = z.enum([
   'VIEW_FINANCIALS',
@@ -150,6 +201,19 @@ export const organizationOverviewDtoSchema = z.object({
 });
 export type OrganizationOverviewDto = z.infer<typeof organizationOverviewDtoSchema>;
 
+/** Source-backed organization sales totals. All amounts are integer paise. */
+export const organizationSalesBreakdownDtoSchema = z.object({
+  totalTicketsIssued: z.number().int().nonnegative(),
+  paidTickets: z.number().int().nonnegative(),
+  freeRsvpTickets: z.number().int().nonnegative(),
+  paidOrderCount: z.number().int().nonnegative(),
+  /** Captured grand totals, including fees and GST, before refunds. */
+  guestGrossCollectedPaise: z.number().int().nonnegative(),
+  /** Discounted ticket subtotals, excluding fees and GST, before refunds. */
+  ticketRevenuePaise: z.number().int().nonnegative(),
+});
+export type OrganizationSalesBreakdownDto = z.infer<typeof organizationSalesBreakdownDtoSchema>;
+
 /**
  * Bucket width for a trends series. A dashboard's ranges are genuinely
  * different shapes, not one range at three zooms: "today" wants hours, "this
@@ -173,16 +237,17 @@ export const trendBucketDtoSchema = z.object({
   revenuePaise: z.number().int().nonnegative(),
   tickets: z.number().int().nonnegative(),
   checkIns: z.number().int().nonnegative(),
+  totalTicketsIssued: z.number().int().nonnegative(),
+  paidTickets: z.number().int().nonnegative(),
+  freeRsvpTickets: z.number().int().nonnegative(),
+  paidOrderCount: z.number().int().nonnegative(),
+  guestGrossCollectedPaise: z.number().int().nonnegative(),
+  ticketRevenuePaise: z.number().int().nonnegative(),
 });
 export type TrendBucketDto = z.infer<typeof trendBucketDtoSchema>;
 
 /**
- * `totals` are lifetime totals for the scanned data, NOT the sum of `buckets`.
- *
- * The two differ whenever an order or scan falls outside the requested window,
- * and a dashboard showing "₹0 this week" beside "₹4,80,000 total" is a fair
- * reading of a clamped range — conflating them would make a legitimately
- * narrow range look like a data-loss bug.
+ * `totals` summarize only the requested window and equal the sum of `buckets`.
  */
 export const organizationTrendsDtoSchema = z.object({
   organizationId: opaqueIdSchema,
@@ -196,6 +261,12 @@ export const organizationTrendsDtoSchema = z.object({
     revenuePaise: z.number().int().nonnegative(),
     tickets: z.number().int().nonnegative(),
     checkIns: z.number().int().nonnegative(),
+    totalTicketsIssued: z.number().int().nonnegative(),
+    paidTickets: z.number().int().nonnegative(),
+    freeRsvpTickets: z.number().int().nonnegative(),
+    paidOrderCount: z.number().int().nonnegative(),
+    guestGrossCollectedPaise: z.number().int().nonnegative(),
+    ticketRevenuePaise: z.number().int().nonnegative(),
   }),
 });
 export type OrganizationTrendsDto = z.infer<typeof organizationTrendsDtoSchema>;
@@ -263,19 +334,149 @@ export const eventAnalyticsDtoSchema = z.object({
   totalRevenuePaise: z.number().int().nonnegative(),
   ticketsSold: z.number().int().nonnegative(),
   totalCheckIns: z.number().int().nonnegative(),
-  capacity: z.number().int().nonnegative(),
+  totalTicketInventory: z.number().int().nonnegative(),
+  capacity: z.number().int().nonnegative().nullable(),
   views: z.number().int().nonnegative(),
   guestlistSignups: z.number().int().nonnegative(),
   avgTicketPricePaise: z.number().int().nonnegative(),
-  occupancyRate: ratio(),
-  sellThroughRate: ratio(),
+  occupancyRate: ratio().nullable(),
+  sellThroughRate: ratio().nullable(),
   refundAmountPaise: z.number().int().nonnegative(),
   refundRate: ratio(),
-  noShowRate: ratio(),
+  noShowRate: ratio().nullable(),
   repeatGuests: z.number().int().nonnegative(),
   conversionRate: ratio(),
 });
 export type EventAnalyticsDto = z.infer<typeof eventAnalyticsDtoSchema>;
+
+const venueOperationalCountSchema = z.number().int().nonnegative();
+const venueCapacityUtilizationSchema = z.number().nonnegative().nullable();
+
+export const venueOperationalOverviewDtoSchema = z
+  .object({
+    summary: z
+      .object({
+        eventsTonight: venueOperationalCountSchema,
+        upcomingEvents: venueOperationalCountSchema,
+        ticketUnitsIssued: venueOperationalCountSchema,
+        rsvpUnitsIssued: venueOperationalCountSchema,
+        expectedGuests: venueOperationalCountSchema,
+        checkedInGuests: venueOperationalCountSchema,
+        physicalVenueCapacity: venueOperationalCountSchema,
+        expectedOccupancyPercent: venueCapacityUtilizationSchema,
+        complete: z.boolean(),
+      })
+      .strict(),
+    upcomingEvents: z.array(venueOperationalEventDtoSchema).max(5),
+  })
+  .strict();
+export type VenueOperationalOverviewDto = z.infer<typeof venueOperationalOverviewDtoSchema>;
+
+export const venueOperationalAnalyticsDtoSchema = z
+  .object({
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    timeZone: z.literal('Asia/Kolkata'),
+    summary: z
+      .object({
+        eventCount: venueOperationalCountSchema,
+        ticketUnitsIssued: venueOperationalCountSchema,
+        rsvpUnitsIssued: venueOperationalCountSchema,
+        expectedGuests: venueOperationalCountSchema,
+        checkedInGuests: venueOperationalCountSchema,
+        physicalVenueCapacity: venueOperationalCountSchema,
+        expectedOccupancyPercent: venueCapacityUtilizationSchema,
+        complete: z.boolean(),
+      })
+      .strict(),
+    days: z
+      .array(
+        z
+          .object({
+            date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+            eventCount: venueOperationalCountSchema,
+            ticketUnitsIssued: venueOperationalCountSchema,
+            rsvpUnitsIssued: venueOperationalCountSchema,
+            expectedGuests: venueOperationalCountSchema,
+            checkedInGuests: venueOperationalCountSchema,
+            physicalVenueCapacity: venueOperationalCountSchema,
+            expectedOccupancyPercent: venueCapacityUtilizationSchema,
+          })
+          .strict(),
+      )
+      .max(366),
+    events: z.array(venueOperationalEventDtoSchema).max(10_000),
+  })
+  .strict();
+export type VenueOperationalAnalyticsDto = z.infer<typeof venueOperationalAnalyticsDtoSchema>;
+
+/** Historical successful bookings by weekday/hour in product time. */
+export const eventBookingHeatmapDtoSchema = z
+  .object({
+    eventId: opaqueIdSchema,
+    timeZone: z.literal('Asia/Kolkata'),
+    weekdays: z
+      .array(
+        z
+          .object({
+            day: z.enum(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']),
+            hours: z.array(z.number().int().nonnegative()).length(24),
+          })
+          .strict(),
+      )
+      .length(7),
+    totalBookings: z.number().int().nonnegative(),
+    complete: z.boolean(),
+  })
+  .strict();
+export type EventBookingHeatmapDto = z.infer<typeof eventBookingHeatmapDtoSchema>;
+
+/**
+ * Event-level Promoter attribution analytics. Historical acquisition and
+ * current refund/RSVP outcomes remain separate.
+ */
+export const eventPromoterAnalyticsDtoSchema = z.object({
+  eventId: opaqueIdSchema,
+  complete: z.boolean(),
+  refundValueComplete: z.boolean(),
+  historicalConversionCount: z.number().int().nonnegative(),
+  historicalRsvpConversionCount: z.number().int().nonnegative(),
+  activeRsvpCount: z.number().int().nonnegative(),
+  capturedTicketCount: z.number().int().nonnegative(),
+  attributedTicketCount: z.number().int().nonnegative(),
+  attributedTicketValuePaise: z.number().int().nonnegative(),
+  grossAttributedTicketValuePaise: z.number().int().nonnegative(),
+  refundedAttributedTicketValuePaise: z.number().int().nonnegative(),
+  netAttributedTicketValuePaise: z.number().int().nonnegative(),
+  recordedCommissionPaise: z.number().int().nonnegative(),
+  reversedCommissionPaise: z.number().int().nonnegative().nullable(),
+  /** @deprecated Historical meaning is ticket value less recorded commission. */
+  netAttributedValuePaise: z.number().int(),
+  commissionPayableBalancePaise: z.number().int(),
+  liabilityComplete: z.boolean(),
+  liabilityReadModel: z.enum(['legacy_ledger_v1', 'financial_journal_v2']),
+  items: z.array(
+    z.object({
+      promoterOrganizationId: opaqueIdSchema,
+      attributedOrderCount: z.number().int().nonnegative(),
+      historicalRsvpConversionCount: z.number().int().nonnegative(),
+      activeRsvpCount: z.number().int().nonnegative(),
+      attributedTicketCount: z.number().int().nonnegative(),
+      attributedTicketValuePaise: z.number().int().nonnegative(),
+      grossAttributedTicketValuePaise: z.number().int().nonnegative(),
+      refundedAttributedTicketValuePaise: z.number().int().nonnegative(),
+      netAttributedTicketValuePaise: z.number().int().nonnegative(),
+      recordedCommissionPaise: z.number().int().nonnegative(),
+      reversedCommissionPaise: z.number().int().nonnegative().nullable(),
+      /** @deprecated Historical meaning is ticket value less recorded commission. */
+      netAttributedValuePaise: z.number().int(),
+      commissionPayableBalancePaise: z.number().int(),
+      liabilityComplete: z.boolean(),
+      liabilityReadModel: z.enum(['legacy_ledger_v1', 'financial_journal_v2']),
+    }),
+  ),
+});
+export type EventPromoterAnalyticsDto = z.infer<typeof eventPromoterAnalyticsDtoSchema>;
 
 /* ─── Promoter referral links ────────────────────────────────────────────── */
 
@@ -302,6 +503,9 @@ export const referralLinkDtoSchema = z.object({
         .optional(),
     })
     .nullable(),
+  commissionPolicyVersion: z.string().nullable(),
+  commercialPolicyVersion: z.string().nullable(),
+  eligibleTierIds: z.array(opaqueIdSchema).nullable(),
   attributionSignature: z.string().nullable(),
   eventTitle: z.string(),
   campaignLabel: z.string(),
@@ -312,6 +516,7 @@ export const referralLinkDtoSchema = z.object({
   isActive: z.boolean(),
   /** Vanity counters. The authoritative attribution lives on the order. */
   clicks: z.number().int().nonnegative(),
+  lastClickedAt: z.iso.datetime().nullable(),
   conversions: z.number().int().nonnegative(),
   revenuePaise: z.number().int().nonnegative(),
   commissionPaise: z.number().int().nonnegative(),
@@ -320,6 +525,14 @@ export const referralLinkDtoSchema = z.object({
   updatedAt: z.iso.datetime(),
 });
 export type ReferralLinkDto = z.infer<typeof referralLinkDtoSchema>;
+
+export const promoterReferralLinkListResponseSchema = z.object({
+  items: z.array(referralLinkDtoSchema),
+  pageInfo: pageInfoSchema.extend({ nextCursor: cursorSchema.nullable() }),
+});
+export type PromoterReferralLinkListResponse = z.infer<
+  typeof promoterReferralLinkListResponseSchema
+>;
 
 export const createReferralLinkSchema = z
   .object({
@@ -388,6 +601,14 @@ export const promoterConnectionDtoSchema = z.object({
   targetName: z.string().min(1).max(200).nullish(),
   targetSlug: z.string().min(1).max(60).nullish(),
   targetCity: z.string().max(100).nullish(),
+  promoterPhotoUrl: z.url().nullable().optional(),
+  promoterCoverUrl: z.url().nullable().optional(),
+  promoterBio: z.string().max(2000).optional(),
+  promoterGenres: z.array(z.string().max(60)).max(20).optional(),
+  targetPhotoUrl: z.url().nullable().optional(),
+  targetCoverUrl: z.url().nullable().optional(),
+  targetBio: z.string().max(2000).optional(),
+  targetGenres: z.array(z.string().max(60)).max(20).optional(),
 });
 export type PromoterConnectionDto = z.infer<typeof promoterConnectionDtoSchema>;
 
@@ -429,6 +650,14 @@ export const discoverPartnerDtoSchema = z.object({
   organizationId: opaqueIdSchema.nullable(),
   /** Venue id behind a venue candidate (the partnership request key). */
   venueId: opaqueIdSchema.nullable(),
+  photoUrl: z.url().nullable().optional(),
+  coverUrl: z.url().nullable().optional(),
+  bio: z.string().max(2000).optional(),
+  genres: z.array(z.string().max(60)).max(20).optional(),
+  stats: z
+    .array(z.object({ label: z.string().max(80), value: z.string().max(40) }))
+    .max(4)
+    .optional(),
 });
 export type DiscoverPartnerDto = z.infer<typeof discoverPartnerDtoSchema>;
 
@@ -439,3 +668,33 @@ export const discoverPartnersQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 export type DiscoverPartnersQuery = z.infer<typeof discoverPartnersQuerySchema>;
+
+/** Tenant-scoped global search results. Guest and order identities are excluded by design. */
+export const partnerGlobalSearchQuerySchema = z.object({
+  q: z.string().trim().min(2).max(120),
+  studio: z.enum(['host', 'venue']).optional(),
+});
+export const partnerGlobalSearchResultSchema = z.object({
+  id: opaqueIdSchema,
+  type: z.enum(['event', 'partner']),
+  title: z.string().min(1).max(200),
+  subtitle: z.string().max(200),
+});
+export const partnerGlobalSearchResponseSchema = z.object({
+  results: z.array(partnerGlobalSearchResultSchema).max(12),
+});
+export type PartnerGlobalSearchQuery = z.infer<typeof partnerGlobalSearchQuerySchema>;
+export type PartnerGlobalSearchResponse = z.infer<typeof partnerGlobalSearchResponseSchema>;
+
+export const eventComparisonItemSchema = z.object({
+  eventId: opaqueIdSchema,
+  title: z.string().min(1).max(200),
+  startAt: z.iso.datetime(),
+  status: z.enum(['current', 'final']),
+  analytics: eventAnalyticsDtoSchema,
+});
+export const eventComparisonResponseSchema = z.object({
+  current: eventComparisonItemSchema,
+  previous: z.array(eventComparisonItemSchema).max(5),
+});
+export type EventComparisonResponse = z.infer<typeof eventComparisonResponseSchema>;

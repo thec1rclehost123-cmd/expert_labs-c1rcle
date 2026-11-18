@@ -1,0 +1,74 @@
+# Client IP and origin verification. Rendered into conf.d by
+# deploy/docker/nginx-entrypoint.sh for every profile and topology.
+#
+# Problem: behind a platform proxy the socket peer ($remote_addr) is the
+# platform's hop, identical for every visitor, so per-client rate limits and
+# audit IPs collapse into one bucket. A header that says "the client is X" is
+# worthless on its own, because anyone can send it.
+#
+# Mechanism: Cloudflare (which really does know the visitor's address) is
+# configured to stamp two request headers on this API's hostname:
+#   X-Origin-Verify  a secret only Cloudflare and this container know
+#   X-C1-Client-IP   the visitor's address (Cloudflare's ip.src)
+# The address is believed ONLY when the secret matches, and only when it is a
+# well-formed IP. Anything else (no secret, wrong secret, or the secret with a
+# malformed address) falls back to the socket peer, so a forged header changes
+# nothing. A request that reaches the origin directly, around Cloudflare, can
+# never carry the secret.
+#
+# With NGINX_ORIGIN_VERIFY_SECRET unset the secret map is empty and this is a
+# no-op: $c1rcle_client_ip is just $remote_addr, exactly as before.
+
+map $http_x_origin_verify $c1rcle_origin_verified {
+    default 0;
+${NGINX_ORIGIN_VERIFY_MAP_ENTRIES}
+}
+
+map "$c1rcle_origin_verified:$http_x_c1_client_ip" $c1rcle_client_ip {
+    default $remote_addr;
+    "~^1:(?<c1rcle_verified_ip>[0-9A-Fa-f:.]{2,45})$" $c1rcle_verified_ip;
+}
+
+# The address that goes into the access log is anonymised: IPv4 to its /24
+# (203.0.113.77 -> 203.0.113.0) and IPv6 to its /48. Access logs are retained
+# by the platform and a client address is personal data; the full address is
+# still what the rate limits key on and what Fastify receives (for abuse
+# handling), but a log line only needs the network to show where traffic comes
+# from. Anything that does not parse as either shape is logged as "redacted"
+# rather than passed through.
+map $c1rcle_client_ip $c1rcle_client_ip_logged {
+    default "redacted";
+    "~^(?<c1rcle_v4_net>[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\.[0-9]{1,3}$" "$c1rcle_v4_net.0";
+    "~^(?<c1rcle_v6_net>[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}):[0-9A-Fa-f:]+$" "$c1rcle_v6_net::";
+}
+
+# Hostnames that must arrive through Cloudflare. A request for one of these
+# without a valid X-Origin-Verify is refused (403) by the server block, which
+# closes the "skip Cloudflare and hit the origin directly" bypass.
+map $host $c1rcle_origin_locked_host {
+    default 0;
+${NGINX_ORIGIN_LOCKED_MAP_ENTRIES}
+}
+
+# 1 only for a locked host that did NOT present a valid secret. nginx's `if`
+# takes a single variable, so the facts are combined here.
+#
+# One deliberate exception: GET and HEAD of exactly /api/v2/internal/health.
+# The platform's own health checker (Render) probes the service through its
+# custom domain, so the Host is a locked name, and it cannot send a secret it
+# does not know. Without this exception a locked deployment never passes its
+# health check and every deploy fails after ~15 minutes with "update_failed",
+# leaving the previous version running (this happened on 2026-11-04). The path
+# answers only {ok, uptime}; /internal/readiness and /internal/version stay
+# behind their own token, and every other path on a locked host stays refused.
+#
+# nginx evaluates exact map keys before regular expressions regardless of
+# order, so the two exact keys below win over the "~^1:0:" catch-all.
+# `$uri` is the normalised path (percent-decoding and "../" resolved, query
+# string removed), so a crafted path cannot be mistaken for the health path.
+map "$c1rcle_origin_locked_host:$c1rcle_origin_verified:$request_method:$uri" $c1rcle_origin_blocked {
+    default 0;
+    "~^1:0:" 1;
+    "1:0:GET:/api/v2/internal/health" 0;
+    "1:0:HEAD:/api/v2/internal/health" 0;
+}

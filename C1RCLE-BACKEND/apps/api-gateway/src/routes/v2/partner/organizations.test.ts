@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { createOrganization } from '@c1rcle/core/domain';
+import { type MemoryUserAccountRepository } from '@c1rcle/core/infrastructure';
+import { describe, expect, it, vi } from 'vitest';
 
+import { createV2Services } from '../../../lib/v2-services.js';
 import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
 
 import partnerOrganizationRoutes from './organizations.js';
@@ -7,27 +10,34 @@ import partnerOrganizationRoutes from './organizations.js';
 const buildServer = () => buildPartnerTestServer({ routes: [partnerOrganizationRoutes] });
 
 const VALID_HEADERS = { 'x-organization-id': 'org_1' };
+function seedRecipient(id: string, email: string, emailVerified = true) {
+  (createV2Services().repos().users as MemoryUserAccountRepository).save({
+    id,
+    email,
+    emailVerified,
+    name: 'Synthetic invitee',
+    image: null,
+    role: 'partner',
+    createdAt: 0,
+    updatedAt: 0,
+  });
+}
+
 const CREATE_HEADERS = { 'x-organization-id': 'org_1', 'idempotency-key': 'idem-org-1' };
 
 describe('V2 partners organizations slice', () => {
-  it('creates an organization and returns the canonical DTO', async () => {
+  it('denies direct organization provisioning before KYC approval', async () => {
     const server = await buildServer();
+    const create = vi.spyOn(createV2Services().organizations, 'create');
     const response = await server.inject({
       method: 'POST',
       url: '/organizations',
       headers: CREATE_HEADERS,
-      payload: { name: 'Skyline Events', slug: 'skyline-events' },
+      payload: { name: 'Unreviewed applicant', slug: 'unreviewed' },
     });
-    expect(response.statusCode).toBe(201);
-    const body = response.json();
-    expect(body).toMatchObject({
-      name: 'Skyline Events',
-      slug: 'skyline-events',
-      role: 'owner',
-      status: 'active',
-      version: 1,
-    });
-    expect(typeof body.id).toBe('string');
+    expect(response.statusCode).toBe(403);
+    expect(create).not.toHaveBeenCalled();
+    create.mockRestore();
     await server.close();
   });
 
@@ -72,15 +82,15 @@ function nextOrgKey() {
   return `idem-org-${orgSeq}`;
 }
 
-async function createOrg(server: Awaited<ReturnType<typeof buildServer>>) {
-  const response = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: { 'idempotency-key': nextOrgKey() },
-    payload: { name: 'Skyline Events', slug: 'skyline-events' },
+async function createOrg(_server: Awaited<ReturnType<typeof buildServer>>) {
+  const org = createOrganization({
+    id: nextOrgKey(),
+    name: 'Skyline Events',
+    slug: 'skyline-events',
+    ownerId: 'user_1',
   });
-  expect(response.statusCode).toBe(201);
-  return response.json();
+  await createV2Services().repos().organizations.save(org);
+  return org;
 }
 
 describe('V2 partners organizations slice — read, update, members', () => {
@@ -270,6 +280,55 @@ describe('V2 partners organizations slice — invitations', () => {
     await server.close();
   });
 
+  it('resends a pending door-staff invitation, and refuses once it is revoked', async () => {
+    const server = await buildServer();
+    const { id } = await createOrg(server);
+    const created = await server.inject({
+      method: 'POST',
+      url: `/organizations/${id}/invitations`,
+      headers: { 'x-organization-id': id, 'idempotency-key': nextOrgKey() },
+      payload: { email: 'gate.one@acme.test', role: 'gate_staff' },
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject({ role: 'gate_staff', status: 'pending' });
+    const invitationId = created.json().id as string;
+
+    const resent = await server.inject({
+      method: 'POST',
+      url: `/invitations/${invitationId}/resend`,
+      headers: { 'x-organization-id': id, 'idempotency-key': nextOrgKey() },
+    });
+    expect(resent.statusCode).toBe(200);
+    expect(resent.json()).toMatchObject({ id: invitationId, status: 'pending' });
+
+    await server.inject({
+      method: 'POST',
+      url: `/invitations/${invitationId}/revoke`,
+      headers: { 'x-organization-id': id, 'idempotency-key': nextOrgKey() },
+    });
+    const afterRevoke = await server.inject({
+      method: 'POST',
+      url: `/invitations/${invitationId}/resend`,
+      headers: { 'x-organization-id': id, 'idempotency-key': nextOrgKey() },
+    });
+    expect(afterRevoke.statusCode).toBeGreaterThanOrEqual(400);
+    expect(afterRevoke.statusCode).toBeLessThan(500);
+    await server.close();
+  });
+
+  it('never accepts the owner role on an invitation', async () => {
+    const server = await buildServer();
+    const { id } = await createOrg(server);
+    const created = await server.inject({
+      method: 'POST',
+      url: `/organizations/${id}/invitations`,
+      headers: { 'x-organization-id': id, 'idempotency-key': nextOrgKey() },
+      payload: { email: 'boss@acme.test', role: 'owner' },
+    });
+    expect(created.statusCode).toBe(422);
+    await server.close();
+  });
+
   it('accepts an invitation as the invitee and joins the org', async () => {
     const server = await buildServer();
     const { id } = await createOrg(server);
@@ -281,6 +340,7 @@ describe('V2 partners organizations slice — invitations', () => {
     });
     expect(created.statusCode).toBe(201);
 
+    seedRecipient('user_2', 'joining@acme.test');
     const accepted = await server.inject({
       method: 'POST',
       url: `/invitations/${created.json().id}/accept`,
@@ -302,6 +362,7 @@ describe('V2 partners organizations slice — invitations', () => {
     });
     expect(created.statusCode).toBe(201);
 
+    seedRecipient('user_3', 'again@acme.test');
     const first = await server.inject({
       method: 'POST',
       url: `/invitations/${created.json().id}/accept`,
@@ -312,10 +373,50 @@ describe('V2 partners organizations slice — invitations', () => {
     const second = await server.inject({
       method: 'POST',
       url: `/invitations/${created.json().id}/accept`,
-      headers: { 'x-user-id': 'user_4' },
+      headers: { 'x-user-id': 'user_3' },
     });
     expect(second.statusCode).toBe(400);
     expect(second.json()).toMatchObject({ code: 'validation', status: 400 });
     await server.close();
   });
+});
+
+describe('invitation acceptance recipient authorization', () => {
+  it.each([false, true])(
+    'rejects wrong or unverified recipient (verified=%s)',
+    async (verified) => {
+      const server = await buildServer();
+      try {
+        const { id } = await createOrg(server);
+        const created = await server.inject({
+          method: 'POST',
+          url: `/organizations/${id}/invitations`,
+          headers: { 'x-organization-id': id, 'idempotency-key': nextOrgKey() },
+          payload: { email: 'bound@example.invalid', role: 'manager' },
+        });
+        expect(created.statusCode).toBe(201);
+        seedRecipient(
+          'wrong-recipient',
+          verified ? 'wrong@example.invalid' : 'bound@example.invalid',
+          verified,
+        );
+        const denied = await server.inject({
+          method: 'POST',
+          url: `/invitations/${created.json().id}/accept`,
+          headers: { 'x-user-id': 'wrong-recipient' },
+          payload: { userId: 'intended', email: 'bound@example.invalid', emailVerified: true },
+        });
+        expect(denied.statusCode).toBe(403);
+        expect(denied.json()).toMatchObject({ code: 'forbidden', status: 403 });
+        expect(
+          (await createV2Services().repos().invitations.getById(created.json().id))?.status,
+        ).toBe('pending');
+        expect(
+          await createV2Services().repos().organizations.getMember(id, 'wrong-recipient'),
+        ).toBeNull();
+      } finally {
+        await server.close();
+      }
+    },
+  );
 });

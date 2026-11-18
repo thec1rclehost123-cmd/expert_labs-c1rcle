@@ -19,8 +19,19 @@ import type {
 export interface PaidCheckoutDeps {
   createHold(input: {
     eventId: string;
-    lines: { tierId: string; quantity: number }[];
+    lines: {
+      tierId: string;
+      quantity: number;
+      accessGrantId?: string;
+      eligibilityAttested?: boolean;
+      ticketAddons?: { addonId: string; quantityPerEntitlement: number }[];
+    }[];
     idempotencyKey: string;
+    promoCode?: string | null;
+    referralCode?: string | null;
+    referralContextTokens?: readonly string[];
+    upgradeFromEntitlementId?: string;
+    attendee?: { name: string; email: string; phone?: string };
   }): Promise<CheckoutHoldResponse>;
   createAttempt(input: { holdId: string; idempotencyKey: string }): Promise<PaymentAttemptResponse>;
   openCheckout(args: OpenCheckoutArgs): Promise<RazorpayOutcome>;
@@ -31,29 +42,54 @@ export interface PaidCheckoutDeps {
     signature: string;
     idempotencyKey: string;
   }): Promise<PaymentConfirmResponse>;
-  /** Resolves true once the buyer has a ticket for the event, false if it never appears. */
-  waitForTickets(eventId: string): Promise<boolean>;
+  /** Resolves true only when this hold is authoritatively fulfilled. */
+  waitForTickets(eventId: string, holdId: string): Promise<boolean>;
 }
 
 export interface PaidCheckoutInput {
   readonly eventId: string;
   readonly eventTitle: string;
-  readonly lines: readonly { tierId: string; quantity: number }[];
+  readonly lines: readonly {
+    tierId: string;
+    quantity: number;
+    accessGrantId?: string;
+    eligibilityAttested?: boolean;
+    ticketAddons?: { addonId: string; quantityPerEntitlement: number }[];
+  }[];
   /** The total the buyer was shown; a hold priced differently stops for re-confirmation. */
   readonly expectedTotalPaise: number;
+  /** Version of the server-owned policy shown with the quote, absent for legacy quotes. */
+  readonly expectedFeePolicyVersion?: string;
   /** One per checkout attempt, so a double-click or retry replays rather than repeats. */
   readonly idempotencyKey: string;
+  readonly promoCode?: string | null;
+  readonly referralCode?: string | null;
+  readonly referralContextTokens?: readonly string[];
+  readonly upgradeFromEntitlementId?: string;
+  readonly attendee?: { name: string; email: string; phone?: string };
   readonly prefill?: { name?: string; email?: string; contact?: string };
+  /** A waitlist offer has already reserved inventory and must not create a second hold. */
+  readonly reservedHold?: CheckoutHoldResponse;
 }
+
+export const PAYMENT_SUPPORT_MESSAGE =
+  'We could not reconcile the existing checkout automatically. Contact support before trying again. No replacement payment has been started; keep this checkout available for support.';
 
 export type PaidCheckoutResult =
   | { readonly kind: 'confirmed'; readonly orderId: string }
   /** Paid, but the server has not confirmed yet; the webhook will finish the job. */
-  | { readonly kind: 'processing'; readonly ticketsReady: boolean }
-  | { readonly kind: 'price_changed'; readonly grandTotalPaise: number }
-  /** The payment was captured but could not be honoured, and has been refunded in full. */
+  | { readonly kind: 'processing'; readonly ticketsReady: boolean; readonly orderId?: string }
+  | {
+      readonly kind: 'price_changed';
+      readonly grandTotalPaise: number;
+      readonly feePolicyChanged?: boolean;
+    }
+  /** Captured money has a durable refund request; provider settlement is still pending. */
+  | { readonly kind: 'refund_pending'; readonly message: string; readonly orderId?: string }
+  /** Authoritative server evidence confirms the completed refund. */
   | { readonly kind: 'refunded'; readonly message: string }
   | { readonly kind: 'cancelled'; readonly reason?: string }
+  | { readonly kind: 'requires_support'; readonly message: string }
   | { readonly kind: 'unavailable' }
   | { readonly kind: 'error'; readonly message: string };
 
@@ -73,13 +109,31 @@ export async function runPaidCheckout(
   let hold: CheckoutHoldResponse;
   let attempt: PaymentAttemptResponse;
   try {
-    hold = await deps.createHold({
-      eventId: input.eventId,
-      lines: input.lines.map((line) => ({ ...line })),
-      idempotencyKey: `${input.idempotencyKey}-hold`,
-    });
+    hold =
+      input.reservedHold ??
+      (await deps.createHold({
+        eventId: input.eventId,
+        lines: input.lines.map((line) => ({ ...line })),
+        idempotencyKey: `${input.idempotencyKey}-hold`,
+        ...(input.promoCode ? { promoCode: input.promoCode } : {}),
+        ...(input.referralCode ? { referralCode: input.referralCode } : {}),
+        ...(input.referralContextTokens?.length
+          ? { referralContextTokens: input.referralContextTokens }
+          : {}),
+        ...(input.upgradeFromEntitlementId
+          ? { upgradeFromEntitlementId: input.upgradeFromEntitlementId }
+          : {}),
+        ...(input.attendee ? { attendee: input.attendee } : {}),
+      }));
     if (hold.pricing.grandTotalPaise !== input.expectedTotalPaise) {
       return { kind: 'price_changed', grandTotalPaise: hold.pricing.grandTotalPaise };
+    }
+    if (hold.pricing.feePolicy?.version !== input.expectedFeePolicyVersion) {
+      return {
+        kind: 'price_changed',
+        grandTotalPaise: hold.pricing.grandTotalPaise,
+        feePolicyChanged: true,
+      };
     }
     attempt = await deps.createAttempt({
       holdId: hold.holdId,
@@ -121,6 +175,20 @@ export async function runPaidCheckout(
       signature: outcome.signature,
       idempotencyKey: `${input.idempotencyKey}-verify`,
     });
+    if (confirmed.order.status === 'refund_requested')
+      return {
+        kind: 'refund_pending',
+        orderId: confirmed.order.id,
+        message:
+          'Your payment was received. A refund request is pending. Review, required approvals and provider confirmation must complete before it is shown as refunded.',
+      };
+    if (confirmed.order.status === 'refunded')
+      return {
+        kind: 'refunded',
+        message: 'The server confirmed your refund. No admission is available for this payment.',
+      };
+    if (confirmed.order.status !== 'paid' || confirmed.order.fulfillmentState === 'pending')
+      return { kind: 'processing', ticketsReady: false, orderId: confirmed.order.id };
     return { kind: 'confirmed', orderId: confirmed.order.id };
   } catch (error) {
     // The server may have answered "your payment arrived too late, the seats are
@@ -130,7 +198,10 @@ export async function runPaidCheckout(
     if (refund) return refund;
     // Any other failure of the redirect confirmation: the money moved and
     // Razorpay's webhook confirms the same payment independently. Wait for it.
-    return { kind: 'processing', ticketsReady: await deps.waitForTickets(input.eventId) };
+    return {
+      kind: 'processing',
+      ticketsReady: await deps.waitForTickets(input.eventId, hold.holdId),
+    };
   }
 }
 
@@ -143,12 +214,24 @@ function refundOutcome(error: unknown): PaidCheckoutResult | null {
   if (typeof error !== 'object' || error === null) return null;
   const { status } = errorFacts(error);
   const message = 'message' in error && typeof error.message === 'string' ? error.message : '';
-  if (status === 409 && /refund/i.test(message)) return { kind: 'refunded', message };
+  if (status === 409 && /refund/i.test(message) && /pending|review|approval|queued/i.test(message))
+    return { kind: 'refund_pending', message };
+  if (status === 409 && /has been refunded in full/i.test(message))
+    return { kind: 'refunded', message };
   return null;
 }
 
 function failureBeforePayment(error: unknown): PaidCheckoutResult {
   const { status, code } = errorFacts(error);
+  const message =
+    typeof error === 'object' &&
+    error !== null &&
+    'message' in error &&
+    typeof error.message === 'string'
+      ? error.message
+      : '';
+  if (status !== undefined && status >= 400 && status < 500 && /\brequires_support\b/.test(message))
+    return { kind: 'requires_support', message: PAYMENT_SUPPORT_MESSAGE };
   if (status === 503) return { kind: 'unavailable' };
   if (status === 409 || code === 'conflict') {
     return {

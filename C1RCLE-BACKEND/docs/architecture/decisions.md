@@ -155,7 +155,7 @@
 
 - **Date / Status:** 2026-08-13 · confirmed by user
 - **Context:** While this session was mid-flight, a different contributor
-  (an earlier contributor, working with an AI assistant) pushed
+  (a teammate, `dev@example.com`, co-authored with Claude Opus 5) pushed
   an independent, thorough implementation of the same B08–B12 scope directly
   to `origin/main` (commit `80cca2c`). It diverged architecturally in real
   ways: SQLite (`node:sqlite`) instead of Firestore for durable storage
@@ -173,7 +173,7 @@
   both independently-found bug fixes (D-009, D-010).
 - **Deliberately NOT ported this pass:** the SQLite adapter itself
   (`infrastructure/sqlite/`, 462 lines, keyset pagination — a different
-  scheme than this repo's offset-based `paginateQuery`) and another contributor.s
+  scheme than this repo's offset-based `paginateQuery`) and a teammate's
   `repository-contract.ts` multi-adapter test-suite pattern. A rushed port of
   a storage engine under time pressure is exactly the kind of change that
   should not be rushed; this is tracked as real, available, valuable work
@@ -186,7 +186,7 @@
   renamed the same core abstractions (event bus, outbox, service locator)
   differently enough that automatic conflict resolution risked producing
   inconsistent code. Reconciliation was done by hand-reviewing and adapting
-  another contributor.s additions onto this session's foundation instead.
+  a teammate's additions onto this session's foundation instead.
 
 ## D-012 · Policy order: rate-limit → validate → authorize → cache
 
@@ -483,7 +483,7 @@ traceable, not deleted):
   | C-7 | CSRF | "frontend / thin-BFF concern, not the gateway" (PLAN:125 lists cookies + CSRF as an approved Next.js BFF use case); gateway has none | gateway relies on Bearer + CORS-credentials + SameSite; prod cross-domain "needs revisit" (D-001) | **A minimal Next.js BFF owns the cookie/CSRF surface.** Doc-sanctioned; also fixes the unresolved prod cross-domain cookie problem (BFF re-scopes the session cookie to the FE origin, host-only). |
   | C-8 | Idempotency key | "one key per user **intent**, not per network retry" (RM:407, PLAN:293) | current partial FE wiring mints a fresh UUID per HTTP call — wrong | **Key minted at the user-action call site**, stable across the client's internal retries. |
   | C-9 | Runtime route truth | `route-manifest.ts` doc says only 3 ACTIVE routes | ~80 routes registered; `apps/api-gateway/src/routes/v2/route-manifest.ts` + route files are truth | **The code manifest is truth.** The doc manifest is stale. |
-  | C-10 | `role` on the user | V1 role soup (`user`/`onboarding`/`partner`/`venue`/`host`/…) | V2 `role ∈ {guest, partner, admin}`, server-set; `/auth/signup` forces `partner` | **`{guest, partner, admin}`.** Per-org capability/role is a **separate** concern resolved from `GET /organizations/:id/access`, never from the token. |
+  | C-10 | `role` on the user | V1 role soup (`user`/`onboarding`/`partner`/`venue`/`host`/…) | V2 `role ∈ {guest, partner, admin}`, server-set; `/auth/signup` creates `guest`; `/auth/partner/signup` creates `partner` (Milestone 1, Packet 1.4) | **`{guest, partner, admin}`.** Signup bodies cannot select roles. Partner classification grants no organization membership. Per-org capability/role is a **separate** concern resolved from `GET /organizations/:id/access`, never from the token. |
 
 - **Backend changes that land with this decision (this slice's Phase 1, one commit, separate from the Phase 5 door/ WIP):**
   1. `packages/contracts` builds to `dist/**` (JS + `.d.ts`); `package.json` gains `main`/`types`/`files` + a dist-pointing `exports` alternative so an external consumer can resolve built output while in-repo consumers keep resolving `src/`.
@@ -826,3 +826,37 @@ traceable, not deleted):
   3. **Object-level poster ACL.** `UploadUrlRequest` gains `visibility: 'private' | 'public'` (default private). A `'public'` request signs `x-goog-acl: public-read` into the v4 PUT (`extensionHeaders` **and** the returned PUT headers), so the browser's upload sets **that object's** ACL — the bucket, and every KYC/private object, stay credential-only. `issuePosterUploadUrl` opts in; the onboarding KYC flow stays private-by-default. `EchoObjectStorage` mirrors the header for memory-driver parity.
   4. **`maxPerUser` enforced at hold time.** `createHold` now loads each line's tier and, when a stable buyer id exists (`actor.userId` — guests on this platform carry an `x-user-id`), counts what the user already holds (live cart reservations: `CartReservationRepository.countActiveQuantity`) and owns (paid orders only: `OrderRepository.countPaidQuantityByUserAndEvent`) for that `(user, event, tier)`, rejecting when `held + bought + requested > maxPerUser`. Both counts are single-field `userId` equality queries filtered in application code — no new composite indexes. A guest with **no** identity at all falls through (documented in code): there is no stable key to count against, and v1 never enforced a per-user tier cap either.
 - **Why:** Each failure broke a documented invariant (bounded reads B-x, no lost updates D-015, no PII exposure D-018, wiring honest to its schema). The fixes preserve the frozen wire contract — every change is additive (new optional fields, new repo methods) and the DTO shapes are byte-identical, so the frontend mirror only needs its standard `scripts/export-contracts.mjs` regeneration, not a contract break.
+
+## Milestone 1, Packet 1.6 — runtime account and organization access (2026-11-03)
+
+The approved suspension policy blocks organization access while retaining sign-out
+and independently authorized platform-admin recovery. Runtime enforcement reads
+persisted state, rather than relying on the Admin directory's status display:
+
+- The Gateway authentication boundary checks `v2_user_bans` on authenticated
+  requests. Banned accounts receive a generic 403; unavailable ban state fails
+  closed with a generic 503. Sign-out remains available.
+- Better Auth's session-create hook refuses new sessions for banned accounts and
+  fails closed if ban state cannot be read. Existing authentication error
+  normalization remains in place; no ban reason is exposed to clients.
+- Organization-scoped actor resolution reads organization status and membership
+  from the same organization document. Only active organizations grant scoped
+  access. The approved recovery exceptions do not bypass account bans or the
+  separate platform-admin permission checks. Other active organizations remain
+  usable by their authorized members.
+- The account-level organization directory is distinct from operational access
+  to a selected organization. This change does not automatically cancel public
+  events, refund orders, alter payouts, or revoke independent provider callbacks.
+- Better Auth transaction retries can append duplicate authentication cookies.
+  The bridge retains the last value for each cookie name for both its session
+  read and forwarded cookies, matching the final browser cookie state.
+
+These are source/runtime rules, not a claim of deployment or connected
+acceptance. They apply at authorization checks; already-running operations are
+not retroactively rolled back when a ban or suspension is committed.
+
+### Milestone 1 Packet 1.8 — account preservation and security boundaries
+
+User-approved account policy: inviting an existing identity must not reset its password, issue temporary credentials or change its first-login rotation state. A concurrent signup winner is also an existing identity. Removing staff membership or revoking an invitation changes organization access only; it must not delete the recipient's personal account or credentials, or clear an outstanding rotation requirement. Membership is resolved again at the request authorization boundary. New identities retain temporary credentials and mandatory first-login rotation.
+
+Gateway cookie-authenticated commands require execution-time browser-origin protection, in addition to CORS response headers and frontend BFF CSRF tokens. Origin-less server/BFF/provider/native calls remain supported. An unavailable password-rotation store fails closed; sign-out remains available. Password reset invalidates all existing sessions through the auth provider's transaction-backed revocation option.

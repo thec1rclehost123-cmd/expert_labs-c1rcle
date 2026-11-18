@@ -1,8 +1,11 @@
+import Link from 'next/link';
+
 import { CalendarIcon, LocationIcon, TimeIcon, TicketIcon } from '@c1rcle/icons';
 
 import { Button } from '@/components/partner-v3/Button';
 import { EventPoster } from '@/components/partner-v3/events/EventPoster';
 
+import { slotRequestArtwork } from './slot-request-artwork';
 import styles from './slot-requests.module.css';
 import { SlotRequestStatusBadge } from './SlotRequestStatusBadge';
 
@@ -11,6 +14,7 @@ import type { SlotRequest, SlotRequestActionKind } from '@/data/partner-data-sou
 export interface SlotRequestCardProps {
   readonly request: SlotRequest;
   readonly busy?: boolean;
+  readonly busyAction?: SlotRequestActionKind | null;
   readonly actionError?: string | null;
   readonly onOpen: () => void;
   readonly onAction?: (id: string, kind: SlotRequestActionKind) => void;
@@ -19,26 +23,29 @@ export interface SlotRequestCardProps {
 export function SlotRequestCard({
   request,
   busy,
+  busyAction,
   actionError,
   onOpen,
   onAction,
 }: SlotRequestCardProps) {
   const isIncoming = request.direction === 'incoming';
   const canDecide = isIncoming && request.status === 'pending';
-  const canCancel = !isIncoming && request.status === 'approved';
+  const canRetryPublish =
+    isIncoming &&
+    request.status === 'approved' &&
+    request.hasEventDraft === true &&
+    request.linkedEventStatus !== 'published';
+  const isLinkedEventLive =
+    request.linkedEventStatus === 'published' ||
+    request.linkedEventStatus === 'sales_paused' ||
+    request.linkedEventStatus === 'started';
+  const canCancel = !isIncoming && request.status === 'approved' && !isLinkedEventLive;
   return (
     <article className={styles['requestCard']}>
       <button type="button" className={styles['requestCardMain']} onClick={onOpen}>
         <div className={styles['requestArtwork']}>
           <EventPoster
-            artwork={{
-              type: 'gradient',
-              value: request.id.includes('retro')
-                ? 'mystery'
-                : request.id.includes('sunday')
-                  ? 'sunset'
-                  : 'eclipse',
-            }}
+            artwork={slotRequestArtwork(request)}
             sizes="(max-width: 700px) 100vw, 420px"
           />
           <span className={styles['artworkShade']} />
@@ -83,27 +90,46 @@ export function SlotRequestCard({
           <p className={styles['requestNote']}>{request.event.note}</p>
         </div>
       </button>
-      {canDecide || canCancel ? (
+      {!isIncoming && request.status === 'rejected' && request.rejectionReason ? (
+        <p className={styles['actionError']}>Venue response: {request.rejectionReason}</p>
+      ) : null}
+      {!isIncoming && request.status === 'rejected' && request.eventDraft ? (
+        <div className={styles['requestCardActions']}>
+          <Link
+            className={styles['emptyLink']}
+            href={`/partner/host/events/create?resubmit=${encodeURIComponent(request.id)}`}
+          >
+            Edit and resubmit
+          </Link>
+        </div>
+      ) : null}
+      {canDecide || canRetryPublish || canCancel ? (
         <div className={styles['requestCardActions']}>
           {canDecide ? (
             <>
-              <Button
-                type="button"
-                variant="secondary"
-                disabled={busy}
-                onClick={() => onAction?.(request.id, 'reject')}
-              >
+              <Button type="button" variant="secondary" disabled={busy} onClick={onOpen}>
                 Decline
               </Button>
               <Button
                 type="button"
                 variant="primary"
                 disabled={busy}
+                aria-busy={busy && busyAction === 'accept'}
                 onClick={() => onAction?.(request.id, 'accept')}
               >
-                Accept
+                {busy && busyAction === 'accept' ? 'Accepting…' : 'Accept'}
               </Button>
             </>
+          ) : null}
+          {canRetryPublish ? (
+            <Button
+              type="button"
+              variant="primary"
+              disabled={busy}
+              onClick={() => onAction?.(request.id, 'accept')}
+            >
+              Retry publish
+            </Button>
           ) : null}
           {canCancel ? (
             <Button
@@ -120,6 +146,29 @@ export function SlotRequestCard({
               {actionError}
             </p>
           ) : null}
+        </div>
+      ) : null}
+      {!isIncoming && request.status === 'approved' && request.eventId ? (
+        <div className={styles['requestCardActions']}>
+          <Link
+            className={styles['emptyLink']}
+            href={`/partner/host/events/${encodeURIComponent(request.eventId)}`}
+          >
+            View event
+          </Link>
+        </div>
+      ) : !isIncoming &&
+        request.slotId &&
+        request.venueId &&
+        request.slotStartTime &&
+        request.slotEndTime ? (
+        <div className={styles['requestCardActions']}>
+          <Link
+            className={styles['emptyLink']}
+            href={`/partner/host/events/create?request=${encodeURIComponent(request.id)}`}
+          >
+            Create event from accepted slot
+          </Link>
         </div>
       ) : null}
     </article>

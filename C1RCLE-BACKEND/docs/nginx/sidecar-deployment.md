@@ -15,7 +15,7 @@
 
 **Decision:** Deploy nginx + Fastify in ONE Render Web Service (a same-container
 sidecar) as the interim staging topology, instead of the real two-service
-topology (`circle-v2-edge-staging` Web Service + `circle-v2-backend-staging`
+topology (`circle-v2-edge-staging` Web Service + `c1rcle-api-staging`
 Private Service) described in [`deployment.md`](./deployment.md) and
 [`sota-architecture.md`](./sota-architecture.md).
 
@@ -84,7 +84,7 @@ at the next infra/budget review if it has not happened.
   whether Fastify is sidecared or not; that is unrelated to this decision.
 - **If asked to "deploy nginx" or "fix the nginx deployment" and Render's
   paid plan status is unknown**, ask — don't assume the sidecar is still the
-  right answer. Check whether `TRUSTED_PROXY_CIDRS` or a `circle-v2-backend-staging`
+  right answer. Check whether `TRUSTED_PROXY_CIDRS` or a `c1rcle-api-staging`
   Private Service already exists on Render before building sidecar
   infrastructure that may already be obsolete.
 
@@ -249,11 +249,11 @@ sidecar needs to be migrated or ported — the real topology's code has been
 sitting on `staging` unused since PR #24/#27 merged.
 
 1. Follow [`deployment.md`](./deployment.md) § Step-by-Step Deployment from
-   Step 1, unmodified — create `circle-v2-backend-staging` (Private Service)
+   Step 1, unmodified — create `c1rcle-api-staging` (Private Service)
    and `circle-v2-edge-staging` (Web Service) as two new Render services.
 2. Set env vars per that document's tables — note `TRUSTED_PROXY_CIDRS`
    becomes the real private-network CIDR again (not `127.0.0.1/32`),
-   `FASTIFY_UPSTREAM` becomes `circle-v2-backend-staging:8080` (not
+   `FASTIFY_UPSTREAM` becomes `c1rcle-api-staging:8080` (not
    `127.0.0.1:8081`), and `PUBLIC_API_URL`/`BETTER_AUTH_URL` point at the
    nginx service's URL, not the (now-retired) single sidecar service's URL.
 3. Verify both new services are healthy end-to-end (smoke + security tests
@@ -278,7 +278,7 @@ not a normal operation:
 3. Repoint the frontend's `NEXT_PUBLIC_API_BASE_URL` at the sidecar
    service's URL.
 4. Suspend (don't immediately delete) `circle-v2-edge-staging` and
-   `circle-v2-backend-staging` — keep them available to switch back again
+   `c1rcle-api-staging` — keep them available to switch back again
    without rebuilding from scratch, unless the paid plan is being cancelled
    for good.
 

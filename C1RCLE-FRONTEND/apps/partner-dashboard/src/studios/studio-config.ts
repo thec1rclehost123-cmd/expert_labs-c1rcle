@@ -42,7 +42,6 @@ export const STUDIO_CONFIG: Readonly<Record<StudioRole, StudioConfig>> = {
       { label: 'Slot requests', href: studioPath('venue', 'slot-requests'), icon: 'requests' },
       { label: 'Partners', href: studioPath('venue', 'partners'), icon: 'partners' },
       { label: 'Marketing', href: studioPath('venue', 'marketing'), icon: 'marketing' },
-      { label: 'Presence', href: studioPath('venue', 'presence'), icon: 'presence' },
       { label: 'Finance', href: studioPath('venue', 'finance'), icon: 'finance' },
       { label: 'Support', href: studioPath('venue', 'support'), icon: 'support' },
       { label: 'Settings', href: studioPath('venue', 'settings'), icon: 'settings' },
@@ -67,15 +66,15 @@ export const STUDIO_CONFIG: Readonly<Record<StudioRole, StudioConfig>> = {
   promoter: {
     role: 'promoter',
     label: 'Promoter Studio',
-    description: 'Track opportunities, guests, links and commissions.',
+    description: 'Track event campaigns, attributed activity, links and commissions.',
     navigation: [
       { label: 'Overview', href: studioPath('promoter', 'overview'), icon: 'dashboard' },
       { label: 'Events', href: studioPath('promoter', 'events'), icon: 'events' },
-      { label: 'Guests', href: studioPath('promoter', 'guests'), icon: 'guests' },
+      { label: 'Activity', href: studioPath('promoter', 'guests'), icon: 'guests' },
       { label: 'Analytics', href: studioPath('promoter', 'analytics'), icon: 'analytics' },
       { label: 'Finance', href: studioPath('promoter', 'finance'), icon: 'finance' },
       { label: 'Partners', href: studioPath('promoter', 'partners'), icon: 'partners' },
-      { label: 'Leaderboard', href: studioPath('promoter', 'leaderboard'), icon: 'leaderboard' },
+      { label: 'Settings', href: studioPath('promoter', 'settings'), icon: 'settings' },
     ],
   },
 };

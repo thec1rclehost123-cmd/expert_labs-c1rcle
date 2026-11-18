@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { staffApi } from '@/lib/api/staff-api';
+import { getOrganizations } from '@/lib/org/org-repository';
 
 import { VenuePartnersScreen } from './VenuePartnersScreen';
 
@@ -10,8 +11,21 @@ import type { VenuePartnersData } from '@/data/partner-data-source';
 vi.mock('@/lib/api/staff-api', () => ({
   staffApi: {
     updateMemberRole: vi.fn(),
+    resendInvitation: vi.fn(),
   },
 }));
+
+// The caller's own role comes from the organizations list the gateway scopes to
+// them; each test sets it with `callerRole`.
+vi.mock('@/lib/org/org-repository', () => ({
+  getOrganizations: vi.fn(),
+}));
+
+function callerRole(role: 'owner' | 'admin' | 'manager' | 'door_supervisor' | 'gate_staff') {
+  vi.mocked(getOrganizations).mockResolvedValue([
+    { id: 'org-xyz', name: 'Skyline', slug: 'skyline', role },
+  ] as Awaited<ReturnType<typeof getOrganizations>>);
+}
 
 const emptySet = { connected: [], discover: [], requests: { incoming: [], outgoing: [] } };
 
@@ -74,6 +88,46 @@ describe('Partner staff section', () => {
     const revoke = screen.getByRole('button', { name: 'Revoke' });
     fireEvent.click(revoke);
     expect(onRevokeInvite).toHaveBeenCalledTimes(1);
+  });
+
+  it('resends a pending invite and says the old temporary password no longer works', async () => {
+    vi.mocked(staffApi.resendInvitation).mockResolvedValueOnce({
+      id: 'inv-1',
+      status: 'pending',
+    } as Awaited<ReturnType<typeof staffApi.resendInvitation>>);
+    render(
+      <VenuePartnersScreen
+        data={makeData()}
+        segment="staff"
+        staffInvites={makeData().staffInvites ?? []}
+        staffCanManage
+        onRevokeInvite={vi.fn()}
+        studioCapability="venue"
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Resend' }));
+    await waitFor(() => {
+      expect(staffApi.resendInvitation).toHaveBeenCalledWith('inv-1');
+    });
+    expect(await screen.findByRole('status')).toHaveTextContent(/no longer works/i);
+  });
+
+  it('shows the gateway message when a resend is refused', async () => {
+    vi.mocked(staffApi.resendInvitation).mockRejectedValueOnce(
+      new Error('A Venue manager cannot manage a Venue manager'),
+    );
+    render(
+      <VenuePartnersScreen
+        data={makeData()}
+        segment="staff"
+        staffInvites={makeData().staffInvites ?? []}
+        staffCanManage
+        onRevokeInvite={vi.fn()}
+        studioCapability="venue"
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Resend' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/cannot manage/i);
   });
 
   it('disables inviting without staff-management access', () => {
@@ -139,7 +193,7 @@ describe('Partner staff section', () => {
     expect(screen.getByText(/Jan 15, 2026/)).toBeInTheDocument();
   });
 
-  it('shows "Edit role" button only when isAdmin is true', () => {
+  it('shows "Manage access" button only when isAdmin is true', () => {
     const { rerender } = render(
       <VenuePartnersScreen
         data={makeData()}
@@ -151,7 +205,7 @@ describe('Partner staff section', () => {
       />,
     );
 
-    expect(screen.queryByRole('button', { name: 'Edit role' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Manage access' })).not.toBeInTheDocument();
 
     rerender(
       <VenuePartnersScreen
@@ -164,10 +218,10 @@ describe('Partner staff section', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: 'Edit role' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Manage access' })).toBeInTheDocument();
   });
 
-  it('shows "Owner (Primary)" badge instead of "Edit role" button for owner members', () => {
+  it('shows "Owner (Primary)" badge instead of "Manage access" button for owner members', () => {
     render(
       <VenuePartnersScreen
         data={makeData({
@@ -195,7 +249,7 @@ describe('Partner staff section', () => {
     );
 
     expect(screen.getByText('Owner (Primary)')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Edit role' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Manage access' })).not.toBeInTheDocument();
   });
 
   it('opens edit role dialog, changes role, and calls staffApi.updateMemberRole', async () => {
@@ -206,6 +260,7 @@ describe('Partner staff section', () => {
       joinedAt: '2026-01-01T00:00:00.000Z',
     });
 
+    callerRole('owner');
     const onStaffChanged = vi.fn();
 
     render(
@@ -221,15 +276,15 @@ describe('Partner staff section', () => {
       />,
     );
 
-    const editRoleBtn = screen.getByRole('button', { name: 'Edit role' });
+    const editRoleBtn = screen.getByRole('button', { name: 'Manage access' });
     fireEvent.click(editRoleBtn);
 
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     expect(screen.getByText('Edit staff role')).toBeInTheDocument();
 
-    // Select the "Admin" role option
-    const adminOptionBtn = screen.getByRole('button', { name: /Admin · Can manage staff/i });
-    fireEvent.click(adminOptionBtn);
+    // Select the "Ops lead" role option (the owner may hand out every role below it)
+    const opsLeadBtn = await screen.findByRole('button', { name: /Ops lead · Runs the whole/i });
+    fireEvent.click(opsLeadBtn);
 
     const saveBtn = screen.getByRole('button', { name: 'Save role' });
     expect(saveBtn).not.toBeDisabled();
@@ -249,6 +304,41 @@ describe('Partner staff section', () => {
     await waitFor(() => {
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
+  });
+
+  it('offers a venue manager only the roles below manager, and cannot edit a peer', async () => {
+    callerRole('manager');
+    render(
+      <VenuePartnersScreen
+        data={makeData({
+          staff: [
+            {
+              id: 'user-gate',
+              name: 'Gate One',
+              initials: 'GO',
+              role: 'Gate staff',
+              status: 'Active',
+              permissions: [],
+              userId: 'user-gate',
+              email: null,
+              backendRole: 'gate_staff',
+              capabilities: ['venue'],
+            },
+          ],
+        })}
+        segment="staff"
+        staffInvites={[]}
+        staffCanManage
+        isAdmin={true}
+        organizationId="org-xyz"
+        studioCapability="venue"
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Manage access' }));
+    expect(await screen.findByRole('button', { name: /Door supervisor · /i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Gate staff · /i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Ops lead · /i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Venue manager · /i })).not.toBeInTheDocument();
   });
 
   it('renders "You" tag for the currently signed-in user by currentUserId', () => {

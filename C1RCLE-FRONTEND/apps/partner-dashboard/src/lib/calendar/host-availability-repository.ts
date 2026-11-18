@@ -1,10 +1,13 @@
 import { paginatedSchema } from '@c1rcle/api-client';
+import { PRODUCT_TIME_ZONE } from '@c1rcle/contracts';
 import {
   eventDtoSchema,
   partnershipDtoSchema,
+  slotRequestDtoSchema,
   venueAvailabilityDtoSchema,
   venueDtoSchema,
   type EventDto,
+  type SlotRequestEventDraft,
   type VenueAvailabilityDto,
   type VenueDto,
 } from '@c1rcle/contracts';
@@ -12,8 +15,8 @@ import {
 import { apiClient } from '@/lib/api/client';
 
 import {
-  formatTimeRange,
-  isoDatePart,
+  eventDatePartInIndia,
+  formatEventTimeRange,
   parseMonthKey,
   rangeForMonthKeys,
 } from './venue-calendar-repository';
@@ -79,7 +82,10 @@ export async function loadHostAvailability({
         }),
         apiClient.get({
           path: `/api/v2/venues/${venueId}/availability`,
-          query: range,
+          query: {
+            ...range,
+            to: new Date(Date.parse(range.to) + 48 * 60 * 60 * 1000).toISOString(),
+          },
           headers,
           schema: venueAvailabilityDtoSchema,
           ...(signal ? { signal } : {}),
@@ -139,7 +145,7 @@ function buildHostMonths(
   const slotsByDate = new Map<string, VenueAvailabilityDto['slots']>();
   for (const slot of availability.slots) {
     if (slot.status === 'cancelled') continue;
-    const date = isoDatePart(slot.startTime);
+    const date = eventDatePartInIndia(slot.startTime);
     if (!date) continue;
     slotsByDate.set(date, [...(slotsByDate.get(date) ?? []), slot]);
   }
@@ -147,21 +153,19 @@ function buildHostMonths(
   const eventsByDate = new Map<string, CalendarEvent[]>();
   for (const event of events) {
     if (inactiveEventStatuses.has(event.status)) continue;
-    const date = isoDatePart(event.startAt);
+    const date = eventDatePartInIndia(event.startAt);
     if (!date) continue;
     const item: CalendarEvent = {
       id: event.id,
       date,
       name: event.title,
-      time: formatTimeRange(event.startAt, event.endAt),
+      time: formatEventTimeRange(event.startAt, event.endAt),
       status: pendingEventStatuses.has(event.status) ? 'pending' : 'confirmed',
       venue: venue.name,
       href: `/partner/host/events/${event.id}`,
     };
     eventsByDate.set(date, [...(eventsByDate.get(date) ?? []), item]);
   }
-
-  const hasAnySlotsInWindow = availability.slots.length > 0;
 
   return monthKeys.flatMap((key): CalendarMonth[] => {
     const parsed = parseMonthKey(key);
@@ -175,9 +179,11 @@ function buildHostMonths(
       return {
         date,
         day,
-        state: hostDayState(dayEvents, daySlots, hasAnySlotsInWindow),
+        state: freeTimeSlots(date, availability.slots, events).length
+          ? 'available'
+          : hostDayState(dayEvents, daySlots),
         events: dayEvents,
-        slots: openSlots(date, daySlots, hasAnySlotsInWindow),
+        slots: freeTimeSlots(date, availability.slots, events),
       };
     });
     return [
@@ -186,7 +192,7 @@ function buildHostMonths(
         label: new Intl.DateTimeFormat('en-US', {
           month: 'long',
           year: 'numeric',
-          timeZone: 'UTC',
+          timeZone: PRODUCT_TIME_ZONE,
         }).format(new Date(Date.UTC(parsed.year, parsed.month - 1, 1))),
         firstDayOffset: new Date(Date.UTC(parsed.year, parsed.month - 1, 1)).getUTCDay(),
         daysInMonth,
@@ -199,37 +205,94 @@ function buildHostMonths(
 function hostDayState(
   events: readonly CalendarEvent[],
   slots: VenueAvailabilityDto['slots'],
-  hasAnySlotsInWindow: boolean,
 ): CalendarDayState {
   if (events.some((event) => event.status === 'pending')) return 'pending';
+  if (slots.some((slot) => slot.status === 'pending')) return 'pending';
   if (events.length > 0 || slots.some((slot) => slot.status === 'booked')) return 'confirmed';
   if (slots.some((slot) => slot.status === 'open')) return 'available';
-  if (!hasAnySlotsInWindow && events.length === 0) return 'available';
   return 'unavailable';
 }
 
-function openSlots(
+export function freeTimeSlots(
   date: string,
   slots: VenueAvailabilityDto['slots'],
-  hasAnySlotsInWindow: boolean,
+  events: readonly EventDto[] = [],
 ): readonly AvailabilitySlot[] {
-  const explicitOpen = slots
-    .filter((slot) => slot.status === 'open')
-    .map((slot) => ({
-      id: slot.id,
-      label: formatTimeRange(slot.startTime, slot.endTime),
-      status: 'available' as const,
-    }));
-  if (explicitOpen.length > 0) return explicitOpen;
+  const format = (value: number) =>
+    new Intl.DateTimeFormat('en-IN', {
+      timeZone: PRODUCT_TIME_ZONE,
+      hour: 'numeric',
+      minute: '2-digit',
+    }).format(new Date(value));
+  return slots
+    .filter((slot) => {
+      const from = Date.parse(slot.startTime);
+      return (
+        slot.status === 'open' && from > Date.now() && eventDatePartInIndia(slot.startTime) === date
+      );
+    })
+    .map((slot) => {
+      const from = Date.parse(slot.startTime);
+      const to = Date.parse(slot.endTime);
+      const blockedIntervals = [
+        ...slots
+          .filter(
+            (other) =>
+              other.id !== slot.id && other.status !== 'open' && other.status !== 'cancelled',
+          )
+          .map((other) => ({ startTime: other.startTime, endTime: other.endTime })),
+        ...events
+          .filter((event) => !inactiveEventStatuses.has(event.status))
+          .map((event) => ({ startTime: event.startAt, endTime: event.endAt ?? event.startAt })),
+      ]
+        .map(({ startTime, endTime }) => ({
+          startTime: new Date(Math.max(from, Date.parse(startTime))).toISOString(),
+          endTime: new Date(Math.min(to, Date.parse(endTime))).toISOString(),
+        }))
+        .filter(({ startTime, endTime }) => Date.parse(startTime) < Date.parse(endTime));
+      return {
+        id: slot.id,
+        label: `${format(from)} – ${format(to)} IST`,
+        status: 'available' as const,
+        startTime: slot.startTime,
+        endTime: slot.endTime,
+        timezone: slot.timezone ?? PRODUCT_TIME_ZONE,
+        blockedIntervals,
+      };
+    });
+}
 
-  if (!hasAnySlotsInWindow && slots.length === 0) {
-    return [
-      { id: `${date}-late`, label: '8:00 PM – 11:00 PM', status: 'available' },
-      { id: `${date}-night`, label: '11:00 PM – 3:00 AM', status: 'available' },
-    ];
-  }
-
-  return [];
+export async function requestHostAvailabilitySlot({
+  organizationId,
+  venueId,
+  slotId,
+  idempotencyKey,
+  eventId,
+  eventDraft,
+}: {
+  readonly organizationId: string;
+  readonly venueId: string;
+  readonly slotId: string;
+  readonly idempotencyKey: string;
+  readonly eventId?: string;
+  readonly eventDraft?: SlotRequestEventDraft;
+}) {
+  return apiClient.post({
+    path: `/api/v2/venues/${encodeURIComponent(venueId)}/slot-requests`,
+    body: {
+      slotId,
+      ...(eventId ? { eventId } : {}),
+      ...(eventDraft ? { eventDraft } : {}),
+      message: eventId
+        ? `Requesting a new Venue slot for event ${eventId}.`
+        : 'Requesting the selected Venue time.',
+    },
+    headers: {
+      'x-organization-id': organizationId,
+      'Idempotency-Key': idempotencyKey,
+    },
+    schema: slotRequestDtoSchema,
+  });
 }
 
 function emptyHostAvailability(): HostAvailabilityData {

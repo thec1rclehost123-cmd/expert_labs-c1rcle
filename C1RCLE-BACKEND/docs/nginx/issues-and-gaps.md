@@ -79,7 +79,7 @@ graph LR
 
 **What's needed (real topology — do this once a paid plan is available):**
 - Create `circle-v2-edge-staging` Web Service on Render
-- Create `circle-v2-backend-staging` Private Service on Render
+- Create `c1rcle-api-staging` Private Service on Render
 - Configure env vars per [`deployment.md`](./deployment.md)
 - Both services on same commit
 - Verify with preflight + smoke + security scripts

@@ -16,6 +16,10 @@ export interface VenuePublicProfile {
   description: string;
   shortDescription?: string;
   photoUrl: string | null;
+  /** Optional public cover artwork for the partner profile. */
+  coverUrl?: string | null;
+  /** Optional public profile genres. */
+  genres?: string[];
   address: VenueAddress;
   facilities: string[];
   capacity: number | null;
@@ -214,9 +218,101 @@ export interface VenueSlot extends VersionedEntity {
   recurring: boolean;
   status: VenueSlotStatus;
   capacityFor: number | null;
+  /** IANA zone used to present an explicitly offered time window. */
+  timezone?: string | null;
+  /** Host-facing constraints, never used as an authorization decision. */
+  notes?: string | null;
+  /** null means all approved active Host partners; [] means none. */
+  visibleToHostIds?: EntityId[] | null;
+  /** Present while a Host request is pending or after the slot is booked. */
+  slotRequestId?: EntityId | null;
+  requestingHostId?: EntityId | null;
 }
 
-export type VenueSlotStatus = 'open' | 'booked' | 'blocked' | 'cancelled';
+export type VenueSlotStatus = 'open' | 'pending' | 'booked' | 'blocked' | 'cancelled';
+
+const MAX_OFFERED_SLOT_DURATION_MS = 24 * 60 * 60 * 1000;
+
+export function createVenueAvailabilitySlot(input: {
+  id: EntityId;
+  venueId: EntityId;
+  label: string;
+  startTime: string;
+  endTime: string;
+  timezone: string;
+  notes?: string | null;
+  visibleToHostIds?: EntityId[] | null;
+  now: Date;
+}): VenueSlot {
+  const start = Date.parse(input.startTime);
+  const end = Date.parse(input.endTime);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    throw new InvalidOperationError('Availability end time must be after its start time');
+  }
+  if (start <= input.now.getTime()) {
+    throw new InvalidOperationError('Availability must start in the future');
+  }
+  if (end - start > MAX_OFFERED_SLOT_DURATION_MS) {
+    throw new InvalidOperationError('Availability cannot exceed 24 hours');
+  }
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: input.timezone }).format(input.now);
+  } catch {
+    throw new InvalidOperationError('A valid IANA timezone is required');
+  }
+  if (!input.label.trim() || input.label.length > 200) {
+    throw new InvalidOperationError('Availability label must be between 1 and 200 characters');
+  }
+  if ((input.notes?.length ?? 0) > 2000) {
+    throw new InvalidOperationError('Availability notes cannot exceed 2000 characters');
+  }
+  return {
+    id: input.id,
+    venueId: input.venueId,
+    label: input.label.trim(),
+    startTime: new Date(start).toISOString(),
+    endTime: new Date(end).toISOString(),
+    recurring: false,
+    status: 'open',
+    capacityFor: null,
+    timezone: input.timezone,
+    notes: input.notes?.trim() ? input.notes.trim() : null,
+    visibleToHostIds: input.visibleToHostIds ?? null,
+    slotRequestId: null,
+    requestingHostId: null,
+    ...newVersionedEntity(input.now),
+  };
+}
+
+export function setVenueSlotRequestState(
+  slot: VenueSlot,
+  status: 'pending' | 'booked' | 'open' | 'cancelled',
+  requestId: EntityId | null,
+  hostId: EntityId | null,
+  now: Date,
+): VenueSlot {
+  if (status === 'pending' && slot.status !== 'open') {
+    throw new InvalidOperationError('Only open availability can be requested');
+  }
+  if (status === 'booked' && (slot.status !== 'pending' || slot.slotRequestId !== requestId)) {
+    throw new InvalidOperationError('Only the pending request may reserve this slot');
+  }
+  if (status === 'open' && slot.status !== 'pending') {
+    throw new InvalidOperationError('Only a pending slot request can release availability');
+  }
+  if (status === 'cancelled' && slot.status !== 'booked') {
+    throw new InvalidOperationError('Only a booked slot can be cancelled');
+  }
+  return bumpVersion(
+    {
+      ...slot,
+      status,
+      slotRequestId: status === 'open' ? null : requestId,
+      requestingHostId: status === 'open' ? null : hostId,
+    },
+    now,
+  );
+}
 
 export function createVenueBlock(input: {
   id: EntityId;
@@ -250,13 +346,21 @@ export function createVenueBlock(input: {
  * slots out, so an unblocked date immediately reads as open again.
  *
  * Only `blocked` slots can be unblocked — unblocking an `open`/`booked`
- * slot would silently destroy bookable inventory, and re-unblocking an
- * already-`cancelled` slot is a no-op that must surface as a 400 rather
- * than silently succeeding.
+ * slot would silently destroy bookable inventory. Replaying an unblock for
+ * an already-cancelled slot is an idempotent no-op.
  */
 export function cancelVenueBlock(slot: VenueSlot, now?: Date): VenueSlot {
+  if (slot.status === 'cancelled') return slot;
   if (slot.status !== 'blocked') {
     throw new InvalidOperationError('Only blocked slots can be unblocked');
+  }
+  return bumpVersion({ ...slot, status: 'cancelled' }, now ?? new Date());
+}
+
+/** Remove an unused published offer without affecting held or booked slots. */
+export function unpublishVenueAvailability(slot: VenueSlot, now?: Date): VenueSlot {
+  if (slot.status !== 'open') {
+    throw new InvalidOperationError('Only unused open availability can be unpublished');
   }
   return bumpVersion({ ...slot, status: 'cancelled' }, now ?? new Date());
 }
@@ -317,17 +421,31 @@ export function assertSlotRangeFree(
 export interface SlotRequest extends VersionedEntity {
   id: EntityId;
   venueId: EntityId;
+  /** Null only for historical event-first requests created before open slots. */
+  slotId?: EntityId | null;
+  slotStartTime?: string | null;
+  slotEndTime?: string | null;
+  timezone?: string | null;
   eventId: EntityId | null;
   hostId: EntityId;
   status: SlotRequestStatus;
   message?: string;
+  /** Venue-provided explanation returned to the Host after a rejection. */
+  rejectionReason?: string | null;
+  /** Validated event proposal, private to the Host and Venue until approved. */
+  eventDraft?: {
+    event: Record<string, unknown>;
+    tiers: { localId: EntityId; command: Record<string, unknown> }[];
+    promotions: Record<string, unknown>[];
+    promoters: Record<string, unknown>[];
+  };
 }
 
 export type SlotRequestStatus = 'pending' | 'accepted' | 'rejected' | 'cancelled';
 
 const SLOT_REQUEST_TRANSITIONS: Readonly<Record<SlotRequestStatus, readonly SlotRequestStatus[]>> =
   {
-    pending: ['accepted', 'rejected'],
+    pending: ['accepted', 'rejected', 'cancelled'],
     accepted: ['cancelled'],
     rejected: [],
     cancelled: [],
@@ -347,26 +465,47 @@ export function transitionSlotRequest(
   request: SlotRequest,
   to: SlotRequestStatus,
   now?: Date,
+  reason?: string,
 ): SlotRequest {
+  if (to === 'rejected' && !reason?.trim()) {
+    throw new InvalidOperationError('A rejection reason is required');
+  }
   const next = transitionSlotRequestStatus(request.status, to);
-  return bumpVersion({ ...request, status: next }, now ?? new Date());
+  return bumpVersion(
+    {
+      ...request,
+      status: next,
+      ...(to === 'rejected' ? { rejectionReason: reason?.trim() ?? null } : {}),
+    },
+    now ?? new Date(),
+  );
 }
 
 export function createSlotRequest(input: {
   id: EntityId;
   venueId: EntityId;
+  slotId?: EntityId | null;
+  slotStartTime?: string | null;
+  slotEndTime?: string | null;
+  timezone?: string | null;
   eventId: EntityId | null;
   hostId: EntityId;
   message?: string;
+  eventDraft?: SlotRequest['eventDraft'];
   now?: Date;
 }): SlotRequest {
   return {
     id: input.id,
     venueId: input.venueId,
+    slotId: input.slotId ?? null,
+    slotStartTime: input.slotStartTime ?? null,
+    slotEndTime: input.slotEndTime ?? null,
+    timezone: input.timezone ?? null,
     eventId: input.eventId,
     hostId: input.hostId,
     status: 'pending',
     message: input.message,
+    ...(input.eventDraft ? { eventDraft: input.eventDraft } : {}),
     ...newVersionedEntity(input.now ?? new Date()),
   };
 }
@@ -387,6 +526,7 @@ export interface VenueAvailability {
   from: string;
   to: string;
   openSlots: number;
+  pendingRequests: number;
   bookedSlots: number;
   blockedSlots: number;
   /** Total minutes across open slots — the practical "how much can I book". */
@@ -403,6 +543,9 @@ export interface VenueAvailabilitySlot {
   endTime: string;
   status: Exclude<VenueSlotStatus, 'cancelled'>;
   capacityFor: number | null;
+  timezone?: string | null;
+  notes?: string | null;
+  requestable?: boolean;
 }
 
 export function computeVenueAvailability(input: {
@@ -414,6 +557,7 @@ export function computeVenueAvailability(input: {
   const live = input.slots.filter((slot) => slot.status !== 'cancelled');
 
   let openSlots = 0;
+  let pendingRequests = 0;
   let bookedSlots = 0;
   let blockedSlots = 0;
   let openMinutes = 0;
@@ -422,6 +566,8 @@ export function computeVenueAvailability(input: {
     if (slot.status === 'open') {
       openSlots++;
       openMinutes += slotMinutes(slot);
+    } else if (slot.status === 'pending') {
+      pendingRequests++;
     } else if (slot.status === 'booked') {
       bookedSlots++;
     } else {
@@ -434,6 +580,7 @@ export function computeVenueAvailability(input: {
     from: input.from,
     to: input.to,
     openSlots,
+    pendingRequests,
     bookedSlots,
     blockedSlots,
     openMinutes,
@@ -447,6 +594,9 @@ export function computeVenueAvailability(input: {
       endTime: slot.endTime,
       status: slot.status as Exclude<VenueSlotStatus, 'cancelled'>,
       capacityFor: slot.capacityFor,
+      ...(slot.timezone !== undefined ? { timezone: slot.timezone } : {}),
+      ...(slot.notes !== undefined ? { notes: slot.notes } : {}),
+      requestable: slot.status === 'open',
     })),
   };
 }

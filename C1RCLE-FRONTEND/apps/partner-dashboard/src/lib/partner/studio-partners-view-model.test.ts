@@ -88,8 +88,31 @@ describe('toVenuePartnersData', () => {
       discoveredPromoters: [],
     });
 
-    expect(data.hosts.connected[0]?.name).toBe('org_host');
+    expect(data.hosts.connected[0]?.name).toBe('Partner name unavailable');
     expect(data.hosts.requests).toEqual({ incoming: [], outgoing: [] });
+  });
+
+  it('does not expose a counterparty organization ID when a partnership name is missing', () => {
+    const data = toVenuePartnersData({
+      partnerships: [{ ...partnership, status: 'active', hostName: null }],
+      promoterConnections: [],
+      discoveredHosts: [],
+      discoveredPromoters: [],
+    });
+
+    expect(data.hosts.connected[0]?.name).toBe('Partner name unavailable');
+    expect(data.hosts.connected[0]?.name).not.toContain('org_host');
+  });
+
+  it('does not expose a target organization ID for an unnamed promoter relationship', () => {
+    const data = toPromoterPartnersData({
+      organizationId: 'org_promoter',
+      promoterConnections: [{ ...connection, status: 'active', targetName: null }],
+      discovered: [],
+    });
+
+    expect(data.active[0]?.name).toBe('Partner name unavailable');
+    expect(data.active[0]?.name).not.toContain('org_venue');
   });
 });
 
@@ -108,6 +131,33 @@ describe('toHostPartnersData', () => {
     expect(data.venues.connected.map((item) => item.name)).toEqual(['Real Venue']);
     expect(data.venues.requests.outgoing.map((item) => item.id)).toEqual(['part_out']);
     expect(data.staff).toEqual([]);
+  });
+
+  it('distinguishes active Promoter connections from canonical event assignability', () => {
+    const data = toHostPartnersData({
+      partnerships: [],
+      promoterConnections: [
+        { ...connection, targetId: 'org_host', targetType: 'host', status: 'active' },
+        {
+          ...connection,
+          id: 'conn_other',
+          promoterId: 'org_other',
+          targetId: 'org_host',
+          targetType: 'host',
+          status: 'active',
+        },
+      ],
+      discoveredVenues: [],
+      discoveredPromoters: [],
+      assignablePromoterIds: new Set(['org_promoter']),
+    });
+
+    expect(
+      data.promoters.connected.map((item) => [item.id, item.eventAssignmentAvailability]),
+    ).toEqual([
+      ['conn_1', 'available'],
+      ['conn_other', 'unavailable'],
+    ]);
   });
 });
 

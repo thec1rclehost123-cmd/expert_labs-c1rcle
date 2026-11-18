@@ -1,9 +1,15 @@
 import { MemoryPaymentProvider } from '@c1rcle/core/domain';
+import { MemoryCartReservationRepository } from '@c1rcle/core/infrastructure';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createV2Services } from '../../../lib/v2-services.js';
-import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
+import { seedApprovedPartnerOrganization } from '../../../test-utils/approved-partner-organization.js';
+import {
+  buildPartnerTestServer,
+  futureTestEventStartAt,
+} from '../../../test-utils/partner-test-server.js';
 import { publishEventForTest } from '../../../test-utils/publish-event.js';
+import { seedVerifiedCheckoutUsers } from '../../../test-utils/verified-test-users.js';
 import partnerEventCatalogRoutes from '../partner/event-catalog.js';
 import partnerEventRoutes from '../partner/events.js';
 import partnerOrganizationRoutes from '../partner/organizations.js';
@@ -21,8 +27,9 @@ import paymentRoutes from './payment-routes.js';
  */
 
 let keySeq = 0;
-const buildServer = () =>
-  buildPartnerTestServer({
+const buildServer = () => {
+  seedVerifiedCheckoutUsers();
+  return buildPartnerTestServer({
     routes: [
       partnerOrganizationRoutes,
       partnerVenueRoutes,
@@ -32,6 +39,7 @@ const buildServer = () =>
       paymentRoutes,
     ],
   });
+};
 
 type Server = Awaited<ReturnType<typeof buildServer>>;
 
@@ -41,13 +49,12 @@ const write = (org: string) => ({
 });
 
 async function seedHold(server: Server): Promise<{ holdId: string; grandTotalPaise: number }> {
-  const created = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: { 'x-organization-id': 'org_seed', 'idempotency-key': `seed-${++keySeq}` },
-    payload: { name: 'Skyline', slug: `skyline-${keySeq}` },
+  ++keySeq;
+  const created = await seedApprovedPartnerOrganization({
+    name: 'Skyline',
+    slug: `skyline-${keySeq}`,
   });
-  const org: string = created.json().id;
+  const org: string = created.id;
   const venue = await server.inject({
     method: 'POST',
     url: `/organizations/${org}/venues`,
@@ -59,7 +66,7 @@ async function seedHold(server: Server): Promise<{ holdId: string; grandTotalPai
     method: 'POST',
     url: `/organizations/${org}/events`,
     headers: write(org),
-    payload: { title: 'Sky Night', venueId, startAt: '2026-09-01T18:00:00Z' },
+    payload: { title: 'Sky Night', venueId, startAt: futureTestEventStartAt() },
   });
   const eventId: string = event.json().id;
   await publishEventForTest(eventId);
@@ -159,7 +166,10 @@ describe('GET /payments/attempts/:holdId/status', () => {
     const { paymentIntentId } = await attemptFor(server, holdId, 'recover-fulfilled');
     const paymentId = 'pay_recovery_fulfilled';
     const provider = memoryProvider();
-    provider.simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    provider.simulateCapture(paymentId, grandTotalPaise, paymentIntentId, 'INR', {
+      feePaise: 2_360,
+      taxOnFeePaise: 425,
+    });
     const verified = await verifyPayment(server, { paymentId, holdId, paymentIntentId });
     expect(verified.statusCode).toBe(200);
 
@@ -174,6 +184,76 @@ describe('GET /payments/attempts/:holdId/status', () => {
       status: 'fulfilled',
       orderId: verified.json().order.id,
     });
+    await server.close();
+  });
+});
+
+describe('POST /payments/attempts/:holdId/reconcile', () => {
+  it('re-reads a captured payment and fulfills one expired hold after a lost redirect callback', async () => {
+    const server = await buildServer();
+    const { holdId, grandTotalPaise } = await seedHold(server);
+    const { paymentIntentId } = await attemptFor(server, holdId, 'recover-lost-callback');
+    const paymentId = 'pay_recovery_lost_callback';
+    memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId, 'INR', {
+      feePaise: 20,
+      taxOnFeePaise: 4,
+    });
+    const services = createV2Services();
+    await services.providerPayments.recordEvent(
+      {
+        type: 'captured',
+        paymentId,
+        providerOrderId: paymentIntentId,
+        orderId: null,
+        correlated: true,
+        amountPaise: grandTotalPaise,
+        currency: 'INR',
+        feePaise: 20,
+        taxOnFeePaise: 4,
+        occurredAt: new Date().toISOString(),
+      },
+      { trustedIngestion: 'signature_verified' },
+    );
+    await services.repos().cartReservations.release(holdId);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: `/payments/attempts/${holdId}/reconcile`,
+      payload: {},
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      holdId,
+      status: 'fulfilled',
+      orderId: `ORD-${paymentId}`,
+    });
+    const repos = createV2Services().repos();
+    const order = await repos.orders.getById(`ORD-${paymentId}`);
+    expect(order).toMatchObject({ status: 'paid', paymentId, grandTotalPaise });
+    expect(await repos.entitlements.getByOrderId(`ORD-${paymentId}`)).toHaveLength(1);
+    expect(await repos.cartReservations.getById(holdId)).toMatchObject({
+      status: 'converted',
+      convertedOrderId: `ORD-${paymentId}`,
+    });
+    expect(await repos.providerPayments.findByPaymentId(paymentId)).toMatchObject({
+      processingState: 'fulfilled',
+      orderId: `ORD-${paymentId}`,
+    });
+
+    const duplicate = await server.inject({
+      method: 'POST',
+      url: `/payments/attempts/${holdId}/reconcile`,
+      payload: {},
+    });
+    expect(duplicate.statusCode).toBe(200);
+    expect(duplicate.json()).toMatchObject({
+      holdId,
+      status: 'fulfilled',
+      orderId: `ORD-${paymentId}`,
+    });
+    if (!order) throw new Error('Expected recovered order');
+    expect((await repos.orders.listByEvent(order.eventId, { limit: 100 })).items).toHaveLength(1);
     await server.close();
   });
 });
@@ -194,7 +274,10 @@ describe('POST /payments/:id/verify', () => {
     const provider = memoryProvider();
     // Stands in for "the guest paid at Razorpay's hosted page" — the one
     // fact a memory adapter cannot derive on its own.
-    provider.simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
+    provider.simulateCapture(paymentId, grandTotalPaise, paymentIntentId, 'INR', {
+      feePaise: 2_360,
+      taxOnFeePaise: 425,
+    });
     const signature = provider.generateSignature({ paymentId, orderId: paymentIntentId });
 
     const response = await server.inject({
@@ -211,6 +294,20 @@ describe('POST /payments/:id/verify', () => {
       grandTotalPaise,
     });
     expect(body.entitlements.length).toBeGreaterThan(0);
+    const repositories = createV2Services().repos();
+    await expect(repositories.providerPayments.findByPaymentId(paymentId)).resolves.toMatchObject({
+      providerOrderId: paymentIntentId,
+      orderId: body.order.id,
+      processingState: 'fulfilled',
+      capturedPaise: grandTotalPaise,
+      currency: 'INR',
+      feePaise: 2_360,
+      taxOnFeePaise: 425,
+    });
+    const journal = (
+      await repositories.financialJournals.findBySource('online_payment_capture', body.order.id)
+    ).find((entry) => entry.idempotencyKey.endsWith(':provider-fee'));
+    expect(journal?.components?.providerFeePaise).toBe(2_785);
     await server.close();
   });
 
@@ -414,7 +511,9 @@ describe('payment ↔ hold binding', () => {
     const repos = createV2Services().repos();
     const hold = await repos.cartReservations.getById(holdId);
     // Re-home the hold to a different user: the caller is no longer its owner.
-    if (hold) await repos.cartReservations.create({ ...hold, userId: 'someone_else' });
+    if (!(repos.cartReservations instanceof MemoryCartReservationRepository) || !hold)
+      throw new Error('Expected synthetic memory hold');
+    repos.cartReservations.reservations.set(hold.id, { ...hold, userId: 'someone_else' });
     const paymentId = 'pay_not_mine';
     memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
 
@@ -544,11 +643,14 @@ describe('payment captured after the hold expired', () => {
     const hold = await repos.cartReservations.getById(holdId);
     if (!hold) throw new Error('hold missing');
     // Lapse the hold the two ways it happens: TTL passes, or the sweep released it.
-    await repos.cartReservations.create(
-      status === 'expired'
-        ? { ...hold, expiresAt: new Date(Date.now() - 60_000).toISOString() }
-        : { ...hold, status: 'released' },
-    );
+    if (!(repos.cartReservations instanceof MemoryCartReservationRepository))
+      throw new Error('Expected synthetic memory hold');
+    if (status === 'expired')
+      repos.cartReservations.reservations.set(hold.id, {
+        ...hold,
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      });
+    else await repos.cartReservations.release(hold.id);
     const paymentId = `pay_${label}`;
     memoryProvider().simulateCapture(paymentId, grandTotalPaise, paymentIntentId);
     return { holdId, paymentId, paymentIntentId, grandTotalPaise, repos };
@@ -580,35 +682,40 @@ describe('payment captured after the hold expired', () => {
     },
   );
 
-  it('refunds in full, once, when the seats are gone', async () => {
+  it('creates one full-paid compensation request without claiming money was refunded or issuing admissions', async () => {
     const server = await buildServer();
     const paid = await lapsedPaidHold(server, 'late_soldout', 'expired');
-    // The revived hold no longer fits: another buyer holds, or has bought, the seat.
     vi.spyOn(inventoryOf(), 'firstOverbookedTier').mockResolvedValue('tier_taken');
     const refund = vi.spyOn(memoryProvider(), 'refundPayment');
-
     try {
       const first = await verifyPayment(server, paid);
-      const second = await verifyPayment(server, paid); // a redelivered webhook / retry
-
-      // 409, not 400: the buyer is told they were refunded, not asked to retry.
-      expect(first.statusCode).toBe(409);
-      expect(first.json().message).toMatch(/refunded in full/i);
-      expect(first.json().details).toEqual({ outcome: 'refunded' });
-      expect(second.statusCode).toBe(409);
-      // Money is returned, no order or tickets exist, and both calls used the same
-      // idempotency key so the provider can only refund once.
-      expect(refund).toHaveBeenCalledWith({
-        paymentId: paid.paymentId,
-        amountPaise: paid.grandTotalPaise,
-        idempotencyKey: `autorefund:${paid.paymentId}`,
+      const second = await verifyPayment(server, paid);
+      expect(first.statusCode).toBe(200);
+      expect(second.statusCode).toBe(200);
+      expect(first.json().order).toMatchObject({
+        status: 'refund_requested',
+        fulfillmentState: 'pending',
+        grandTotalPaise: paid.grandTotalPaise,
       });
-      expect(new Set(refund.mock.calls.map(([r]) => r.idempotencyKey)).size).toBe(1);
-      expect(await paid.repos.orders.getByPaymentId(paid.paymentId)).toBeNull();
+      expect(first.json().entitlements).toHaveLength(0);
+      expect(second.json().order.id).toBe(first.json().order.id);
+      const order = await paid.repos.orders.getByPaymentId(paid.paymentId);
+      if (!order) throw new Error('Captured compensation must retain its original paid order');
+      expect(order.compensationRequired?.reason).toBe('capacity_unavailable');
+      const requests = await paid.repos.refundRequests.listByOrder(order.id);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({
+        amountPaise: paid.grandTotalPaise,
+        refundCause: 'fulfillment_failure',
+        status: 'pending',
+        approversRequired: 1,
+      });
+      expect(refund).not.toHaveBeenCalled();
+      expect(await paid.repos.entitlements.getByOrderId(order.id)).toHaveLength(0);
     } finally {
       vi.restoreAllMocks();
+      await server.close();
     }
-    await server.close();
   });
 
   it('does not swallow an unexpected inventory failure by refunding', async () => {

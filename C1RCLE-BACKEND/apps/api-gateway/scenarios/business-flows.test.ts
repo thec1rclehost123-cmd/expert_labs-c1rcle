@@ -1,10 +1,18 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 
-import { MemoryPaymentProvider, createPlatformAdmin } from '@c1rcle/core/domain';
+import {
+  MemoryPaymentProvider,
+  bookingReferenceForOrderId,
+  createPlatformAdmin,
+} from '@c1rcle/core/domain';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import type { MemoryUserAccountRepository } from '@c1rcle/core/infrastructure';
+
 import { buildApp } from '../src/app.js';
+import { getGatewayConfig } from '../src/config/index.js';
 import { createV2Services } from '../src/lib/v2-services.js';
+import { seedVerifiedCheckoutUsers } from '../src/test-utils/verified-test-users.js';
 
 import type { FastifyInstance } from 'fastify';
 
@@ -54,7 +62,39 @@ const FULL_PROFILE = {
   contactPerson: 'A. Applicant',
   phone: '9876543210',
   city: 'Mumbai',
+  kyc: {
+    identity: { idType: 'passport', idNumber: 'P1234567' },
+  },
 };
+
+/** Scenario applicants have already completed both required contact proofs. */
+async function seedVerifiedPartnerApplicant(userId: string): Promise<void> {
+  const repos = services.repos();
+  (repos.users as MemoryUserAccountRepository).save({
+    id: userId,
+    email: `${userId}@c1rcle.test`,
+    name: userId,
+    image: null,
+    emailVerified: true,
+    role: 'partner',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  const now = new Date().toISOString();
+  await repos.guestProfiles.save({
+    userId,
+    displayName: userId,
+    dateOfBirth: '',
+    city: '',
+    tastes: [],
+    intents: [],
+    phoneNumber: '+919876543210',
+    phoneVerifiedAt: now,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+  });
+}
 
 const WEBHOOK_SECRET = 'test_webhook_secret';
 
@@ -93,6 +133,7 @@ async function onboardAndApproveHost(
   server: FastifyInstance,
 ): Promise<{ requestId: string; orgId: string }> {
   const applicantId = 'host_1';
+  await seedVerifiedPartnerApplicant(applicantId);
   const start = await server.inject({
     method: 'POST',
     url: '/api/v2/onboarding/applications',
@@ -107,9 +148,9 @@ async function onboardAndApproveHost(
       method: 'POST',
       url: `/api/v2/onboarding/applications/${requestId}/documents`,
       headers: asUser(applicantId),
-      payload: { label, storagePath: `kyc/${applicantId}/${label}.jpg` },
+      payload: { label, storagePath: `kyc/${applicantId}/${requestId}/${label}` },
     });
-    expect(doc.statusCode).toBe(200);
+    expect(doc.statusCode, JSON.stringify(doc.json())).toBe(200);
   }
 
   const submit = await server.inject({
@@ -117,7 +158,7 @@ async function onboardAndApproveHost(
     url: `/api/v2/onboarding/applications/${requestId}/submit`,
     headers: asUser(applicantId),
   });
-  expect(submit.statusCode).toBe(200);
+  expect(submit.statusCode, JSON.stringify(submit.json())).toBe(200);
 
   // Seed a real platform admin so the approval's `requireAdmin` passes.
   await services
@@ -163,7 +204,7 @@ async function onboardAndApproveHost(
 async function seedPublishedEvent(
   server: FastifyInstance,
   orgId: string,
-): Promise<{ eventId: string; tierId: string }> {
+): Promise<{ eventId: string; tierId: string; venueId: string }> {
   const venue = await server.inject({
     method: 'POST',
     url: `/api/v2/organizations/${orgId}/venues`,
@@ -177,7 +218,13 @@ async function seedPublishedEvent(
     method: 'POST',
     url: `/api/v2/organizations/${orgId}/events`,
     headers: host(orgId),
-    payload: { title: 'Sky Night', venueId, startAt: '2026-09-01T18:00:00Z' },
+    payload: {
+      title: 'Sky Night',
+      summary: 'A music night at Sky Bar.',
+      description: 'Live music and dancing at Sky Bar for the acceptance scenario.',
+      venueId,
+      startAt: new Date(Date.now() - 60_000).toISOString(),
+    },
   });
   expect(event.statusCode, JSON.stringify(event.json())).toBe(201);
   const eventId: string = event.json().id;
@@ -206,7 +253,7 @@ async function seedPublishedEvent(
   expect(publish.statusCode, JSON.stringify(publish.json())).toBe(200);
   expect(publish.json().isPublic).toBe(true);
 
-  return { eventId, tierId };
+  return { eventId, tierId, venueId };
 }
 
 function clearRepos(): void {
@@ -309,6 +356,7 @@ describe('scenario: host lifecycle (onboarding -> publish -> public discovery)',
 describe('scenario: KYC document reject, re-upload, request-changes, and the approve gate', () => {
   it('walks the full document review lifecycle through the real HTTP routes', async () => {
     const applicantId = 'applicant_kyc_1';
+    await seedVerifiedPartnerApplicant(applicantId);
     const start = await server.inject({
       method: 'POST',
       url: '/api/v2/onboarding/applications',
@@ -323,9 +371,9 @@ describe('scenario: KYC document reject, re-upload, request-changes, and the app
         method: 'POST',
         url: `/api/v2/onboarding/applications/${requestId}/documents`,
         headers: asUser(applicantId),
-        payload: { label, storagePath: `kyc/${applicantId}/${label}.jpg` },
+        payload: { label, storagePath: `kyc/${applicantId}/${requestId}/${label}` },
       });
-      expect(doc.statusCode).toBe(200);
+      expect(doc.statusCode, JSON.stringify(doc.json())).toBe(200);
     }
 
     const submit = await server.inject({
@@ -333,7 +381,7 @@ describe('scenario: KYC document reject, re-upload, request-changes, and the app
       url: `/api/v2/onboarding/applications/${requestId}/submit`,
       headers: asUser(applicantId),
     });
-    expect(submit.statusCode).toBe(200);
+    expect(submit.statusCode, JSON.stringify(submit.json())).toBe(200);
 
     await services
       .repos()
@@ -365,13 +413,25 @@ describe('scenario: KYC document reject, re-upload, request-changes, and the app
     expect(afterReject.status).toBe('rejected');
     expect(afterReject.rejectionReason).toBe('Photo is blurry, re-upload needed');
 
-    // The applicant re-uploads — the new copy must be pending again, never
+    // Submitted evidence is immutable: the reviewer must reopen the
+    // application before the applicant can replace the rejected document.
+    const requestChanges = await server.inject({
+      method: 'POST',
+      url: `/api/v2/admin/onboarding/applications/${requestId}/request-changes`,
+      headers: { ...asUser('ops_kyc'), 'idempotency-key': ik('reupload-request-changes') },
+      payload: { note: 'Photo is blurry, re-upload needed' },
+    });
+    expect(requestChanges.statusCode, JSON.stringify(requestChanges.json())).toBe(200);
+    expect(requestChanges.json().status).toBe('changes_requested');
+
+    // Re-upload uses the same applicant/application/label object key. The
+    // new copy must be pending again, never
     // inheriting the stale rejected status.
     const reupload = await server.inject({
       method: 'POST',
       url: `/api/v2/onboarding/applications/${requestId}/documents`,
       headers: asUser(applicantId),
-      payload: { label: 'id_front', storagePath: `kyc/${applicantId}/id_front-v2.jpg` },
+      payload: { label: 'id_front', storagePath: `kyc/${applicantId}/${requestId}/id_front` },
     });
     expect(reupload.statusCode).toBe(200);
     const afterReupload = reupload
@@ -379,6 +439,14 @@ describe('scenario: KYC document reject, re-upload, request-changes, and the app
       .documents.find((d: { label: string }) => d.label === 'id_front');
     expect(afterReupload.status).toBe('pending');
     expect(afterReupload.rejectionReason).toBeNull();
+
+    const resubmit = await server.inject({
+      method: 'POST',
+      url: `/api/v2/onboarding/applications/${requestId}/submit`,
+      headers: asUser(applicantId),
+    });
+    expect(resubmit.statusCode, JSON.stringify(resubmit.json())).toBe(200);
+    expect(resubmit.json().status).toBe('submitted');
 
     // Approval is still blocked — id_front is pending again after the re-upload.
     const stillBlocked = await server.inject({
@@ -409,6 +477,7 @@ describe('scenario: KYC document reject, re-upload, request-changes, and the app
 
   it('requests changes with a note the applicant can read back on their own application', async () => {
     const applicantId = 'applicant_kyc_2';
+    await seedVerifiedPartnerApplicant(applicantId);
     const start = await server.inject({
       method: 'POST',
       url: '/api/v2/onboarding/applications',
@@ -418,18 +487,20 @@ describe('scenario: KYC document reject, re-upload, request-changes, and the app
     const requestId: string = start.json().id;
 
     for (const label of ['id_front', 'id_back', 'selfie']) {
-      await server.inject({
+      const document = await server.inject({
         method: 'POST',
         url: `/api/v2/onboarding/applications/${requestId}/documents`,
         headers: asUser(applicantId),
-        payload: { label, storagePath: `kyc/${applicantId}/${label}.jpg` },
+        payload: { label, storagePath: `kyc/${applicantId}/${requestId}/${label}` },
       });
+      expect(document.statusCode, JSON.stringify(document.json())).toBe(200);
     }
-    await server.inject({
+    const submit = await server.inject({
       method: 'POST',
       url: `/api/v2/onboarding/applications/${requestId}/submit`,
       headers: asUser(applicantId),
     });
+    expect(submit.statusCode, JSON.stringify(submit.json())).toBe(200);
 
     await services
       .repos()
@@ -466,6 +537,7 @@ describe('scenario: guest purchase + door check-in + finance settlement', () => 
     const { orgId } = await onboardAndApproveHost(server);
     const { eventId, tierId } = await seedPublishedEvent(server, orgId);
 
+    seedVerifiedCheckoutUsers(['guest_1']);
     // ── Guest checkout ─────────────────────────────────────────────────────
     const quote = await server.inject({
       method: 'POST',
@@ -527,6 +599,13 @@ describe('scenario: guest purchase + door check-in + finance settlement', () => 
     const tickets = wallet.json().items;
     expect(tickets.length).toBe(1);
     const entitlementId: string = tickets[0].id;
+    const credential = await server.inject({
+      method: 'GET',
+      url: `/api/v2/tickets/${entitlementId}/qr`,
+      headers: { 'x-user-id': 'guest_1' },
+    });
+    expect(credential.statusCode, JSON.stringify(credential.json())).toBe(200);
+    const qrPayload: string = credential.json().qrPayload;
 
     // ── Door admission (mint a door code over HTTP, redeem it, scan) ────────
     const codeResponse = await server.inject({
@@ -559,7 +638,7 @@ describe('scenario: guest purchase + door check-in + finance settlement', () => 
       method: 'POST',
       url: '/api/v2/door/check-ins',
       headers: { 'x-organization-id': orgId, 'x-scanner-session-token': scannerToken },
-      payload: { eventId, qrPayload: entitlementId, operatorName: 'Staff One' },
+      payload: { eventId, qrPayload, operatorName: 'Staff One' },
     });
     expect(checkIn.statusCode, JSON.stringify(checkIn.json())).toBe(200);
     expect(checkIn.json()).toMatchObject({ status: 'consumed', checkInId: expect.any(String) });
@@ -570,7 +649,7 @@ describe('scenario: guest purchase + door check-in + finance settlement', () => 
       method: 'POST',
       url: '/api/v2/door/check-ins',
       headers: { 'x-organization-id': orgId, 'x-scanner-session-token': scannerToken },
-      payload: { eventId, qrPayload: entitlementId },
+      payload: { eventId, qrPayload },
     });
     expect(replay.statusCode).toBe(200);
     expect(replay.json()).toMatchObject({ status: 'denied', denyReason: 'already_used' });
@@ -586,5 +665,395 @@ describe('scenario: guest purchase + door check-in + finance settlement', () => 
     for (const expected of ['ticket_revenue', 'platform_fee', 'venue_share', 'host_payout']) {
       expect(entryTypes).toContain(expected);
     }
+  });
+});
+
+describe('scenario: M4 Promoter campaign attribution over the full API', () => {
+  it('connects a Promoter, accepts event terms, attributes a paid order, and exposes scoped evidence', async () => {
+    const { orgId: hostOrgId } = await onboardAndApproveHost(server);
+    const { eventId, tierId, venueId } = await seedPublishedEvent(server, hostOrgId);
+
+    // Run the same flow with either the emulator fixture or an explicitly configured
+    // hosted artifact. No production legal terms are supplied by this scenario.
+    const configuredAgreement = getGatewayConfig().PROMOTER_AGREEMENT_ARTIFACT;
+    const promoterUserId = 'promoter_m4_scenario';
+    await seedVerifiedPartnerApplicant(promoterUserId);
+    const agreement = await server.inject({
+      method: 'GET',
+      url: '/api/v2/onboarding/promoter-agreement',
+      headers: asUser(promoterUserId),
+    });
+    expect(agreement.statusCode).toBe(200);
+    expect(agreement.json()).toMatchObject({
+      activationAvailable: configuredAgreement !== undefined,
+      agreement: {
+        status: configuredAgreement?.status ?? 'test_fixture',
+        text: configuredAgreement?.text ?? expect.stringContaining('NOT A LEGAL AGREEMENT'),
+      },
+    });
+
+    const application = await server.inject({
+      method: 'POST',
+      url: '/api/v2/onboarding/applications',
+      headers: asUser(promoterUserId),
+      payload: {
+        requestedType: 'promoter',
+        plan: 'basic',
+        profile: { ...FULL_PROFILE, legalName: 'M4 Scenario Promoter' },
+      },
+    });
+    expect(application.statusCode, JSON.stringify(application.json())).toBe(201);
+    const requestId: string = application.json().id;
+
+    const acceptedAgreement = await server.inject({
+      method: 'POST',
+      url: `/api/v2/onboarding/applications/${requestId}/promoter-agreement/accept`,
+      headers: asUser(promoterUserId),
+      payload: { version: agreement.json().agreement.version },
+    });
+    expect(acceptedAgreement.statusCode, JSON.stringify(acceptedAgreement.json())).toBe(200);
+    expect(acceptedAgreement.json().promoterAgreementAcceptances[0]).toMatchObject({
+      artifactStatus: configuredAgreement?.status ?? 'test_fixture',
+      acceptedBy: promoterUserId,
+    });
+
+    for (const label of ['id_front', 'id_back', 'selfie']) {
+      const document = await server.inject({
+        method: 'POST',
+        url: `/api/v2/onboarding/applications/${requestId}/documents`,
+        headers: asUser(promoterUserId),
+        payload: { label, storagePath: `kyc/${promoterUserId}/${requestId}/${label}` },
+      });
+      expect(document.statusCode, JSON.stringify(document.json())).toBe(200);
+    }
+    const submit = await server.inject({
+      method: 'POST',
+      url: `/api/v2/onboarding/applications/${requestId}/submit`,
+      headers: asUser(promoterUserId),
+    });
+    expect(submit.statusCode, JSON.stringify(submit.json())).toBe(200);
+
+    for (const label of ['id_front', 'id_back', 'selfie']) {
+      const verify = await server.inject({
+        method: 'POST',
+        url: `/api/v2/admin/onboarding/applications/${requestId}/documents/${label}/verify`,
+        headers: asUser('ops_1'),
+        payload: {},
+      });
+      expect(verify.statusCode, JSON.stringify(verify.json())).toBe(200);
+    }
+    const approvePromoter = await server.inject({
+      method: 'POST',
+      url: `/api/v2/admin/onboarding/applications/${requestId}/approve`,
+      headers: asUser('ops_1'),
+      payload: {},
+    });
+    expect(approvePromoter.statusCode, JSON.stringify(approvePromoter.json())).toBe(200);
+    const promoterOrgId: string = approvePromoter.json().organization.id;
+
+    const promoterHeaders = {
+      'x-user-id': promoterUserId,
+      'x-organization-id': promoterOrgId,
+      'idempotency-key': ik('promoter'),
+    };
+    const promoterCommandHeaders = (prefix: string) => ({
+      ...promoterHeaders,
+      'idempotency-key': ik(prefix),
+    });
+    const connection = await server.inject({
+      method: 'POST',
+      url: '/api/v2/promoter-connections',
+      headers: promoterCommandHeaders('promoter-connect'),
+      payload: { counterpartyId: hostOrgId, targetType: 'host', initiatedBy: 'promoter' },
+    });
+    expect(connection.statusCode, JSON.stringify(connection.json())).toBe(201);
+    const connectionId: string = connection.json().id;
+    const connectionApproval = await server.inject({
+      method: 'POST',
+      url: `/api/v2/promoter-connections/${connectionId}/approve`,
+      headers: host(hostOrgId),
+    });
+    expect(connectionApproval.statusCode, JSON.stringify(connectionApproval.json())).toBe(200);
+    expect(connectionApproval.json().status).toBe('active');
+
+    const freeEvent = await server.inject({
+      method: 'POST',
+      url: `/api/v2/organizations/${hostOrgId}/events`,
+      headers: host(hostOrgId),
+      payload: {
+        title: 'M4 Free RSVP Night',
+        summary: 'A free RSVP music night.',
+        description: 'Free RSVP event for testing promoter attribution without paid commission.',
+        venueId,
+        startAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      },
+    });
+    expect(freeEvent.statusCode, JSON.stringify(freeEvent.json())).toBe(201);
+    const freeEventId: string = freeEvent.json().id;
+    const freeTier = await server.inject({
+      method: 'POST',
+      url: `/api/v2/events/${freeEventId}/ticket-tiers`,
+      headers: host(hostOrgId),
+      payload: { name: 'Free RSVP', accessType: 'RSVP', quantity: 50 },
+    });
+    expect(freeTier.statusCode, JSON.stringify(freeTier.json())).toBe(201);
+    for (const action of ['review', 'publish']) {
+      const transition = await server.inject({
+        method: 'POST',
+        url: `/api/v2/events/${freeEventId}/${action}`,
+        headers: host(hostOrgId),
+      });
+      expect(transition.statusCode, JSON.stringify(transition.json())).toBe(200);
+    }
+
+    const invalidFreeAssignment = await server.inject({
+      method: 'POST',
+      url: `/api/v2/events/${freeEventId}/promoter-assignments`,
+      headers: host(hostOrgId),
+      payload: {
+        promoterId: promoterOrgId,
+        ratePercent: 1,
+        flatPaise: 0,
+        eligibleTierIds: [],
+      },
+    });
+    expect(invalidFreeAssignment.statusCode).toBe(400);
+
+    const freeAssignment = await server.inject({
+      method: 'POST',
+      url: `/api/v2/events/${freeEventId}/promoter-assignments`,
+      headers: host(hostOrgId),
+      payload: {
+        promoterId: promoterOrgId,
+        ratePercent: 0,
+        flatPaise: 0,
+        eligibleTierIds: [],
+      },
+    });
+    expect(freeAssignment.statusCode, JSON.stringify(freeAssignment.json())).toBe(201);
+    const freeAssignmentAccept = await server.inject({
+      method: 'POST',
+      url: `/api/v2/promoter-assignments/${freeAssignment.json().id}/respond`,
+      headers: promoterCommandHeaders('promoter-free-rsvp'),
+      payload: { decision: 'accept', expectedVersion: freeAssignment.json().version },
+    });
+    expect(freeAssignmentAccept.statusCode, JSON.stringify(freeAssignmentAccept.json())).toBe(200);
+    const freeLink = await server.inject({
+      method: 'POST',
+      url: `/api/v2/promoter-assignments/${freeAssignment.json().id}/referral-links`,
+      headers: promoterCommandHeaders('promoter-free-link'),
+      payload: { label: 'Free RSVP campaign' },
+    });
+    expect(freeLink.statusCode, JSON.stringify(freeLink.json())).toBe(201);
+    seedVerifiedCheckoutUsers(['guest_m4_rsvp']);
+    const rsvp = await server.inject({
+      method: 'POST',
+      url: '/api/v2/rsvp',
+      headers: { 'x-user-id': 'guest_m4_rsvp', 'idempotency-key': ik('m4-rsvp') },
+      payload: {
+        eventId: freeEventId,
+        tierId: freeTier.json().id,
+        referralCode: freeLink.json().code,
+      },
+    });
+    expect(rsvp.statusCode, JSON.stringify(rsvp.json())).toBe(201);
+    const rsvpOrder = await services.repos().orders.getById(rsvp.json().order.id);
+    expect(rsvpOrder).toMatchObject({
+      subtotalPaise: 0,
+      grandTotalPaise: 0,
+      attribution: {
+        promoterId: promoterOrgId,
+        assignmentId: freeAssignment.json().id,
+        referralLinkId: freeLink.json().id,
+        promoterCommissionPaise: 0,
+      },
+    });
+
+    const assignment = await server.inject({
+      method: 'POST',
+      url: `/api/v2/events/${eventId}/promoter-assignments`,
+      headers: host(hostOrgId),
+      payload: { promoterId: promoterOrgId, ratePercent: 10, eligibleTierIds: [tierId] },
+    });
+    expect(assignment.statusCode, JSON.stringify(assignment.json())).toBe(201);
+    const assignmentId: string = assignment.json().id;
+    const acceptedAssignment = await server.inject({
+      method: 'POST',
+      url: `/api/v2/promoter-assignments/${assignmentId}/respond`,
+      headers: promoterCommandHeaders('promoter-paid-accept'),
+      payload: { decision: 'accept', expectedVersion: assignment.json().version },
+    });
+    expect(acceptedAssignment.statusCode, JSON.stringify(acceptedAssignment.json())).toBe(200);
+    expect(acceptedAssignment.json().status).toBe('accepted');
+
+    const link = await server.inject({
+      method: 'POST',
+      url: `/api/v2/promoter-assignments/${assignmentId}/referral-links`,
+      headers: promoterCommandHeaders('promoter-paid-link'),
+      payload: { label: 'M4 API scenario' },
+    });
+    expect(link.statusCode, JSON.stringify(link.json())).toBe(201);
+    const referralCode: string = link.json().code;
+
+    const publicEvent = await server.inject({
+      method: 'GET',
+      url: `/api/v2/public/events/${eventId}`,
+    });
+    expect(publicEvent.statusCode).toBe(200);
+    const clickId = randomUUID();
+    const click = await server.inject({
+      method: 'POST',
+      url: '/api/v2/public/promoter-links/click',
+      payload: { eventSlug: publicEvent.json().slug, code: referralCode, clickId },
+    });
+    expect(click.statusCode).toBe(200);
+    expect(click.json()).toEqual({
+      accepted: true,
+      contextToken: expect.stringMatching(/^[A-Za-z0-9_-]+\.[a-f0-9]{64}$/u),
+    });
+    expect(
+      JSON.parse(
+        Buffer.from(click.json().contextToken.split('.')[0], 'base64url').toString('utf8'),
+      ),
+    ).toMatchObject({ eventId });
+    const duplicateClick = await server.inject({
+      method: 'POST',
+      url: '/api/v2/public/promoter-links/click',
+      payload: { eventSlug: publicEvent.json().slug, code: referralCode, clickId },
+    });
+    expect(duplicateClick.statusCode).toBe(200);
+    expect(duplicateClick.json()).toEqual({
+      accepted: true,
+      contextToken: expect.stringMatching(/^[A-Za-z0-9_-]+\.[a-f0-9]{64}$/u),
+    });
+    expect(
+      JSON.parse(
+        Buffer.from(duplicateClick.json().contextToken.split('.')[0], 'base64url').toString('utf8'),
+      ),
+    ).toMatchObject({ eventId });
+    const invalidCodeClick = await server.inject({
+      method: 'POST',
+      url: '/api/v2/public/promoter-links/click',
+      payload: { eventSlug: publicEvent.json().slug, code: 'UNKNOWN', clickId: randomUUID() },
+    });
+    expect(invalidCodeClick.statusCode).toBe(200);
+    expect(invalidCodeClick.json()).toEqual({
+      accepted: true,
+      contextToken: expect.stringMatching(/^[A-Za-z0-9_-]+\.[a-f0-9]{64}$/u),
+    });
+    expect(
+      JSON.parse(
+        Buffer.from(invalidCodeClick.json().contextToken.split('.')[0], 'base64url').toString(
+          'utf8',
+        ),
+      ),
+    ).toMatchObject({ eventId });
+
+    const guestUserId = 'guest_m4_scenario';
+    seedVerifiedCheckoutUsers([guestUserId]);
+    const checkoutLines = [{ tierId, quantity: 1 }];
+    const quote = await server.inject({
+      method: 'POST',
+      url: '/api/v2/checkout/quote',
+      headers: { 'x-user-id': guestUserId },
+      payload: { eventId, lines: checkoutLines, referralCode },
+    });
+    expect(quote.statusCode, JSON.stringify(quote.json())).toBe(200);
+    expect(quote.json()).not.toHaveProperty('referralAttributionStatus');
+
+    const holdHeaders = { 'x-user-id': guestUserId, 'idempotency-key': ik('m4-hold') };
+    const hold = await server.inject({
+      method: 'POST',
+      url: '/api/v2/checkout/holds',
+      headers: holdHeaders,
+      payload: { eventId, lines: checkoutLines, referralCode },
+    });
+    expect(hold.statusCode, JSON.stringify(hold.json())).toBe(201);
+    const holdId: string = hold.json().holdId;
+    const holdRetry = await server.inject({
+      method: 'POST',
+      url: '/api/v2/checkout/holds',
+      headers: holdHeaders,
+      payload: { eventId, lines: checkoutLines, referralCode },
+    });
+    expect(holdRetry.statusCode).toBe(201);
+    expect(holdRetry.json().holdId).toBe(holdId);
+
+    const attemptHeaders = { 'x-user-id': guestUserId, 'idempotency-key': ik('m4-attempt') };
+    const attempt = await server.inject({
+      method: 'POST',
+      url: '/api/v2/payments/attempts',
+      headers: attemptHeaders,
+      payload: { holdId },
+    });
+    expect(attempt.statusCode, JSON.stringify(attempt.json())).toBe(201);
+    const paymentIntentId: string = attempt.json().paymentIntentId;
+    const attemptRetry = await server.inject({
+      method: 'POST',
+      url: '/api/v2/payments/attempts',
+      headers: attemptHeaders,
+      payload: { holdId },
+    });
+    expect(attemptRetry.statusCode).toBe(201);
+    expect(attemptRetry.json().paymentIntentId).toBe(paymentIntentId);
+
+    const paymentId = `pay_m4_scenario_${keySeq}`;
+    memoryProvider().simulateCapture(paymentId, quote.json().grandTotalPaise, paymentIntentId);
+    const body = webhookPayload({ id: paymentId, order_id: paymentIntentId, holdId });
+    const webhook = await server.inject({
+      method: 'POST',
+      url: '/api/v2/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+    expect(webhook.statusCode, JSON.stringify(webhook.json())).toBe(200);
+    const webhookReplay = await server.inject({
+      method: 'POST',
+      url: '/api/v2/webhooks/payments/razorpay',
+      headers: { 'content-type': 'application/json', 'x-razorpay-signature': sign(body) },
+      payload: body,
+    });
+    expect(webhookReplay.statusCode, JSON.stringify(webhookReplay.json())).toBe(200);
+
+    const order = await services.repos().orders.getById(`ORD-${paymentId}`);
+    expect(order?.status).toBe('paid');
+    expect(order?.attribution).toMatchObject({
+      promoterId: promoterOrgId,
+      assignmentId,
+      referralLinkId: link.json().id,
+      code: referralCode,
+    });
+    const bookingReference =
+      order?.bookingReference ?? bookingReferenceForOrderId(`ORD-${paymentId}`);
+
+    const promoterSummary = await server.inject({
+      method: 'GET',
+      url: `/api/v2/promoters/${promoterOrgId}/campaign-summary`,
+      headers: promoterHeaders,
+    });
+    expect(promoterSummary.statusCode, JSON.stringify(promoterSummary.json())).toBe(200);
+    expect(promoterSummary.json()).toMatchObject({ clicks: 1, conversions: 2 });
+
+    const attributedOrders = await server.inject({
+      method: 'GET',
+      url: `/api/v2/events/${eventId}/promoters/${promoterOrgId}/attributed-orders`,
+      headers: host(hostOrgId),
+    });
+    expect(attributedOrders.statusCode, JSON.stringify(attributedOrders.json())).toBe(200);
+    expect(attributedOrders.json().items).toHaveLength(1);
+    expect(JSON.stringify(attributedOrders.json())).not.toContain(guestUserId);
+
+    const investigation = await server.inject({
+      method: 'GET',
+      url: `/api/v2/admin/orders/by-booking-reference/${bookingReference}`,
+      headers: asUser('ops_1'),
+    });
+    expect(investigation.statusCode, JSON.stringify(investigation.json())).toBe(200);
+    expect(investigation.json().attribution).toMatchObject({
+      promoterId: promoterOrgId,
+      assignmentId,
+      referralLinkId: link.json().id,
+    });
+    expect(investigation.json().journals.length).toBeGreaterThan(0);
   });
 });

@@ -35,3 +35,7 @@
 | D-030 (×2) | Partner-chain audit closes: N+1 name resolution, block TOCTOU, poster ACL, the `maxPerUser` knob |
 Frontend ADRs (`C1RCLE-FRONTEND/docs/architecture/adr/`): `0001` TypeScript 5, not 7; `0002` ESLint 9 with `import-x`; `0003` compiled packages.
 **Decisions that are not recorded as ADRs** (the lived decision is in another document or only in practice): the nginx sidecar topology and the Cloudflare origin-lock model (`docs/nginx/sidecar-deployment.md`, `cloudflare-edge.md`); the offline-scanning model (SOTA forbids an offline queue without a new ADR; none exists); the payments design (branch `docs/payments-design`, PR #116) and refund and chargeback decisions (PR #131, open); journal v2 and the read-model transition; the payout release gate (`payments-release-gate.md`); the keep-Vercel-for-compute choice; free-plan-only infra (owner decision in `cloudflare_plan.md`). Suggest: fix the D-030 duplicate, then add ADRs for these.
+
+## Changes since this file was generated
+
+Verified 2026-11-18 against backend `staging` @ `3802889`. `docs/architecture/decisions.md` now has **31** decision headings (30 distinct ids). Not mentioned above (0): none.

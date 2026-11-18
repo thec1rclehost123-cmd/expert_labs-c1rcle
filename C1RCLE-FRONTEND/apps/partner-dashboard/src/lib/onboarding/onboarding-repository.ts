@@ -8,8 +8,10 @@ import { z } from 'zod';
 import { isApiClientError } from '@c1rcle/api-client';
 import {
   onboardingRequestDtoSchema,
+  promoterAgreementStatusDtoSchema,
   startOnboardingSchema,
   verificationResultDtoSchema,
+  verifyPhoneSchema,
 } from '@c1rcle/contracts/client';
 
 import { apiClient } from '@/lib/api/client';
@@ -81,14 +83,18 @@ async function withVersionRecovery(
 }
 
 /** The applicant's own application, if any. `null` before they have started. */
-export async function getMine(): Promise<OnboardingRequestDto | null> {
+export async function getMine(
+  requestedType?: 'venue' | 'host' | 'promoter',
+): Promise<OnboardingRequestDto | null> {
   // Read through the same-origin BFF (`/api/bff/onboarding/me`), which
   // forwards the browser's httpOnly session cookie to the gateway. Every
   // onboarding call below (start/autosave/submit/upload) goes through the BFF
   // the same way — cookie-authenticated, CSRF-checked — so no bearer token is
   // involved and the client never holds a cross-origin gateway URL.
   const response = await bffClient.get({
-    path: '/api/bff/onboarding/me',
+    path: requestedType
+      ? `/api/bff/onboarding/me?requestedType=${requestedType}`
+      : '/api/bff/onboarding/me',
     schema: onboardingMeResponseSchema,
   });
   if (response.request !== null) {
@@ -184,4 +190,38 @@ export async function verifyDocument(input: VerifyDocumentRequest): Promise<Veri
     body: input,
     schema: verificationResultDtoSchema,
   });
+}
+
+export async function verifyPhone(input: {
+  phoneNumber: string;
+  idToken: string;
+}): Promise<VerificationResultDto> {
+  return bffClient.post({
+    path: '/api/auth/phone-verification',
+    body: verifyPhoneSchema.parse(input),
+    schema: verificationResultDtoSchema,
+    headers: csrfHeaders(),
+  });
+}
+
+export async function getPromoterAgreement() {
+  return bffClient.get({
+    path: '/api/bff/onboarding/promoter-agreement',
+    schema: promoterAgreementStatusDtoSchema,
+  });
+}
+
+export async function acceptPromoterAgreement(
+  requestId: string,
+  version: string,
+  idempotencyKey: string,
+) {
+  const dto = await bffClient.post({
+    path: `/api/bff/onboarding/applications/${encodeURIComponent(requestId)}/promoter-agreement/accept`,
+    body: { version },
+    schema: onboardingRequestDtoSchema,
+    headers: { ...csrfHeaders(), 'Idempotency-Key': idempotencyKey },
+  });
+  recordVersion(requestId, dto);
+  return dto;
 }

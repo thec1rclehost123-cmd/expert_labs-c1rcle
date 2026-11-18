@@ -75,11 +75,11 @@ export function HostPartnersScreen({
       baseHref="/partner/host/partners"
       primarySegment="venues"
       primaryLabel="Venues"
-      primarySubLabel="My Venues"
+      primarySubLabel={segment === 'promoters' ? 'My Promoters' : 'My Venues'}
       segment={segment}
       subView={subView}
       search={search}
-      showSearch={false}
+      showSearch={segment === 'staff'}
       hostAccent
       {...(profileId ? { profileId } : {})}
       {...(organizationId ? { organizationId } : {})}

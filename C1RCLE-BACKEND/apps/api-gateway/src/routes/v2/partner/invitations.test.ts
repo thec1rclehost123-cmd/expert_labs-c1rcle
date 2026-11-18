@@ -1,5 +1,8 @@
+import { createOrganization } from '@c1rcle/core/domain';
+import { type MemoryUserAccountRepository } from '@c1rcle/core/infrastructure';
 import { describe, expect, it } from 'vitest';
 
+import { createV2Services } from '../../../lib/v2-services.js';
 import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
 
 import partnerOrganizationRoutes from './organizations.js';
@@ -20,21 +23,16 @@ const write = (organizationId: string) => ({
 
 const buildServer = () => buildPartnerTestServer({ routes: [partnerOrganizationRoutes] });
 
-/**
- * Creates an organization and returns its id. On the memory driver the dev
- * actor's organization comes from `X-Organization-Id`, so scoping every later
- * call to this id is what makes the tenant checks pass.
- */
-async function seedOrganization(server: Awaited<ReturnType<typeof buildServer>>): Promise<string> {
-  const created = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    // `organizations.create` still requires the header even though it ignores
-    // it (there is no tenant yet); the created id is what matters afterwards.
-    headers: { 'x-organization-id': 'org_seed', 'idempotency-key': `seed-${++keySeq}` },
-    payload: { name: 'Skyline', slug: `skyline-${keySeq}` },
+/** Seed an already approved workspace; direct applicant provisioning is forbidden. */
+async function seedOrganization(_server: Awaited<ReturnType<typeof buildServer>>): Promise<string> {
+  const org = createOrganization({
+    id: `inv-org-${++keySeq}`,
+    name: 'Skyline',
+    slug: `skyline-${keySeq}`,
+    ownerId: 'user_1',
   });
-  return created.json().id;
+  await createV2Services().repos().organizations.save(org);
+  return org.id;
 }
 
 describe('organization invitations', () => {
@@ -156,12 +154,19 @@ describe('organization invitations', () => {
     });
     const invitationId = created.json().id;
 
-    // The memory driver has a single fixed dev actor, and that actor owns the
-    // organization it just created — so this exercises the already-a-member
-    // path rather than the new-member happy path. Acceptance BY A NEW USER is
-    // covered at the domain level in `packages/core/src/domain/invitation.test.ts`,
-    // which can name a different accepting user; wiring a second real session
-    // here needs the firestore driver (see phase-00 Session Log).
+    // The already-member path still requires the actor's persisted, verified
+    // email to match the invitation recipient. Owning the org is not a bypass.
+    (createV2Services().repos().users as MemoryUserAccountRepository).save({
+      id: 'user_1',
+      email: 'joiner@example.com',
+      emailVerified: true,
+      name: 'Synthetic existing member',
+      image: null,
+      role: 'partner',
+      createdAt: 0,
+      updatedAt: 0,
+    });
+    const membershipBefore = (await createV2Services().repos().organizations.getById(org))?.members;
     const accepted = await server.inject({
       method: 'POST',
       url: `/invitations/${invitationId}/accept`,
@@ -169,6 +174,9 @@ describe('organization invitations', () => {
 
     expect(accepted.statusCode).toBe(200);
     expect(accepted.json()).toMatchObject({ id: org });
+    expect((await createV2Services().repos().organizations.getById(org))?.members).toEqual(
+      membershipBefore,
+    );
 
     const listed = await server.inject({
       method: 'GET',

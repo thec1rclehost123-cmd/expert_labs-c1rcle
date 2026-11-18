@@ -7,9 +7,14 @@ import {
   hostPublicDtoSchema,
   discoveryFeedDtoSchema,
   publicTicketTierListResponseSchema,
+  eventPosterUrlSchema,
+  eventMediaSchema,
+  publicTicketAddonListResponseSchema,
   paginatedSchema,
+  redeemTicketAccessCodeSchema,
+  ticketAccessGrantDtoSchema,
 } from '@c1rcle/contracts/client';
-import { effectiveTierPricePaise } from '@c1rcle/core/domain';
+import { UnauthorizedError } from '@c1rcle/core/domain';
 import { z } from 'zod';
 
 import type { Organization, TicketTier, Venue } from '@c1rcle/core/domain';
@@ -32,6 +37,87 @@ import type { FastifyInstance } from 'fastify';
  */
 
 const services = createV2Services();
+
+async function publicEventToDto(
+  event: Parameters<typeof eventToDto>[0],
+  revealAfterGrant = false,
+  userId?: string,
+  accessGrantId?: string,
+) {
+  const dto = eventToDto(event);
+  const pricingSummary = await services.public.getPublicPricingSummary(event);
+  const imageUrl = publicArtworkUrl(event.imageUrl);
+  const youtubeUrl = dto.media?.youtubeUrl;
+  const safeYoutubeUrl =
+    youtubeUrl && eventMediaSchema.shape.youtubeUrl.safeParse(youtubeUrl).success
+      ? youtubeUrl
+      : null;
+  const media = dto.media
+    ? {
+        ...dto.media,
+        youtubeUrl: safeYoutubeUrl,
+        gallery: dto.media.gallery.filter((item) => publicArtworkUrl(item.url) !== null),
+        spotlights: dto.media.spotlights.map((item) => ({
+          ...item,
+          link: publicArtworkUrl(item.link),
+          imageUrl: publicArtworkUrl(item.imageUrl),
+        })),
+      }
+    : undefined;
+  const safeDto = {
+    ...dto,
+    imageUrl,
+    salesStatus: pricingSummary.salesStatus,
+    activeStartingPricePaise: pricingSummary.activeStartingPricePaise,
+    currentStartingPricePaise: await services.public.getCurrentStartingPricePaise(
+      event.id,
+      userId,
+      accessGrantId,
+    ),
+    ...(media ? { media } : {}),
+  };
+  if (!event.externalLocation) return safeDto;
+  const disclosure =
+    event.addressDisclosure ??
+    (event.visibilityMode === 'code' || event.visibilityMode === 'invited' ? 'hidden' : 'public');
+  const reveal = disclosure === 'public' || (revealAfterGrant && disclosure === 'after_grant');
+  return {
+    ...safeDto,
+    externalLocation: {
+      name: event.externalLocation.name,
+      address: reveal ? event.externalLocation.address : null,
+      ...(reveal && event.externalLocation.city ? { city: event.externalLocation.city } : {}),
+      ...(reveal && event.externalLocation.region ? { region: event.externalLocation.region } : {}),
+      ...(reveal && event.externalLocation.postalCode
+        ? { postalCode: event.externalLocation.postalCode }
+        : {}),
+      ...(reveal && event.externalLocation.country
+        ? { country: event.externalLocation.country }
+        : {}),
+      ...(reveal && event.externalLocation.mapUrl ? { mapUrl: event.externalLocation.mapUrl } : {}),
+    },
+  };
+}
+
+/** Legacy public reads may contain URLs that newer writes correctly reject. */
+function publicArtworkUrl(value: string | null | undefined): string | null {
+  return value && eventPosterUrlSchema.safeParse(value).success ? value : null;
+}
+const publicTierHeadersSchema = z.looseObject({
+  'x-ticket-access-grant-id': z.string().min(1).max(64).optional(),
+});
+
+function optionalActorUserId(request: Parameters<typeof services.actor>[0]): string | undefined {
+  try {
+    return services.actor(request).userId ?? undefined;
+  } catch (error) {
+    // Public reads accept anonymous callers. On the Firestore driver, the
+    // strict actor resolver correctly rejects a missing session; for these
+    // reads, treat only that expected unauthenticated case as anonymous.
+    if (error instanceof UnauthorizedError) return undefined;
+    throw error;
+  }
+}
 
 // Event ids are opaque (≤64 chars); slugs can run up to 80
 // (`slugifyEventTitle` caps at 80) — the shared char class, wider bound.
@@ -73,8 +159,17 @@ const searchQuerySchema = paginationQuerySchema.extend({
 
 const eventListSchema = paginatedSchema(eventDtoSchema);
 const promoterClickBodySchema = z
-  .object({ eventSlug: z.string().min(1).max(80), code: z.string().min(4).max(16) })
+  .object({
+    eventSlug: z.string().min(1).max(80),
+    code: z.string().min(4).max(16),
+    clickId: z.uuid(),
+    contextToken: z.string().min(16).max(2048).optional(),
+  })
   .strict();
+const promoterClickResponseSchema = z.object({
+  accepted: z.literal(true),
+  contextToken: z.string().min(16).max(2048),
+});
 const vanityParamsSchema = z.object({
   handle: z.string().min(1).max(60),
   slug: z.string().min(1).max(60),
@@ -82,6 +177,45 @@ const vanityParamsSchema = z.object({
 const vanityResolutionSchema = z.object({ eventSlug: z.string(), code: z.string() });
 
 export default async function publicDiscoveryRoutes(fastify: FastifyInstance) {
+  fastify.post(
+    '/ticket-access-codes/redeem',
+    {
+      preHandler: [
+        fastify.rateLimit('SENSITIVE_COMMAND'),
+        fastify.validateV2({ body: redeemTicketAccessCodeSchema }),
+      ],
+    },
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const actor = services.actor(request);
+      if (!actor.userId) {
+        mapDomainError(
+          reply,
+          request,
+          'ticket-access-codes/redeem',
+          new UnauthorizedError('Authentication is required to redeem an access code'),
+        );
+        return reply;
+      }
+      const { code } = request.body as z.infer<typeof redeemTicketAccessCodeSchema>;
+      const grant = await services.ticketAccess
+        .redeemCode(actor, code)
+        .catch((error: unknown) =>
+          mapDomainError(reply, request, 'ticket-access-codes/redeem', error),
+        );
+      if (!grant) return reply;
+      const validated = validateV2Response(reply, request, ticketAccessGrantDtoSchema, {
+        id: grant.id,
+        eventId: grant.eventId,
+        scope: grant.scope ?? 'tiers',
+        tierIds: grant.tierIds,
+        expiresAt: grant.expiresAt,
+      });
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
   fastify.get(
     '/promoter-links/:handle/:slug',
     {
@@ -111,13 +245,30 @@ export default async function publicDiscoveryRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
-      const { eventSlug, code } = request.body as z.infer<typeof promoterClickBodySchema>;
+      const { eventSlug, code, clickId, contextToken } = request.body as z.infer<
+        typeof promoterClickBodySchema
+      >;
       const detail = await services.public
         .getEvent(eventSlug)
         .catch((error: unknown) => mapDomainError(reply, request, eventSlug, error));
       if (!detail) return reply;
-      const link = await services.referralLinks.trackClick(detail.event.id, code);
-      return reply.send({ tracked: Boolean(link) });
+      // Keep code validity private. The service records a click only when the
+      // code is valid. The signed context is issued either way, preserving the
+      // same anonymous response shape and allowing checkout to fall back to an
+      // earlier valid click if this candidate is invalid.
+      await services.referralLinks.trackClick(detail.event.id, code, clickId);
+      const payload = {
+        accepted: true as const,
+        contextToken: await services.referralLinks.updateClickContext(
+          detail.event.id,
+          code,
+          clickId,
+          contextToken,
+        ),
+      };
+      const validated = validateV2Response(reply, request, promoterClickResponseSchema, payload);
+      if (validated === undefined) return reply;
+      return reply.send(validated);
     },
   );
 
@@ -131,13 +282,14 @@ export default async function publicDiscoveryRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const query = request.query as z.infer<typeof paginationQuerySchema>;
       const page = await services.public.listEvents({
         limit: query.limit,
         cursor: query.cursor ?? null,
       });
       const payload = {
-        items: page.items.map(eventToDto),
+        items: await Promise.all(page.items.map((event) => publicEventToDto(event))),
         pageInfo: {
           page: 1,
           pageSize: query.limit,
@@ -155,21 +307,48 @@ export default async function publicDiscoveryRoutes(fastify: FastifyInstance) {
   fastify.get(
     '/events/:idOrSlug',
     {
-      preHandler: [fastify.rateLimit('PUBLIC_READ'), fastify.validateV2({ params: idOrSlugParam })],
+      preHandler: [
+        fastify.rateLimit('PUBLIC_READ'),
+        fastify.validateV2({ params: idOrSlugParam, headers: publicTierHeadersSchema }),
+      ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const { idOrSlug } = request.params as z.infer<typeof idOrSlugParam>;
+      const rawGrantId = request.headers['x-ticket-access-grant-id'];
+      const accessGrantId = Array.isArray(rawGrantId) ? rawGrantId[0] : rawGrantId;
+      const userId = optionalActorUserId(request);
       const detail = await services.public
-        .getEvent(idOrSlug)
+        .getEvent(idOrSlug, userId, accessGrantId)
         .catch((error: unknown) => mapDomainError(reply, request, idOrSlug, error));
       if (detail === undefined) return reply;
+      const privateEvent =
+        detail.event.visibilityMode === 'code' || detail.event.visibilityMode === 'invited';
       const payload = {
-        ...eventToDto(detail.event),
-        venue: detail.venue === null ? null : eventVenueToDto(detail.venue),
+        ...(await publicEventToDto(detail.event, true, userId, accessGrantId)),
+        // PublicService emits only a short-lived signed URL for an event grant;
+        // partner and anonymous projections always redact private poster URLs.
+        imageUrl: publicArtworkUrl(detail.event.imageUrl),
+        venue:
+          detail.venue === null
+            ? null
+            : eventVenueToDto(detail.venue, {
+                revealAddress:
+                  (detail.event.addressDisclosure ?? (privateEvent ? 'hidden' : 'public')) ===
+                    'public' ||
+                  (privateEvent && detail.event.addressDisclosure === 'after_grant'),
+                hideAddress:
+                  (detail.event.addressDisclosure ?? (privateEvent ? 'hidden' : 'public')) ===
+                  'hidden',
+              }),
         organizer: detail.organizer === null ? null : hostToDto(detail.organizer),
       };
       const validated = validateV2Response(reply, request, eventPublicDetailDtoSchema, payload);
       if (validated === undefined) return reply;
+      if (privateEvent) {
+        reply.header('cache-control', 'private, no-store');
+        reply.header('x-robots-tag', 'noindex, nofollow, noarchive');
+      }
       return reply.send(validated);
     },
   );
@@ -265,8 +444,9 @@ export default async function publicDiscoveryRoutes(fastify: FastifyInstance) {
     '/discovery',
     { preHandler: [fastify.rateLimit('PUBLIC_READ')] },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const events = await services.public.discovery();
-      const payload = { items: events.map(eventToDto) };
+      const payload = { items: await Promise.all(events.map((event) => publicEventToDto(event))) };
       const validated = validateV2Response(reply, request, discoveryFeedDtoSchema, payload);
       if (validated === undefined) return reply;
       return reply.send(validated);
@@ -283,13 +463,14 @@ export default async function publicDiscoveryRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const query = request.query as z.infer<typeof searchQuerySchema>;
       const page = await services.public.search(query.q, {
         limit: query.limit,
         cursor: query.cursor ?? null,
       });
       const payload = {
-        items: page.items.map(eventToDto),
+        items: await Promise.all(page.items.map((event) => publicEventToDto(event))),
         pageInfo: {
           page: 1,
           pageSize: query.limit,
@@ -311,21 +492,94 @@ export default async function publicDiscoveryRoutes(fastify: FastifyInstance) {
   fastify.get(
     '/events/:idOrSlug/tiers',
     {
-      preHandler: [fastify.rateLimit('PUBLIC_READ'), fastify.validateV2({ params: idOrSlugParam })],
+      preHandler: [
+        fastify.rateLimit('PUBLIC_READ'),
+        fastify.validateV2({ params: idOrSlugParam, headers: publicTierHeadersSchema }),
+      ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const { idOrSlug } = request.params as z.infer<typeof idOrSlugParam>;
+      const rawGrantId = request.headers['x-ticket-access-grant-id'];
+      const accessGrantId = Array.isArray(rawGrantId) ? rawGrantId[0] : rawGrantId;
+      const userId = optionalActorUserId(request);
       const rows = await services.public
-        .listEventTiers(idOrSlug)
+        .listEventTiers(idOrSlug, userId, accessGrantId)
         .catch((error: unknown) => mapDomainError(reply, request, idOrSlug, error));
       if (rows === undefined) return reply;
+      const detail = await services.public
+        .getEvent(idOrSlug, userId, accessGrantId)
+        .catch((error: unknown) => mapDomainError(reply, request, idOrSlug, error));
+      if (!detail) return reply;
+      if (detail.event.visibilityMode === 'code' || detail.event.visibilityMode === 'invited') {
+        reply.header('cache-control', 'private, no-store');
+        reply.header('x-robots-tag', 'noindex, nofollow, noarchive');
+      }
       const payload = {
-        items: rows.map(({ tier, availableQuantity }) => publicTierToDto(tier, availableQuantity)),
+        items: rows.map((row) =>
+          publicTierToDto(
+            row.tier,
+            row.availableQuantity,
+            row.priceInPaise,
+            row.basePriceInPaise,
+            row.availabilityStatus,
+            row.pricingPhase,
+          ),
+        ),
       };
       const validated = validateV2Response(
         reply,
         request,
         publicTicketTierListResponseSchema,
+        payload,
+      );
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
+  fastify.get(
+    '/events/:idOrSlug/ticket-addons',
+    {
+      preHandler: [
+        fastify.rateLimit('PUBLIC_READ'),
+        fastify.validateV2({ params: idOrSlugParam, headers: publicTierHeadersSchema }),
+      ],
+    },
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const { idOrSlug } = request.params as z.infer<typeof idOrSlugParam>;
+      const rawGrantId = request.headers['x-ticket-access-grant-id'];
+      const accessGrantId = Array.isArray(rawGrantId) ? rawGrantId[0] : rawGrantId;
+      const userId = optionalActorUserId(request);
+      const rows = await services.public
+        .listEventTicketAddons(idOrSlug, userId, accessGrantId)
+        .catch((error: unknown) => mapDomainError(reply, request, idOrSlug, error));
+      if (rows === undefined) return reply;
+      const detail = await services.public
+        .getEvent(idOrSlug, userId, accessGrantId)
+        .catch((error: unknown) => mapDomainError(reply, request, idOrSlug, error));
+      if (!detail) return reply;
+      if (detail.event.visibilityMode === 'code' || detail.event.visibilityMode === 'invited') {
+        reply.header('x-robots-tag', 'noindex, nofollow, noarchive');
+      }
+      const payload = {
+        items: rows.map(({ addon, availableQuantity }) => ({
+          id: addon.id,
+          eventId: addon.eventId,
+          name: addon.name,
+          description: addon.description,
+          kind: addon.kind,
+          priceInPaise: addon.priceInPaise,
+          currency: addon.currency,
+          availableQuantity,
+          maxPerEntitlement: addon.maxPerEntitlement,
+        })),
+      };
+      const validated = validateV2Response(
+        reply,
+        request,
+        publicTicketAddonListResponseSchema,
         payload,
       );
       if (validated === undefined) return reply;
@@ -349,13 +603,27 @@ function hostToDto(org: Organization) {
  * enough to identify and describe the authoritative venue, never its tenant
  * or private profile.
  */
-function eventVenueToDto(venue: Venue) {
+function eventVenueToDto(
+  venue: Venue,
+  addressPolicy: { revealAddress: boolean; hideAddress: boolean } = {
+    revealAddress: true,
+    hideAddress: false,
+  },
+) {
   return {
     id: venue.id,
     name: venue.public.name,
     slug: venue.public.slug,
     photoUrl: venue.public.photoUrl,
-    address: venue.public.address,
+    address: addressPolicy.revealAddress
+      ? venue.public.address
+      : addressPolicy.hideAddress
+        ? {}
+        : {
+            city: venue.public.address.city,
+            state: venue.public.address.state,
+            country: venue.public.address.country,
+          },
   };
 }
 
@@ -378,14 +646,36 @@ function publicVenueToDto(venue: Venue) {
  * availability. No purchase bounds, no sales windows, no version stamps.
  * Legacy tiers without `priceInPaise` price via `effectiveTierPricePaise`.
  */
-function publicTierToDto(tier: TicketTier, availableQuantity: number) {
+function publicTierToDto(
+  tier: TicketTier,
+  availableQuantity: number,
+  priceInPaise: number,
+  basePriceInPaise: number,
+  availabilityStatus: string,
+  pricingPhase: {
+    name: string;
+    startsAt: string;
+    endsAt: string;
+    availableQuantity: number | null;
+  } | null,
+) {
   return {
     id: tier.id,
     eventId: tier.eventId,
     name: tier.name,
     description: tier.description,
-    priceInPaise: effectiveTierPricePaise(tier),
+    priceInPaise,
+    basePriceInPaise,
+    availabilityStatus,
+    pricingPhase,
+    coverAmountPaise: tier.coverAmountPaise ?? 0,
     currency: tier.currency,
     availableQuantity,
+    maxPerOrder: tier.maxPerOrder,
+    guestCount: tier.guestCount ?? 1,
+    admissionMode: tier.admissionMode ?? 'bundle',
+    audienceType: tier.audienceType ?? 'GENERAL',
+    minAge: tier.minAge ?? null,
+    maxAge: tier.maxAge ?? null,
   };
 }

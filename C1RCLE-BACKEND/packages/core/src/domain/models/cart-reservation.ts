@@ -1,9 +1,12 @@
 import { InvalidOperationError } from '../errors.js';
 import { bumpVersion, newVersionedEntity } from '../identity.js';
 
+import type { SaleAllocationSnapshot } from './sale-allocation.js';
 import type { EntityId, VersionedEntity } from '../identity.js';
+import type { TicketAdmissionMode } from './event-catalog.js';
 import type { OrderAttribution, OrderContact } from './order.js';
 import type { PricingBreakdown } from './pricing.js';
+import type { TicketAddonSelection } from './ticket-addon.js';
 
 /**
  * ─── Cart Reservation (Phase 4) ────────────────────────────────────────────────
@@ -19,7 +22,20 @@ import type { PricingBreakdown } from './pricing.js';
 
 export type CartReservationStatus = 'active' | 'converted' | 'released';
 
+export interface TicketUpgradeSnapshot {
+  sourceEntitlementId: EntityId;
+  sourceEntitlementVersion: number;
+  sourceOrderId: EntityId;
+  sourceTierId: EntityId;
+  targetTierId: EntityId;
+  priorAdmissionPaidPaise: number;
+  replacementAdmissionPaise: number;
+  incrementalAdmissionPaise: number;
+}
+
 export interface CartReservation extends VersionedEntity {
+  /** Frozen original distribution; never recomputed from current commercial terms. */
+  saleAllocation?: SaleAllocationSnapshot;
   /** Deterministic id from idempotency key: `HOLD-{idempotencyKey}`. */
   id: EntityId;
   eventId: EntityId;
@@ -28,8 +44,27 @@ export interface CartReservation extends VersionedEntity {
   lines: {
     tierId: EntityId;
     tierName: string;
+    pricingPhaseId?: string | null;
     quantity: number;
     unitPricePaise: number;
+    admissionUnitPricePaise?: number;
+    coverUnitPricePaise?: number;
+    coverPolicy?: { proposalId: EntityId; policyVersion: string; termsDigest: string };
+    /** Server-priced non-cover products attached to each admission entitlement. */
+    ticketAddons?: TicketAddonSelection[];
+    /** Access grant accepted during quote/hold for private events or tiers. */
+    accessGrantId?: EntityId;
+    /** Snapshot of group shape at hold time; absent on legacy holds. */
+    guestCount?: number;
+    admissionMode?: TicketAdmissionMode;
+    /** Policy and acknowledgement snapshot; never contains attendee demographics. */
+    eligibility?: {
+      audienceType: string;
+      minAge: number | null;
+      maxAge: number | null;
+      attested: true;
+      attestedAt: string;
+    };
   }[];
   pricing: PricingBreakdown;
   appliedPromoCode: string | null;
@@ -46,8 +81,21 @@ export interface CartReservation extends VersionedEntity {
    * fulfil another. First writer wins (see `bindProviderOrder`).
    */
   providerOrderId?: string | null;
+  /** Durable pre-provider claim. Never retried with a second create POST. */
+  providerOrderCreation?: {
+    receipt: string;
+    amountPaise: number;
+    currency: string;
+    holdId: EntityId;
+    eventId: EntityId;
+    organizationId: EntityId;
+    claimedAt: string;
+    state: 'creating' | 'requires_support' | 'bound';
+  } | null;
   /** Who the tickets are for, captured at hold time; becomes the order contact. */
   attendee?: OrderContact | null;
+  /** Present only for the bounded one-ticket paid upgrade flow. */
+  upgrade?: TicketUpgradeSnapshot;
   /**
    * Position in the event's strict order of hold creation, assigned by the
    * repository inside a transaction (so no two holds for an event share one).
@@ -70,6 +118,8 @@ export interface CreateCartReservationInput {
     tierName: string;
     quantity: number;
     unitPricePaise: number;
+    guestCount?: number;
+    admissionMode?: TicketAdmissionMode;
   }[];
   pricing: PricingBreakdown;
   appliedPromoCode: string | null;
@@ -128,4 +178,33 @@ export function releaseCartReservation(reservation: CartReservation, now?: Date)
 
 export function isCartReservationExpired(reservation: CartReservation, now: Date): boolean {
   return now.getTime() > Date.parse(reservation.expiresAt);
+}
+
+/** Only the first durable claimant may call the provider's create endpoint. */
+export function claimCartReservationProviderOrderCreation(
+  hold: CartReservation,
+  receipt: string,
+  now: Date,
+): { hold: CartReservation; claimed: boolean } {
+  if (hold.providerOrderCreation || hold.providerOrderId) return { hold, claimed: false };
+  if (hold.status !== 'active' || Date.parse(hold.expiresAt) < now.getTime()) {
+    throw new InvalidOperationError('Cannot begin payment for an inactive or expired hold');
+  }
+  if (!receipt || receipt.length > 40) throw new InvalidOperationError('Invalid provider receipt');
+  return {
+    claimed: true,
+    hold: {
+      ...hold,
+      providerOrderCreation: {
+        receipt,
+        amountPaise: hold.pricing.grandTotalPaise,
+        currency: hold.pricing.currency,
+        holdId: hold.id,
+        eventId: hold.eventId,
+        organizationId: hold.organizationId,
+        claimedAt: now.toISOString(),
+        state: 'creating',
+      },
+    },
+  };
 }

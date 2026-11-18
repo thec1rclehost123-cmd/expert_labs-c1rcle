@@ -16,6 +16,66 @@ function testConfig(overrides: Record<string, string> = {}) {
 }
 
 describe('app bootstrap + internal routes', () => {
+  it('bounds request bodies and redacts unexpected server errors', async () => {
+    const app = await buildApp({ config: testConfig({ LOG_LEVEL: 'silent' }) });
+    let reached = false;
+    app.post('/security-body-probe', () => {
+      reached = true;
+      return {};
+    });
+    app.get('/security-error-probe', () => {
+      throw new Error('synthetic-private-error-material');
+    });
+    const oversized = await app.inject({
+      method: 'POST',
+      url: '/security-body-probe',
+      payload: { value: 'x'.repeat(1024 * 1024) },
+    });
+    expect(oversized.statusCode).toBe(413);
+    expect(oversized.json()).toMatchObject({ status: 413, requestId: expect.any(String) });
+    expect(reached).toBe(false);
+    const error = await app.inject('/security-error-probe');
+    expect(error.statusCode).toBe(500);
+    expect(error.json()).toMatchObject({
+      status: 500,
+      code: 'server',
+      message: 'Internal server error',
+    });
+    expect(error.body).not.toContain('synthetic-private-error-material');
+    await app.close();
+  });
+
+  it('rejects untrusted browser writes before reaching handlers, while allowing BFF calls', async () => {
+    const app = await buildApp();
+    let calls = 0;
+    app.post('/security-write-probe', () => {
+      calls += 1;
+      return { ok: true };
+    });
+    for (const headers of [
+      { origin: 'https://evil.example' },
+      { origin: 'null' },
+      { 'sec-fetch-site': 'cross-site' },
+    ]) {
+      const res = await app.inject({ method: 'POST', url: '/security-write-probe', headers });
+      expect(res.statusCode).toBe(403);
+    }
+    expect(calls).toBe(0);
+    expect((await app.inject({ method: 'POST', url: '/security-write-probe' })).statusCode).toBe(
+      200,
+    );
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/security-write-probe',
+          headers: { origin: 'http://localhost:3001', 'sec-fetch-site': 'cross-site' },
+        })
+      ).statusCode,
+    ).toBe(200);
+    await app.close();
+  });
+
   it('serves /api/v2/internal/health', async () => {
     const app = await buildApp({});
     const res = await app.inject({ method: 'GET', url: '/api/v2/internal/health' });
@@ -130,15 +190,15 @@ describe('app bootstrap + internal routes', () => {
   });
 
   it.each([
-    ['a trailing slash', 'https://admin.example.com/'],
-    ['the default https port', 'https://admin.example.com:443'],
-    ['an upper-case host', 'https://ADMIN.EXAMPLE.COM'],
+    ['a trailing slash', 'https://app.example.com/'],
+    ['the default https port', 'https://app.example.com:443'],
+    ['an upper-case host', 'https://app.example.com'],
   ])('matches the browser Origin when ALLOWED_ORIGINS has %s', async (_label, configured) => {
     // Regression: these forms passed config validation but were handed to
     // @fastify/cors verbatim, so the exact-string compare against the browser's
     // canonical Origin never matched and the admin console's authenticated
     // preflight came back without Access-Control-Allow-Origin.
-    const origin = 'https://admin.example.com';
+    const origin = 'https://app.example.com';
     const app = await buildApp({
       config: testConfig({ ALLOWED_ORIGINS: configured, BETTER_AUTH_TRUSTED_ORIGINS: configured }),
     });
@@ -165,7 +225,7 @@ describe('app bootstrap + internal routes', () => {
     const body = res.json();
     // Flat envelope — matches every route-level error send. A wrapped
     // `{ error: {...} }` shape here would encode the bug this session (and
-    // independently, an earlier contributor's parallel B10 work) found and fixed.
+    // independently, a teammate's parallel B10 work) found and fixed.
     expect(body.code).toBe('not_found');
     expect(body.requestId).toBeDefined();
     await app.close();

@@ -13,6 +13,17 @@ const base = {
 };
 
 describe('ticket tier extensions', () => {
+  it('stores a separate nonnegative cover component and rejects paid cover on free RSVP', () => {
+    const tier = createTicketTier({ ...base, coverAmountPaise: 150_000 });
+    expect(tier.coverAmountPaise).toBe(150_000);
+    expect(() =>
+      createTicketTier({ ...base, accessType: 'RSVP', coverAmountPaise: 150_000 }),
+    ).toThrow(InvalidOperationError);
+    expect(() => createTicketTier({ ...base, coverAmountPaise: -1 })).toThrow(
+      InvalidOperationError,
+    );
+  });
+
   it('keeps legacy tiers valid with safe defaults', () => {
     const tier = createTicketTier({
       ...base,
@@ -32,6 +43,28 @@ describe('ticket tier extensions', () => {
     expect(tier.audienceType).toBe('GENERAL');
     expect(tier.guestCount).toBe(1);
     expect(tier.pricingPhases).toHaveLength(1);
+  });
+
+  it('resolves inclusive India calendar pricing dates to UTC instants', () => {
+    const tier = createTicketTier({
+      ...base,
+      pricingPhases: [
+        {
+          id: 'EARLY-BIRD',
+          name: 'Early Bird',
+          priceInPaise: 65_000,
+          startDate: '16-11',
+          endDate: '22-11',
+          quantity: null,
+        },
+      ],
+      now: new Date('2026-11-13T10:00:00.000Z'),
+    });
+
+    expect(tier.pricingPhases?.[0]).toMatchObject({
+      startsAt: '2026-11-15T18:30:00.000Z',
+      endsAt: '2026-11-22T18:30:00.000Z',
+    });
   });
 
   it('rejects paid RSVP tickets', () => {

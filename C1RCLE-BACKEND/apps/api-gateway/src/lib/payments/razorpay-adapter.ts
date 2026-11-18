@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 
 import {
   DefiniteProviderFailureError,
@@ -14,6 +14,8 @@ import type {
   PaymentVerificationResponse,
   RefundRequest,
   RefundResponse,
+  ProviderRefund,
+  ProviderOrder,
 } from '@c1rcle/core/domain/ports';
 
 interface RazorpayErrorResponse {
@@ -38,6 +40,8 @@ interface RazorpayPaymentResponse {
   captured: boolean;
   /** The Razorpay order this payment was made against; null for orderless payments. */
   order_id?: string | null;
+  fee?: number;
+  tax?: number;
 }
 
 interface RazorpayRefundResponse {
@@ -67,9 +71,18 @@ function isRazorpayOrderResponse(data: unknown): data is RazorpayOrderResponse {
 }
 
 function isRazorpayPaymentResponse(data: unknown): data is RazorpayPaymentResponse {
+  if (
+    !isRazorpayOrderResponse(data) ||
+    typeof (data as unknown as Record<string, unknown>).captured !== 'boolean'
+  ) {
+    return false;
+  }
+  const payment = data as unknown as Record<string, unknown>;
   return (
-    isRazorpayOrderResponse(data) &&
-    typeof (data as unknown as Record<string, unknown>).captured === 'boolean'
+    (payment.fee === undefined || typeof payment.fee === 'number') &&
+    (payment.tax === undefined || typeof payment.tax === 'number') &&
+    (payment.status !== 'captured' ||
+      (typeof payment.fee === 'number' && typeof payment.tax === 'number'))
   );
 }
 
@@ -80,6 +93,24 @@ function isRazorpayRefundResponse(data: unknown): data is RazorpayRefundResponse
     typeof (data as Record<string, unknown>).id === 'string' &&
     typeof (data as Record<string, unknown>).status === 'string' &&
     typeof (data as Record<string, unknown>).amount === 'number'
+  );
+}
+
+function isDefiniteRefundRejection(
+  status: number,
+  data: unknown,
+): data is { error: { code: 'BAD_REQUEST_ERROR'; description: string } } {
+  // Fail closed on server/transport errors, in-flight conflicts and unknown
+  // responses. A non-2xx status alone does not prove that no refund was accepted.
+  if (![400, 401, 403, 404, 422].includes(status)) return false;
+  if (typeof data !== 'object' || data === null) return false;
+  const error = (data as Record<string, unknown>).error;
+  if (typeof error !== 'object' || error === null) return false;
+  const fields = error as Record<string, unknown>;
+  return (
+    fields.code === 'BAD_REQUEST_ERROR' &&
+    typeof fields.description === 'string' &&
+    fields.description.trim().length > 0
   );
 }
 
@@ -132,6 +163,7 @@ export class RazorpayPaymentProvider {
       keySecret: string;
       webhookSecret: string;
       baseUrl?: string;
+      requestTimeoutMs?: number;
     },
   ) {}
 
@@ -145,6 +177,9 @@ export class RazorpayPaymentProvider {
 
   async createOrder(request: PaymentOrderRequest): Promise<PaymentOrderResponse> {
     const response = await fetch(`${this.baseUrl}/orders`, {
+      signal: AbortSignal.timeout(
+        Math.max(1, Math.min(this.config.requestTimeoutMs ?? 10_000, 10_000)),
+      ),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -186,6 +221,57 @@ export class RazorpayPaymentProvider {
     };
   }
 
+  /** Razorpay documents GET /orders?receipt=...; no create POST is used here. */
+  async findOrdersByReceipt(receipt: string): Promise<ProviderOrder[]> {
+    if (!receipt || receipt.length > 40)
+      throw new InvalidOperationError('Invalid provider receipt');
+    const response = await fetch(
+      `${this.baseUrl}/orders?${new URLSearchParams({ receipt, count: '2' })}`,
+      {
+        method: 'GET',
+        signal: AbortSignal.timeout(
+          Math.max(1, Math.min(this.config.requestTimeoutMs ?? 10_000, 10_000)),
+        ),
+        headers: { Authorization: this.authHeader },
+      },
+    );
+    if (!response.ok) throw new InvalidOperationError('Razorpay order lookup unavailable');
+    const data: unknown = await response.json();
+    if (
+      !data ||
+      typeof data !== 'object' ||
+      !('items' in data) ||
+      !Array.isArray(data.items) ||
+      !('count' in data) ||
+      data.count !== data.items.length ||
+      data.items.length > 2
+    ) {
+      throw new InvalidOperationError('Invalid Razorpay order lookup response');
+    }
+    return data.items.map((item: unknown) => {
+      if (
+        !isRazorpayOrderResponse(item) ||
+        !('receipt' in item) ||
+        item.receipt !== receipt ||
+        !('notes' in item) ||
+        !item.notes ||
+        typeof item.notes !== 'object' ||
+        Array.isArray(item.notes) ||
+        Object.values(item.notes).some((value) => typeof value !== 'string')
+      ) {
+        throw new InvalidOperationError('Invalid Razorpay order identity');
+      }
+      return {
+        id: item.id,
+        amountPaise: item.amount,
+        currency: item.currency,
+        status: item.status,
+        receipt,
+        metadata: item.notes as Record<string, string>,
+      };
+    });
+  }
+
   async verifyPayment(request: PaymentVerificationRequest): Promise<PaymentVerificationResponse> {
     // HMAC verification is NOT optional (D-022). `safeHexEqual` never throws on
     // a wrong-length signature, so a forged one is a clean 4xx, not a 500.
@@ -209,6 +295,9 @@ export class RazorpayPaymentProvider {
   ): Promise<PaymentVerificationResponse> {
     const id = assertProviderId(paymentId, 'payment id');
     const response = await fetch(`${this.baseUrl}/payments/${id}/capture`, {
+      signal: AbortSignal.timeout(
+        Math.max(1, Math.min(this.config.requestTimeoutMs ?? 10_000, 10_000)),
+      ),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -238,16 +327,27 @@ export class RazorpayPaymentProvider {
       captured: data.status === 'captured',
       orderId: data.order_id ?? null,
       currency: data.currency,
+      feePaise: data.fee,
+      taxOnFeePaise: data.tax,
     };
   }
 
   async refundPayment(request: RefundRequest): Promise<RefundResponse> {
     const id = assertProviderId(request.paymentId, 'payment id');
+    if (!request.idempotencyKey.trim())
+      throw new InvalidOperationError('Refund requires a canonical idempotency key');
+    // Razorpay's refund idempotency header permits only alphanumerics, '-' and
+    // '_'. Preserve the canonical receipt used by provider-fact reconciliation.
+    const providerKey = `c1r_${createHash('sha256').update(request.idempotencyKey).digest('hex')}`;
     const response = await fetch(`${this.baseUrl}/payments/${id}/refund`, {
+      signal: AbortSignal.timeout(
+        Math.max(1, Math.min(this.config.requestTimeoutMs ?? 10_000, 10_000)),
+      ),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: this.authHeader,
+        'X-Refund-Idempotency': providerKey,
       },
       body: JSON.stringify({
         amount: request.amountPaise,
@@ -256,17 +356,13 @@ export class RazorpayPaymentProvider {
     });
 
     if (!response.ok) {
-      const error = await response
-        .json()
-        .catch(() => ({ error: { description: 'Unknown error' } }));
-      if (!isRazorpayErrorResponseDataWithDescription(error)) {
+      const error: unknown = await response.json().catch(() => null);
+      if (isDefiniteRefundRejection(response.status, error)) {
         throw new DefiniteProviderFailureError(
-          `Razorpay refund was rejected: ${response.statusText}`,
+          `Razorpay refund was rejected: ${error.error.description}`,
         );
       }
-      throw new DefiniteProviderFailureError(
-        `Razorpay refund was rejected: ${error.error.description}`,
-      );
+      throw new InvalidOperationError('Razorpay refund result is uncertain');
     }
 
     const data = await response.json();
@@ -280,9 +376,48 @@ export class RazorpayPaymentProvider {
     };
   }
 
+  async getRefund(paymentId: string, refundId: string): Promise<ProviderRefund> {
+    const payment = assertProviderId(paymentId, 'payment id');
+    const refund = assertProviderId(refundId, 'refund id');
+    const response = await fetch(`${this.baseUrl}/payments/${payment}/refunds/${refund}`, {
+      signal: AbortSignal.timeout(
+        Math.max(1, Math.min(this.config.requestTimeoutMs ?? 10_000, 10_000)),
+      ),
+      headers: { Authorization: this.authHeader },
+    });
+    // Missing, failed or malformed lookups do not prove refund failure/absence.
+    if (!response.ok) throw new InvalidOperationError('Unable to establish provider refund fact');
+    const data: unknown = await response.json();
+    if (!isRazorpayRefundResponse(data)) {
+      throw new InvalidOperationError('Invalid provider refund fact');
+    }
+    const fact = data as unknown as Record<string, unknown>;
+    if (
+      data.id !== refund ||
+      fact.payment_id !== payment ||
+      !Number.isSafeInteger(data.amount) ||
+      data.amount <= 0 ||
+      !['pending', 'processed', 'failed'].includes(data.status) ||
+      typeof fact.currency !== 'string' ||
+      !(fact.receipt === null || typeof fact.receipt === 'string')
+    )
+      throw new InvalidOperationError('Invalid provider refund fact');
+    return {
+      id: data.id,
+      status: data.status,
+      amountPaise: data.amount,
+      paymentId: payment,
+      currency: fact.currency,
+      receipt: fact.receipt,
+    };
+  }
+
   async getPayment(paymentId: string): Promise<PaymentVerificationResponse> {
     const id = assertProviderId(paymentId, 'payment id');
     const response = await fetch(`${this.baseUrl}/payments/${id}`, {
+      signal: AbortSignal.timeout(
+        Math.max(1, Math.min(this.config.requestTimeoutMs ?? 10_000, 10_000)),
+      ),
       headers: {
         Authorization: this.authHeader,
       },
@@ -312,6 +447,8 @@ export class RazorpayPaymentProvider {
       captured: data.status === 'captured',
       orderId: data.order_id ?? null,
       currency: data.currency,
+      feePaise: data.fee,
+      taxOnFeePaise: data.tax,
     };
   }
 

@@ -3,6 +3,8 @@ import 'server-only';
 import { createApiClient } from '@c1rcle/api-client';
 import { sessionSchema } from '@c1rcle/contracts';
 
+import { withGatewaySessionCookieName } from './gateway-session-cookie.js';
+
 import type { User } from '@c1rcle/contracts';
 
 /**
@@ -27,7 +29,7 @@ export async function getServerSession(cookieHeader: string): Promise<{ user: Us
     const session = await createApiClient().get({
       path: '/api/v2/auth/session',
       schema: sessionSchema,
-      headers: { cookie: withGatewayCookieName(cookieHeader) },
+      headers: { cookie: withGatewaySessionCookieName(cookieHeader) },
     });
 
     return { user: session.user };
@@ -42,7 +44,7 @@ export async function getServerSession(cookieHeader: string): Promise<{ user: Us
  * Emit both with the same value so server-side reads resolve the session
  * whatever cookie-name configuration the gateway uses.
  */
-function withGatewayCookieName(cookieHeader: string): string {
+export function withGatewayCookieName(cookieHeader: string): string {
   if (cookieHeader.includes('__Secure-better-auth.session_token=')) {
     return cookieHeader;
   }

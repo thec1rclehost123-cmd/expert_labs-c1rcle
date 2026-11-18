@@ -2,8 +2,13 @@ import { MemoryPaymentProvider } from '@c1rcle/core/domain';
 import { describe, expect, it } from 'vitest';
 
 import { createV2Services } from '../../../lib/v2-services.js';
-import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
+import { seedApprovedPartnerOrganization } from '../../../test-utils/approved-partner-organization.js';
+import {
+  buildPartnerTestServer,
+  futureTestEventStartAt,
+} from '../../../test-utils/partner-test-server.js';
 import { publishEventForTest } from '../../../test-utils/publish-event.js';
+import { seedVerifiedCheckoutUsers } from '../../../test-utils/verified-test-users.js';
 import checkoutRoutes from '../checkout/checkout-routes.js';
 import paymentRoutes from '../checkout/payment-routes.js';
 import partnerEventCatalogRoutes from '../partner/event-catalog.js';
@@ -51,13 +56,13 @@ function memoryProvider(): MemoryPaymentProvider {
 
 /** Seeds org -> venue -> event -> tier -> hold -> paid order. Returns the order id. */
 async function seedPaidOrder(server: Server): Promise<string> {
-  const created = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: { 'x-organization-id': 'org_seed', 'idempotency-key': `seed-${++keySeq}` },
-    payload: { name: 'Skyline', slug: `skyline-${keySeq}` },
+  seedVerifiedCheckoutUsers(['user_1']);
+  ++keySeq;
+  const created = await seedApprovedPartnerOrganization({
+    name: 'Skyline',
+    slug: `skyline-${keySeq}`,
   });
-  const org: string = created.json().id;
+  const org: string = created.id;
   const venue = await server.inject({
     method: 'POST',
     url: `/organizations/${org}/venues`,
@@ -69,7 +74,7 @@ async function seedPaidOrder(server: Server): Promise<string> {
     method: 'POST',
     url: `/organizations/${org}/events`,
     headers: write(org),
-    payload: { title: 'Sky Night', venueId, startAt: '2026-09-01T18:00:00Z' },
+    payload: { title: 'Sky Night', venueId, startAt: futureTestEventStartAt() },
   });
   const eventId: string = event.json().id;
   await publishEventForTest(eventId);
@@ -159,7 +164,15 @@ describe('GET /orders/:id/status', () => {
     const response = await server.inject({ method: 'GET', url: `/orders/${orderId}/status` });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ id: orderId, status: 'paid', version: 1 });
+    const full = await server.inject({ method: 'GET', url: `/orders/${orderId}` });
+    expect(full.statusCode).toBe(200);
+    const persisted = full.json<{ version: number; updatedAt: string }>();
+    expect(response.json()).toEqual({
+      id: orderId,
+      status: 'paid',
+      version: persisted.version,
+      updatedAt: persisted.updatedAt,
+    });
     await server.close();
   });
 });

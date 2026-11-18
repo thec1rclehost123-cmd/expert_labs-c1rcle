@@ -1,34 +1,35 @@
-import { PromoterGuestsScreen } from '@/components/partner-v3/promoter/PromoterGuestsScreen';
-import { fixturePartnerDataSource } from '@/data/fixture-partner-data-source';
+import { ConnectedPartnerGuestsIndexScreen } from '@/components/partner-v3/event-detail/ConnectedPartnerGuestsIndexScreen';
+import { PromoterActivityConnected } from '@/components/partner-v3/promoter/PromoterActivityConnected';
+import { loadPartnerEvents } from '@/lib/events/load-partner-events';
+import { loadPromoterActivity } from '@/lib/events/load-promoter-activity';
 
 import { renderStudioSkeleton } from '../route-helpers';
 
 export default async function StudioGuestsPage({
   params,
-  searchParams,
 }: {
   readonly params: Promise<{ studio: string }>;
-  readonly searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const { studio } = await params;
-  if (studio !== 'promoter')
-    return renderStudioSkeleton(
-      Promise.resolve({ studio }),
-      'Guests',
-      'Guest tools are reserved for the Promoter Studio screen checkpoint.',
-    );
-  const query = await searchParams;
-  const getValue = (value: string | string[] | undefined) =>
-    Array.isArray(value) ? value[0] : value;
-  const status = getValue(query['status']) === 'ticket' ? ('ticket' as const) : ('all' as const);
-  const data = await fixturePartnerDataSource.getPromoterGuests();
-  return (
-    <PromoterGuestsScreen
-      data={data}
-      initialSearch={getValue(query['search']) ?? ''}
-      initialStatus={status}
-      initialEvent={getValue(query['event']) ?? 'all'}
-      initialDialog={getValue(query['dialog']) === 'add'}
-    />
+  if (studio === 'promoter') {
+    let result: { data: Awaited<ReturnType<typeof loadPromoterActivity>> } | { error: string };
+    try {
+      result = { data: await loadPromoterActivity() };
+    } catch {
+      result = {
+        error:
+          'Attributed activity could not be loaded. Confirm you are in the correct Promoter workspace and try again.',
+      };
+    }
+    return <PromoterActivityConnected {...result} />;
+  }
+  if (studio === 'venue' || studio === 'host') {
+    const data = await loadPartnerEvents({ studio });
+    return <ConnectedPartnerGuestsIndexScreen data={data} studio={studio} />;
+  }
+  return renderStudioSkeleton(
+    Promise.resolve({ studio }),
+    'Guests',
+    'Guest tools are not available for this workspace.',
   );
 }

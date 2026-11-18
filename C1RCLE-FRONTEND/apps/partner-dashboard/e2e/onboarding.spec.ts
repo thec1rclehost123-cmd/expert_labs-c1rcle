@@ -7,20 +7,17 @@
  *
  * Phone OTP: Firebase Identity Platform is bypassed by mocking
  * identitytoolkit.googleapis.com at the network level. We return a synthetic
- * verificationId so the SDK constructs a ConfirmationResult, then mock
- * /api/v2/onboarding/verify-document to approve the resulting ID token.
+ * verificationId so the SDK constructs a ConfirmationResult. The resulting ID
+ * token is then posted through the same-origin /api/auth/phone-verification BFF.
  *
  * Playwright config (playwright.config.ts):
  *   - baseURL: http://127.0.0.1:3211
- *   - webServer: pnpm exec next start --port 3211
+ *   - webServer: standalone Next server with local static assets copied beside it
  *   - retries: 2 in CI
  *
- * Known URL routing discrepancies (documented here, not yet hard-failing):
- *   - startOnboarding()  → /api/v2/onboarding/applications (should be BFF)
- *   - saveProgress()     → /api/v2/onboarding/applications/:id (should be BFF)
- *   - submit()           → /api/v2/onboarding/applications/:id/submit (should be BFF)
- * The BFF wrappers for all three exist and are unit-tested. See section 6 of the
- * implementation plan for full details.
+ * Application lifecycle requests must remain same-origin through the BFF.
+ * The mocks return failures for direct gateway paths so routing regressions do
+ * not accidentally pass or reach a configured gateway during browser tests.
  */
 
 import { expect, test, type Page, type Route } from '@playwright/test';
@@ -46,6 +43,7 @@ function makeApplicationDto(overrides: Record<string, unknown> = {}): Record<str
       entityType: 'individual',
     },
     documents: [],
+    promoterAgreementAcceptances: [],
     missingDocuments: ['id_front', 'id_back', 'selfie'],
     submittedAt: null,
     reviewedBy: null,
@@ -60,10 +58,9 @@ function makeApplicationDto(overrides: Record<string, unknown> = {}): Record<str
 }
 
 /**
- * Intercepts all BFF and gateway calls the onboarding wizard makes.
- * Both the correct BFF path AND the current (buggy) direct-gateway path are
- * intercepted for write operations so tests pass regardless of which the code
- * currently hits, while URL contract tests assert the specific path used.
+ * Intercepts onboarding calls made by the wizard. BFF calls receive synthetic
+ * responses; direct gateway application paths fail closed. The sole intentional
+ * direct gateway call is the format-only document check, which has no BFF route.
  */
 async function mockOnboardingNetwork(
   page: Page,
@@ -72,14 +69,24 @@ async function mockOnboardingNetwork(
     existingApplication?: ReturnType<typeof makeApplicationDto> | null;
     /** Makes the signup call return 409 (email already registered). */
     signupConflict?: boolean;
+    /** Makes password login report that the server still has an unverified email. */
+    unverifiedLogin?: boolean;
+    /** Starts without an existing session, as a returning user opening signup. */
+    anonymousSession?: boolean;
+    /** Fails the initial OTP email send after account creation. */
+    otpSendFailsOnce?: boolean;
     /** Makes the final submit call return 400 (missing documents). */
     submitMissingDocs?: boolean;
   } = {},
 ) {
   const existingApp = options.existingApplication ?? null;
+  let signupAttempts = 0;
+  let otpSendAttempts = 0;
+  let onboardingReads = 0;
 
   // ── /api/auth/signup ──────────────────────────────────────────────────────
   await page.route('**/api/auth/signup', async (route: Route) => {
+    signupAttempts += 1;
     if (options.signupConflict) {
       await route.fulfill({
         status: 409,
@@ -102,6 +109,7 @@ async function mockOnboardingNetwork(
           displayName: 'John Doe',
           role: 'partner',
           avatarUrl: null,
+          emailVerified: true,
         },
         accessToken: 'e2e-access-token',
         expiresAt: 4_102_444_800,
@@ -118,8 +126,17 @@ async function mockOnboardingNetwork(
     displayName: 'John Doe',
     role: 'partner',
     avatarUrl: null,
+    emailVerified: true,
   };
   await page.route('**/api/auth/session', async (route: Route) => {
+    if (options.anonymousSession) {
+      await route.fulfill({
+        status: 401,
+        contentType: 'application/json',
+        body: JSON.stringify({ code: 'unauthorized', message: 'Authentication required' }),
+      });
+      return;
+    }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -127,6 +144,14 @@ async function mockOnboardingNetwork(
     });
   });
   await page.route('**/api/auth/refresh', async (route: Route) => {
+    if (options.anonymousSession) {
+      await route.fulfill({
+        status: 401,
+        contentType: 'application/json',
+        body: JSON.stringify({ code: 'unauthorized', message: 'Authentication required' }),
+      });
+      return;
+    }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -153,6 +178,7 @@ async function mockOnboardingNetwork(
           displayName: 'John Doe',
           role: 'partner',
           avatarUrl: null,
+          emailVerified: options.unverifiedLogin ? false : true,
         },
         accessToken: 'e2e-access-token',
         expiresAt: 4_102_444_800,
@@ -162,6 +188,15 @@ async function mockOnboardingNetwork(
 
   // ── /api/auth/otp/send ───────────────────────────────────────────────────
   await page.route('**/api/auth/otp/send', async (route: Route) => {
+    otpSendAttempts += 1;
+    if (options.otpSendFailsOnce && otpSendAttempts === 1) {
+      await route.fulfill({
+        status: 500,
+        contentType: 'application/json',
+        body: JSON.stringify({ code: 'server', message: 'Internal server error', status: 500 }),
+      });
+      return;
+    }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -178,8 +213,22 @@ async function mockOnboardingNetwork(
     });
   });
 
+  await page.route('**/api/auth/phone-verification', async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        passed: true,
+        provider: 'firebase-phone',
+        reason: null,
+        referenceId: null,
+      }),
+    });
+  });
+
   // ── /api/bff/onboarding/me ───────────────────────────────────────────────
-  await page.route('**/api/bff/onboarding/me', async (route: Route) => {
+  await page.route(/\/api\/bff\/onboarding\/me(?:\?.*)?$/, async (route: Route) => {
+    onboardingReads += 1;
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -187,8 +236,7 @@ async function mockOnboardingNetwork(
     });
   });
 
-  // ── POST: start application — both BFF and direct gateway paths ───────────
-  // BFF (correct target): /api/bff/onboarding/applications
+  // ── POST: start application through the same-origin BFF ──────────────────
   await page.route('**/api/bff/onboarding/applications', async (route: Route) => {
     if (route.request().method() !== 'POST') {
       await route.continue();
@@ -200,20 +248,7 @@ async function mockOnboardingNetwork(
       body: JSON.stringify(makeApplicationDto()),
     });
   });
-  // Direct gateway (current buggy target): /api/v2/onboarding/applications
-  await page.route('**/api/v2/onboarding/applications', async (route: Route) => {
-    if (route.request().method() !== 'POST') {
-      await route.continue();
-      return;
-    }
-    await route.fulfill({
-      status: 201,
-      contentType: 'application/json',
-      body: JSON.stringify(makeApplicationDto()),
-    });
-  });
-
-  // ── PATCH autosave — both BFF and direct gateway paths ───────────────────
+  // ── PATCH autosave through the same-origin BFF ────────────────────────────
   await page.route(`**/api/bff/onboarding/applications/${APP_ID}`, async (route: Route) => {
     if (route.request().method() !== 'PATCH') {
       await route.continue();
@@ -225,43 +260,26 @@ async function mockOnboardingNetwork(
       body: JSON.stringify(makeApplicationDto({ version: 2 })),
     });
   });
-  await page.route(`**/api/v2/onboarding/applications/${APP_ID}`, async (route: Route) => {
-    if (route.request().method() !== 'PATCH') {
-      await route.continue();
+  // ── POST submit through the same-origin BFF ───────────────────────────────
+  await page.route(`**/api/bff/onboarding/applications/${APP_ID}/submit`, async (route: Route) => {
+    if (options.submitMissingDocs) {
+      await route.fulfill({
+        status: 400,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          code: 'validation',
+          message: 'Please upload all required documents before submitting.',
+          status: 400,
+        }),
+      });
       return;
     }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(makeApplicationDto({ version: 2 })),
+      body: JSON.stringify(makeApplicationDto({ status: 'submitted', missingDocuments: [] })),
     });
   });
-
-  // ── POST submit — both BFF and direct gateway paths ───────────────────────
-  for (const submitPattern of [
-    `**/api/bff/onboarding/applications/${APP_ID}/submit`,
-    `**/api/v2/onboarding/applications/${APP_ID}/submit`,
-  ]) {
-    await page.route(submitPattern, async (route: Route) => {
-      if (options.submitMissingDocs) {
-        await route.fulfill({
-          status: 400,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            code: 'validation',
-            message: 'Please upload all required documents before submitting.',
-            status: 400,
-          }),
-        });
-        return;
-      }
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify(makeApplicationDto({ status: 'submitted', missingDocuments: [] })),
-      });
-    });
-  }
 
   // ── KYC document upload via BFF (2-phase) ─────────────────────────────────
   await page.route(
@@ -288,6 +306,21 @@ async function mockOnboardingNetwork(
       }),
     });
   });
+
+  // Never let application data bypass the cookie-authenticated, CSRF-checked
+  // same-origin BFF during browser tests, even if a route is added later.
+  for (const directApplicationPattern of [
+    '**/api/v2/onboarding/applications',
+    '**/api/v2/onboarding/applications/**',
+  ]) {
+    await page.route(directApplicationPattern, async (route: Route) => {
+      await route.fulfill({
+        status: 500,
+        contentType: 'application/json',
+        body: JSON.stringify({ code: 'e2e_direct_gateway_forbidden', status: 500 }),
+      });
+    });
+  }
 
   // ── Firebase Identity Platform (phone OTP) ────────────────────────────────
   // `appVerificationDisabledForTesting` (non-production builds) skips reCAPTCHA,
@@ -367,6 +400,15 @@ async function mockOnboardingNetwork(
       body: JSON.stringify({ sessionInfo: 'fake-session-info-e2e' }),
     });
   });
+
+  return {
+    get signupAttempts() {
+      return signupAttempts;
+    },
+    get onboardingReads() {
+      return onboardingReads;
+    },
+  };
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -464,6 +506,48 @@ test.describe('Onboarding wizard — /onboard', () => {
     await expect(page.getByRole('textbox', { name: /^Password$/i })).toBeVisible();
   });
 
+  test('OTP send failure after signup keeps the account on a retryable verification step', async ({
+    page,
+  }) => {
+    const network = await mockOnboardingNetwork(page, { otpSendFailsOnce: true });
+    await page.goto('/onboard');
+    await chooseRole(page);
+    await signUp(page);
+
+    await expect(page.getByRole('heading', { name: /confirm your email/i })).toBeVisible();
+    await expect(
+      page.getByText(/account was created.*could not send the email code/i),
+    ).toBeVisible();
+    expect(network.signupAttempts).toBe(1);
+    await page.getByRole('button', { name: /send code/i }).click();
+    await expect(
+      page.getByRole('textbox', { name: /6-digit code sent to your email/i }),
+    ).toBeVisible();
+    expect(network.signupAttempts).toBe(1);
+  });
+
+  test('login recovery requires email verification before reading or resuming onboarding', async ({
+    page,
+  }) => {
+    const network = await mockOnboardingNetwork(page, {
+      signupConflict: true,
+      unverifiedLogin: true,
+      anonymousSession: true,
+    });
+    await page.goto('/onboard');
+    await chooseRole(page);
+    await signUp(page, { email: 'existing@example.com' });
+    await expect(page.getByRole('heading', { name: /Welcome Back/i })).toBeVisible();
+    const onboardingReadsBeforeLogin = network.onboardingReads;
+
+    await page.getByRole('textbox', { name: /^Password$/i }).fill('Password1234');
+    await page.getByRole('button', { name: /verify & login/i }).click();
+
+    await expect(page.getByRole('heading', { name: /confirm your email/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: /send code/i })).toBeVisible();
+    expect(network.onboardingReads).toBe(onboardingReadsBeforeLogin);
+  });
+
   test('email, phone and entity steps advance in order', async ({ page }) => {
     await mockOnboardingNetwork(page);
     await reachEntityStep(page);
@@ -484,8 +568,8 @@ test.describe('Onboarding wizard — /onboard', () => {
 
 // ── URL contract assertions ──────────────────────────────────────────────────
 // These tests verify which HTTP path each wizard step calls. They serve as a
-// regression net: start/saveProgress/submit must go through the same-origin BFF
-// (only verify-document may call the gateway directly).
+// regression net: onboarding and both verification paths must go through the
+// same-origin BFF.
 // Specific routes are registered AFTER mockOnboardingNetwork: Playwright gives
 // the most recently registered matching route priority.
 
@@ -556,38 +640,32 @@ test.describe('Onboarding wizard — URL contract', () => {
     expect(startHits.filter((h) => h.startsWith('GATEWAY:'))).toHaveLength(0);
   });
 
-  test('phone verification posts the Firebase ID token to /api/v2/onboarding/verify-document', async ({
+  test('phone verification posts the Firebase ID token through the session-scoped BFF', async ({
     page,
   }) => {
     await mockOnboardingNetwork(page);
-    const directGatewayHits: string[] = [];
     const bffHits: string[] = [];
     let proofToken: unknown;
 
-    await page.route('**/api/v2/onboarding/verify-document', async (route) => {
-      directGatewayHits.push(new URL(route.request().url()).pathname);
-      proofToken = (route.request().postDataJSON() as { proofToken?: unknown }).proofToken;
+    await page.route('**/api/auth/phone-verification', async (route) => {
+      bffHits.push(new URL(route.request().url()).pathname);
+      proofToken = (route.request().postDataJSON() as { idToken?: unknown }).idToken;
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify({ passed: true, provider: 'format', reason: null, referenceId: null }),
-      });
-    });
-    await page.route('**/api/bff/onboarding/verify-document', async (route) => {
-      bffHits.push(new URL(route.request().url()).pathname);
-      await route.fulfill({
-        status: 404,
-        contentType: 'application/json',
-        body: JSON.stringify({ code: 'not_found', status: 404 }),
+        body: JSON.stringify({
+          passed: true,
+          provider: 'firebase-phone',
+          reason: null,
+          referenceId: null,
+        }),
       });
     });
 
     await reachEntityStep(page);
     await expect(page.getByRole('heading', { name: /Individual or Business/i })).toBeVisible();
 
-    // verify-document must go direct to gateway (no BFF wrapper exists — by design)
-    expect(directGatewayHits).toContain('/api/v2/onboarding/verify-document');
+    expect(bffHits).toContain('/api/auth/phone-verification');
     expect(typeof proofToken).toBe('string');
-    expect(bffHits).toHaveLength(0);
   });
 });

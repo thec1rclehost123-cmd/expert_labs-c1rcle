@@ -1,3 +1,5 @@
+import { PRODUCT_TIME_ZONE } from '@c1rcle/contracts';
+
 import { formatPaise } from '@/lib/finance/finance-view-model';
 
 import type {
@@ -7,6 +9,7 @@ import type {
   OverviewData,
   OverviewEvent,
   OverviewNetworkMember,
+  OverviewRecentOrder,
   OverviewTrendMetric,
   OverviewTrendRange,
   OverviewTrendSeries,
@@ -17,6 +20,7 @@ import type {
   OrganizationEventCardListResponse,
   OrganizationOverviewDto,
   OrganizationTrendsDto,
+  FinanceOrderDto,
 } from '@c1rcle/contracts';
 
 /**
@@ -53,10 +57,11 @@ const UPCOMING_LIMIT = 4;
 const POINTS_1D = 12;
 const POINTS_1W = 7;
 const POINTS_1M = 12;
-const POINTS_ALL = 12;
 
 /** How many days back the "All" monthly series reaches. */
 const ALL_TIME_MONTHS = 24;
+/** Keep one plotted point per month across the full "All" window. */
+const POINTS_ALL = ALL_TIME_MONTHS;
 
 const MONTH_LABELS = [
   'January',
@@ -71,16 +76,6 @@ const MONTH_LABELS = [
   'October',
   'November',
   'December',
-] as const;
-
-const WEEKDAY_LABELS = [
-  'Sunday',
-  'Monday',
-  'Tuesday',
-  'Wednesday',
-  'Thursday',
-  'Friday',
-  'Saturday',
 ] as const;
 
 export interface OverviewViewModelInput {
@@ -100,6 +95,8 @@ export interface OverviewViewModelInput {
   readonly network: readonly NetworkPartner[];
   /** Recent ledger-backed activity. */
   readonly activity: readonly ActivitySource[];
+  /** `null` when the current role is not allowed to read finance orders. */
+  readonly recentOrders: readonly FinanceOrderDto[] | null;
   /**
    * The moment the page is rendering, injected rather than read from the clock.
    * Every label below is derived from it, and a Server Component that called
@@ -112,7 +109,8 @@ export interface OverviewViewModelInput {
 export interface NetworkPartner {
   readonly partnershipId: string;
   readonly counterpartyOrganizationId: string;
-  readonly side: 'host' | 'venue';
+  readonly name?: string | null;
+  readonly side: 'host' | 'venue' | 'promoter';
   readonly status: string;
 }
 
@@ -130,7 +128,8 @@ export function toOverviewData(input: OverviewViewModelInput): OverviewData {
   const { now } = input;
   const today = toDayKey(now);
 
-  const events = input.cards.items.map((card) => toEvent(card));
+  const eligibleCards = input.cards.items.filter((card) => isUpcomingEvent(card, now));
+  const events = eligibleCards.map((card) => toEvent(card));
   const [nextEvent, ...rest] = events;
 
   return {
@@ -139,9 +138,27 @@ export function toOverviewData(input: OverviewViewModelInput): OverviewData {
     greeting: formatGreeting(input.displayName, now),
     // A partner with nothing scheduled gets an honest placeholder rather than a
     // fabricated next event. The card renders its own empty state.
-    nextEvent: nextEvent ?? placeholderEvent(),
+    nextEvent:
+      nextEvent ??
+      placeholderEvent(input.cards.items.some((card) => toEventStatus(card.status) === 'draft')),
     trends: buildTrends(input),
     recentActivity: buildActivity(input.activity),
+    recentOrders:
+      input.recentOrders === null
+        ? null
+        : input.recentOrders.map((order): OverviewRecentOrder => ({
+            id: order.id,
+            buyerName: order.buyerName,
+            amountLabel: order.grandTotalPaise === 0 ? 'Free' : formatPaise(order.grandTotalPaise),
+            amountTone:
+              order.status === 'refunded'
+                ? 'negative'
+                : order.status === 'paid' && order.grandTotalPaise > 0
+                  ? 'positive'
+                  : 'neutral',
+            timeAgo: formatRelativeOrderTime(order.createdAt, now),
+            ticketSummary: formatTicketSummary(order.ticketLines ?? []),
+          })),
     calendar: {
       // The label follows the **calendar's** month, not the render date. The
       // grid can legitimately be showing a different month than today, and a
@@ -156,11 +173,30 @@ export function toOverviewData(input: OverviewViewModelInput): OverviewData {
   };
 }
 
+export function formatTicketSummary(
+  lines: readonly { readonly tierName: string; readonly quantity: number }[],
+): string {
+  if (lines.length === 0) return 'Tickets';
+  return lines.map((line) => `${String(line.quantity)} × ${line.tierName}`).join(' + ');
+}
+
+export function formatRelativeOrderTime(value: string, now: Date): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Time unavailable';
+  const minutes = Math.max(0, Math.floor((now.getTime() - date.getTime()) / 60_000));
+  if (minutes < 1) return 'Just now';
+  if (minutes < 60) return `${String(minutes)}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${String(hours)}h ago`;
+  return `${String(Math.floor(hours / 24))}d ago`;
+}
+
 // ─── Events ──────────────────────────────────────────────────────────────────
 
 function toEvent(card: OrganizationEventCardDto): OverviewEvent {
   return {
     id: card.eventId,
+    startAt: card.startAt,
     name: card.title,
     // A deleted venue or a venue-less event resolves to a dash, not to the
     // string "undefined" and not to a guess.
@@ -179,11 +215,11 @@ function toEvent(card: OrganizationEventCardDto): OverviewEvent {
   };
 }
 
-function placeholderEvent(): OverviewEvent {
+function placeholderEvent(hasDrafts: boolean): OverviewEvent {
   return {
     id: '',
     name: 'No upcoming events',
-    venue: 'Create your first event to see it here',
+    venue: hasDrafts ? 'Draft events are in Events' : 'Create your first event to see it here',
     dateLabel: '',
     timeLabel: '',
     href: '/partner/venue/events/create',
@@ -191,6 +227,12 @@ function placeholderEvent(): OverviewEvent {
     sold: 0,
     capacity: null,
   };
+}
+
+function isUpcomingEvent(card: OrganizationEventCardDto, now: Date): boolean {
+  if (!['published', 'sales_paused', 'started'].includes(card.status)) return false;
+  const startAt = Date.parse(card.startAt);
+  return Number.isFinite(startAt) && startAt > now.getTime();
 }
 
 /**
@@ -236,9 +278,9 @@ function buildTrends(input: OverviewViewModelInput): readonly OverviewTrendSerie
  * One (metric, range) row.
  *
  * `value` is the sum over the **whole** series the endpoint returned, not over
- * the plotted points. Sub-sampling to fit a chart and then reporting the
- * sub-sample's sum would understate the number whenever the two differ — which
- * for `1W` plotted from a 30-day daily window is always.
+ * the plotted points. The chart aggregates adjacent buckets to fit its fixed
+ * width, while the headline remains tied directly to the complete requested
+ * window.
  */
 function trendSeries(
   metric: OverviewTrendMetric,
@@ -260,8 +302,34 @@ function trendSeries(
     value: formatTotal(metric, values),
     delta: formatDelta(values, window),
     caption,
-    points: sample(values, points),
+    points: aggregateBuckets(values, points),
+    pointLabels: Array.from({ length: Math.min(scoped.length, points) }, (_, index) => {
+      const start = scoped.length <= points ? index : Math.floor((index * scoped.length) / points);
+      const end =
+        scoped.length <= points ? index + 1 : Math.floor(((index + 1) * scoped.length) / points);
+      const first = formatTrendKey(scoped[start]?.key ?? '');
+      const last = formatTrendKey(scoped[end - 1]?.key ?? '');
+      return first === last ? first : `${first} – ${last}`;
+    }),
   };
+}
+
+function formatTrendKey(key: string): string {
+  if (!key) return '';
+  const monthly = key.length === 7;
+  const hourly = key.includes('T');
+  const date = new Date(
+    `${monthly ? `${key}-01` : key.slice(0, 10)}T${hourly ? key.slice(11, 16) : '12:00'}:00+05:30`,
+  );
+  if (Number.isNaN(date.getTime())) return key;
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: PRODUCT_TIME_ZONE,
+    ...(monthly
+      ? { month: 'short', year: 'numeric' }
+      : hourly
+        ? { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true }
+        : { day: 'numeric', month: 'short' }),
+  }).format(date);
 }
 
 function formatTotal(metric: OverviewTrendMetric, values: readonly number[]): string {
@@ -294,18 +362,20 @@ function formatDelta(values: readonly number[], window: number | undefined): str
 }
 
 /**
- * Reduces `values` to at most `points` entries.
+ * Reduces `values` to at most `points` chart intervals without dropping activity.
  *
- * Evenly spaced by index, always keeping the **last** value: the most recent
- * bucket is the one a partner is actually looking at, and dropping it in favour
- * of an average of the rest would make today's sales invisible.
+ * Adjacent source buckets are summed into each interval. Selecting individual
+ * buckets by index can skip a sparse sales bucket entirely (for example, a
+ * single active month between two sampled months), leaving the chart flat even
+ * while its headline total is nonzero. Summing preserves both that activity and
+ * the total represented by the plotted intervals.
  */
-function sample(values: readonly number[], points: number): readonly number[] {
+function aggregateBuckets(values: readonly number[], points: number): readonly number[] {
   if (values.length <= points) return [...values];
-  const step = (values.length - 1) / (points - 1);
   return Array.from({ length: points }, (_, index) => {
-    const value = values[Math.round(index * step)];
-    return value ?? 0;
+    const start = Math.floor((index * values.length) / points);
+    const end = Math.floor(((index + 1) * values.length) / points);
+    return values.slice(start, end).reduce((total, value) => total + value, 0);
   });
 }
 
@@ -354,53 +424,74 @@ function formatAmount(paise: number): string {
 
 // ─── Network ─────────────────────────────────────────────────────────────────
 
-/**
- * The network card lists counterparties from real partnerships.
- *
- * It shows a **shortened organization id**, not a name: the partnership DTO
- * carries ids, and there is no partner-side endpoint that resolves a
- * counterparty organization the viewer is not a member of. Inventing a name
- * here would put a stranger's business name on another partner's dashboard.
- */
+/** Only backend-provided public-safe names may be shown; never expose an organization ID. */
 function buildNetwork(partners: readonly NetworkPartner[]): readonly OverviewNetworkMember[] {
-  return partners.map((partner, index) => ({
-    id: partner.partnershipId,
-    name: shortId(partner.counterpartyOrganizationId),
-    role: partner.side === 'venue' ? 'Venue' : 'Host',
-    initials: shortId(partner.counterpartyOrganizationId).slice(0, 2).toUpperCase(),
-    status: toNetworkStatus(partner.status),
-    statusTone: partner.status === 'active' ? 'success' : 'neutral',
-    accent: (['orange', 'violet', 'teal', 'pink'] as const)[index % 4] ?? 'orange',
-  }));
+  return partners.map((partner, index) => {
+    const trimmedName = partner.name?.trim();
+    const name = trimmedName && trimmedName.length > 0 ? trimmedName : undefined;
+    return {
+      id: partner.partnershipId,
+      name: name ?? 'Partner name unavailable',
+      role: partner.side === 'venue' ? 'Venue' : partner.side === 'promoter' ? 'Promoter' : 'Host',
+      initials: name
+        ? name
+            .split(/\s+/)
+            .slice(0, 2)
+            .map((part) => part[0]?.toUpperCase() ?? '')
+            .join('')
+        : partner.side === 'venue'
+          ? 'V'
+          : partner.side === 'promoter'
+            ? 'P'
+            : 'H',
+      status: toNetworkStatus(partner.status),
+      statusTone:
+        partner.status === 'active'
+          ? 'success'
+          : partner.status === 'pending'
+            ? 'accent'
+            : 'neutral',
+      accent: (['orange', 'violet', 'teal', 'pink'] as const)[index % 4] ?? 'orange',
+    };
+  });
 }
 
 function toNetworkStatus(status: string): OverviewNetworkMember['status'] {
   if (status === 'active') return 'Partnered';
   if (status === 'pending') return 'Invite sent';
+  if (status === 'ended' || status === 'revoked') return 'Ended';
+  if (status === 'blocked') return 'Blocked';
+  if (status === 'rejected') return 'Rejected';
   return 'Active';
 }
 
-function shortId(id: string): string {
-  return id.length <= 10 ? id : `${id.slice(0, 8)}…`;
-}
-
-// ─── Date labels (UTC, so server and client agree) ───────────────────────────
+// ─── Date labels (fixed product timezone, so server/client agree) ────────────
 
 /**
  * `Thursday, 16 July · 5:40 PM`.
  *
- * UTC throughout. This string is produced on the server and re-rendered on the
- * client during hydration; if it were local-time, a partner in a different zone
- * from the server would get a hydration mismatch on every render.
+ * All user-facing date and clock labels use the product's fixed timezone.
  */
 function formatTodayLabel(now: Date): string {
-  const weekday = WEEKDAY_LABELS[now.getUTCDay()] ?? '';
-  const month = MONTH_LABELS[now.getUTCMonth()] ?? '';
-  return `${weekday}, ${String(now.getUTCDate())} ${month} · ${formatClock(now)}`;
+  const parts = new Intl.DateTimeFormat('en-IN', {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    timeZone: PRODUCT_TIME_ZONE,
+  }).formatToParts(now);
+  const get = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value ?? '';
+  return `${get('weekday')}, ${get('day')} ${get('month')} · ${formatClock(now)}`;
 }
 
 function formatGreeting(displayName: string | null, now: Date): string {
-  const hour = now.getUTCHours();
+  const hour = Number(
+    new Intl.DateTimeFormat('en-IN', {
+      hour: 'numeric',
+      hourCycle: 'h23',
+      timeZone: PRODUCT_TIME_ZONE,
+    }).format(now),
+  );
   const part = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening';
   const firstName = displayName?.trim().split(/\s+/)[0];
   // No stored display name → a greeting that is still warm but claims nothing.
@@ -408,23 +499,35 @@ function formatGreeting(displayName: string | null, now: Date): string {
 }
 
 function formatClock(now: Date): string {
-  const hours = now.getUTCHours();
-  const minutes = String(now.getUTCMinutes()).padStart(2, '0');
-  const suffix = hours < 12 ? 'AM' : 'PM';
-  const twelve = hours % 12 === 0 ? 12 : hours % 12;
-  return `${String(twelve)}:${minutes} ${suffix}`;
+  return new Intl.DateTimeFormat('en-IN', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: PRODUCT_TIME_ZONE,
+  })
+    .format(now)
+    .toUpperCase();
 }
 
 function formatDayLabel(iso: string): string {
   const parsed = new Date(iso);
   if (Number.isNaN(parsed.getTime())) return '—';
-  return `${String(parsed.getUTCDate())} ${MONTH_LABELS[parsed.getUTCMonth()] ?? ''}`;
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: PRODUCT_TIME_ZONE,
+    day: 'numeric',
+    month: 'short',
+  }).format(parsed);
 }
 
 function formatTimeLabel(iso: string): string {
   const parsed = new Date(iso);
   if (Number.isNaN(parsed.getTime())) return '—';
-  return formatClock(parsed);
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: PRODUCT_TIME_ZONE,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).format(parsed);
 }
 
 /** `YYYY-MM-DD` in UTC, the wire format every date range uses. */

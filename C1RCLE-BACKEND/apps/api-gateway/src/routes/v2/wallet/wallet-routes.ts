@@ -1,5 +1,7 @@
 import {
   entitlementsListResponseSchema,
+  managedTicketListSchema,
+  eventCoverWalletResponseSchema,
   ordersListResponseSchema,
   paginationQuerySchema,
   walletSummaryDtoSchema,
@@ -26,9 +28,35 @@ const services = createV2Services();
 
 export default async function walletRoutes(fastify: FastifyInstance) {
   fastify.get(
+    '/wallet/booking-tickets',
+    {
+      preHandler: [
+        fastify.rateLimit('AUTH_READ'),
+        fastify.validateV2({ querystring: paginationQuerySchema }),
+      ],
+    },
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const query = request.query as z.infer<typeof paginationQuerySchema>;
+      const data = await services.tickets
+        .listPurchasedManagement(services.actor(request), {
+          limit: query.limit,
+          cursor: query.cursor ?? null,
+        })
+        .catch((error: unknown) =>
+          mapDomainError(reply, request, 'self', error, { hideForbidden: true }),
+        );
+      if (!data) return reply;
+      const validated = validateV2Response(reply, request, managedTicketListSchema, data);
+      return validated ? reply.send(validated) : reply;
+    },
+  );
+
+  fastify.get(
     '/wallet',
     { preHandler: [fastify.rateLimit('AUTH_READ')] },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const actor = services.actor(request);
       const summary = await Promise.resolve()
         .then(async () => {
@@ -36,7 +64,9 @@ export default async function walletRoutes(fastify: FastifyInstance) {
           const orders = await services.orders.listForUser(actor, { limit: 100, cursor: null });
           return {
             activeTicketCount: tickets.items.filter((t) => t.status === 'valid').length,
-            upcomingOrderCount: orders.items.filter((o) => o.status === 'paid').length,
+            upcomingOrderCount: orders.items.filter(
+              (o) => o.status === 'paid' && o.fulfillmentState !== 'pending',
+            ).length,
           };
         })
         .catch((error: unknown) => mapDomainError(reply, request, 'self', error));
@@ -56,6 +86,7 @@ export default async function walletRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const query = request.query as z.infer<typeof paginationQuerySchema>;
       const actor = services.actor(request);
       const page = await services.tickets
@@ -86,6 +117,7 @@ export default async function walletRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const query = request.query as z.infer<typeof paginationQuerySchema>;
       const actor = services.actor(request);
       const page = await services.orders
@@ -102,6 +134,22 @@ export default async function walletRoutes(fastify: FastifyInstance) {
         },
       };
       const validated = validateV2Response(reply, request, ordersListResponseSchema, payload);
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
+  fastify.get(
+    '/wallet/event-covers',
+    { preHandler: [fastify.rateLimit('AUTH_READ')] },
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const actor = services.actor(request);
+      const items = await services.eventCoverWallet
+        .listForGuest(actor)
+        .catch((error: unknown) => mapDomainError(reply, request, 'self', error));
+      if (items === undefined) return reply;
+      const validated = validateV2Response(reply, request, eventCoverWalletResponseSchema, items);
       if (validated === undefined) return reply;
       return reply.send(validated);
     },

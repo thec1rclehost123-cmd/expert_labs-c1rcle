@@ -10,6 +10,8 @@ import {
   VenueCalendarService,
   VenueSlotRequestService,
   EventService,
+  EventCancellationService,
+  createTransactionalEmailConsumer,
   EventCatalogService,
   AnalyticsService,
   IdempotencyService,
@@ -26,6 +28,12 @@ import {
   PricingService,
   OrderService,
   TicketService,
+  TicketAccessService,
+  ComplimentaryAllocationService,
+  WaitlistService,
+  EventCoverPolicyService,
+  EventCoverWalletService,
+  EventCoverRedemptionService,
   createScannerService,
   createDoorService,
   createCoverWalletService,
@@ -49,6 +57,8 @@ import {
   createGuestProfileService,
   SocialService,
   createFollowerFanOutConsumer,
+  createEventMaterialChangeNoticeConsumer,
+  createEventCoverFinancialConsumer,
   NotificationService,
   createNotificationConsumer,
   type ScannerService,
@@ -73,13 +83,23 @@ import {
   FormatCheckVerificationProvider,
   CompositeVerificationProvider,
   MemoryPaymentProvider,
+  resolveGuestBookingFeePolicy,
   MemoryStaffCredentialProvisioner,
   MemoryStaffRotationStore,
   MemoryStaffUserDirectory,
 } from '@c1rcle/core/domain';
 import {
   MemoryOutboxStore,
+  MemoryOrderRepository,
+  MemoryEntitlementRepository,
+  MemoryCartReservationRepository,
+  MemoryLedgerRepository,
+  MemoryFinancialJournalRepository,
+  MemoryProviderPaymentRepository,
+  MemoryEventRepository,
   FirestoreOutboxStore,
+  MemoryEmailDeliveryRepository,
+  FirestoreEmailDeliveryRepository,
   MemoryAuditRepository,
   MemoryAdminAuditRepository,
   FirestoreAdminAuditRepository,
@@ -102,6 +122,7 @@ import type {
   StaffUserDirectory,
   VerificationProvider,
   UserDirectoryPort,
+  ObjectStoragePort,
 } from '@c1rcle/core/domain';
 import type { SocialNotificationRepository } from '@c1rcle/core/domain/ports';
 
@@ -112,6 +133,7 @@ import { BetterAuthStaffCredentialProvisioner } from './auth/staff-credential-pr
 import { ResendEmailSender } from './notifications/resend-email-sender.js';
 import { RazorpayPaymentProvider } from './payments/razorpay-adapter.js';
 import { UnconfiguredPaymentProvider } from './payments/unconfigured-provider.js';
+import { subscribeTransactionalEmailConsumer } from './transactional-email-wiring.js';
 import { FirebasePhoneVerificationProvider } from './verification/firebase-phone-verifier.js';
 
 import type { GatewayConfig } from '../config/index.js';
@@ -163,10 +185,22 @@ export interface PartnerV2Services {
    * hatch (not part of this interface — see that class's doc comment).
    */
   paymentProvider: PaymentProvider;
+  /** Signed media-upload grants; credentials remain server-side. */
+  objectStorage: ObjectStoragePort;
   /** Phase 4 PR3: guest-facing order reads (GET /orders, /orders/:id[/status]). */
   orders: OrderService;
   /** Phase 4 PR3: guest-facing ticket reads (GET /tickets/:id, /wallet/tickets). */
   tickets: TicketService;
+  /** M5 tier access codes and identity-bound grants. */
+  ticketAccess: TicketAccessService;
+  /** M5 Admin controlled comp allocation and issuance. */
+  complimentaryAllocations: ComplimentaryAllocationService;
+  /** M5 FIFO waitlist, bounded offers and checkout handoff. */
+  waitlist: WaitlistService;
+  /** M5 Host/Venue draft cover policy proposal and acceptance. */
+  eventCoverPolicies: EventCoverPolicyService;
+  eventCoverWallet: EventCoverWalletService;
+  eventCoverRedemption: EventCoverRedemptionService;
   /** T09 idempotency — durable on the firestore driver, in-memory on `memory`. */
   idempotency: IdempotencyService;
   /** Builds the service actor from the authenticated request state. */
@@ -297,9 +331,38 @@ export function actorFromRequest(gw: GatewayConfig, request: FastifyRequest): Ac
 
 function buildV2Services(logger?: Logger): PartnerV2Services {
   const gw = getGatewayConfig();
+  const promoterAgreementFixtureAllowed =
+    gw.NODE_ENV !== 'production' &&
+    (gw.STORAGE_DRIVER === 'memory' ||
+      (Boolean(gw.FIRESTORE_EMULATOR_HOST) && Boolean(gw.FIREBASE_AUTH_EMULATOR_HOST)));
   const coreConfig = createCoreConfig({
+    deploymentEnvironment:
+      gw.DEPLOYMENT_ENVIRONMENT ?? (gw.NODE_ENV === 'production' ? 'production' : 'local'),
+    promoterAgreement: gw.PROMOTER_AGREEMENT_ARTIFACT ?? null,
     redis: { url: gw.REDIS_URL },
     firestore: { projectId: gw.FIRESTORE_PROJECT_ID },
+    features: {
+      m4PromoterAgreementFixture: promoterAgreementFixtureAllowed,
+      // API route tests exercise the real grant path; all other environments
+      // require an explicit non-production M5 activation handoff.
+      m5PrivateAccess: gw.NODE_ENV === 'test' || gw.M5_PRIVATE_ACCESS_ENABLED,
+      m5EligibilityRulesEnabled: gw.NODE_ENV === 'test' || gw.M5_ELIGIBILITY_RULES_ENABLED,
+      m5TicketTransfers: gw.M5_TICKET_TRANSFERS_ENABLED,
+      m5OfflineTicketManifests: gw.M5_OFFLINE_TICKET_MANIFESTS_ENABLED,
+      m5OfflineManifestDrainComplete: gw.M5_OFFLINE_MANIFEST_DRAIN_COMPLETE,
+      m5EventCoverSales: gw.M5_COVER_SALES_ENABLED,
+      m5TicketAddonsEnabled: gw.NODE_ENV === 'test' || gw.M5_TICKET_ADDONS_ENABLED,
+      m5CoverMerchantApproved: gw.M5_COVER_MERCHANT_APPROVED,
+      m5CoverAccountingApproved: gw.M5_COVER_ACCOUNTING_APPROVED,
+      m5CoverActivationApproved: gw.M5_COVER_ACTIVATION_APPROVED,
+      // In-memory/emulator acceptance is test-fixture evidence only. A real
+      // project never records an apparent commercial approval by default.
+      m5CoverPolicyFixtures:
+        gw.STORAGE_DRIVER === 'memory' ||
+        (gw.NODE_ENV !== 'production' &&
+          Boolean(gw.FIRESTORE_EMULATOR_HOST) &&
+          Boolean(gw.FIREBASE_AUTH_EMULATOR_HOST)),
+    },
     storage: gw.FIREBASE_STORAGE_BUCKET ? { kycBucket: gw.FIREBASE_STORAGE_BUCKET } : undefined,
     emailOtpSecret: gw.EMAIL_OTP_SECRET,
     // Was never passed, so every deploy silently used the core default — a
@@ -311,9 +374,14 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
     bankEncryptionSecret: gw.ENCRYPTION_KEY,
     bankEncryptionSalt: gw.ENCRYPTION_SALT,
     ...(gw.PARTNER_DASHBOARD_URL ? { partnerDashboardUrl: gw.PARTNER_DASHBOARD_URL } : {}),
+    ...(gw.GUEST_PORTAL_URL ? { guestPortalUrl: gw.GUEST_PORTAL_URL } : {}),
   });
 
   const repositories: ServiceDeps['repositories'] = buildRepositories(gw);
+  const emailDeliveries =
+    gw.STORAGE_DRIVER === 'memory'
+      ? new MemoryEmailDeliveryRepository()
+      : new FirestoreEmailDeliveryRepository(firestoreClient(gw));
 
   // Financial and domain-event intents must survive a production process
   // restart. Tests keep the deterministic memory adapter; Firestore uses the
@@ -322,10 +390,46 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
     gw.STORAGE_DRIVER === 'memory'
       ? new MemoryOutboxStore()
       : new FirestoreOutboxStore(firestoreClient(gw));
+  if (gw.STORAGE_DRIVER === 'memory' && outboxStore instanceof MemoryOutboxStore) {
+    const {
+      orders,
+      entitlements,
+      cartReservations,
+      ledger,
+      financialJournals,
+      providerPayments,
+      events,
+    } = repositories;
+    if (
+      !(orders instanceof MemoryOrderRepository) ||
+      !(entitlements instanceof MemoryEntitlementRepository) ||
+      !(cartReservations instanceof MemoryCartReservationRepository) ||
+      !(ledger instanceof MemoryLedgerRepository) ||
+      !(financialJournals instanceof MemoryFinancialJournalRepository) ||
+      !(providerPayments instanceof MemoryProviderPaymentRepository) ||
+      !(events instanceof MemoryEventRepository)
+    ) {
+      throw new Error('Canonical memory fulfillment storage is unavailable');
+    }
+    orders.fulfilmentStore = {
+      carts: cartReservations,
+      entitlements,
+      ledger,
+      journals: financialJournals,
+      outbox: outboxStore,
+      providerPayments,
+      events,
+    };
+    entitlements.issuanceOutbox = outboxStore;
+    entitlements.admissionOrders = orders;
+  }
   const audits = new MemoryAuditRepository();
   const eventBus = new InProcessEventBus(outboxStore);
   eventBus.subscribe('event.published', createAuditConsumer(audits));
   eventBus.subscribe('event.updated', createAuditConsumer(audits));
+  eventBus.subscribe('event.ticket_tier_limits_updated', createAuditConsumer(audits));
+  eventBus.subscribe('event.cancelled', createAuditConsumer(audits));
+  eventBus.subscribe('event.cancellation.order_affected', createAuditConsumer(audits));
   // B11: the analytics projection consumer is subscribed below, once `deps`
   // exists — it needs the AnalyticsService instance, which needs `deps`.
   // Phase 8 pub/sub: follow graph changes are audited, and every publish fans
@@ -370,11 +474,22 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
       : keyId && keySecret && webhookSecret
         ? new RazorpayPaymentProvider({ keyId, keySecret, webhookSecret })
         : new UnconfiguredPaymentProvider();
-  const pricing = new PricingService({ eventCatalog: repositories.catalog });
   const inventory = new InventoryService({
     eventCatalog: repositories.catalog,
     cartReservation: repositories.cartReservations,
     order: repositories.orders,
+  });
+  const pricing = new PricingService({
+    eventCatalog: repositories.catalog,
+    inventory,
+    clock: () => coreConfig.clock.now(),
+    bookingFeePolicy: async () => {
+      const settings = await repositories.platformSettings.get();
+      return resolveGuestBookingFeePolicy(
+        coreConfig.deploymentEnvironment,
+        settings.bookingFeePolicy,
+      );
+    },
   });
 
   // Phone verification: real GCP Identity Platform check when firestore
@@ -402,6 +517,9 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
     gwConfig.RESEND_API_KEY,
     gwConfig.NODE_ENV,
     resolvedLogger,
+    gwConfig.RESEND_FROM_EMAIL,
+    gwConfig.RESEND_NON_PROD_TEST_RECIPIENT,
+    gwConfig.RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST,
   );
 
   // B10: auth is only real on the firestore driver — see plugins/auth.ts and
@@ -446,6 +564,7 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
         ? new EchoObjectStorage()
         : new FirebaseObjectStorage(storageClient(gw), coreConfig.storage.kycBucket),
     emailSender,
+    emailDeliveries,
     userDirectory,
     paymentProvider,
     credentialProvisioner,
@@ -455,17 +574,55 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
     repositories,
   };
 
+  const eventCancellation = new EventCancellationService(deps);
+  eventBus.subscribe('event.cancelled', eventCancellation.handle);
+  eventBus.subscribe('event.cancellation.batch_requested', eventCancellation.handle);
+  eventBus.subscribe('order.fulfilled', eventCancellation.handle);
+  eventBus.subscribe('finance.refund.finalized', eventCancellation.handle);
+  eventBus.subscribe('finance.refund.settled', eventCancellation.handle);
+  const transactionalEmailConsumer = createTransactionalEmailConsumer(deps);
+  subscribeTransactionalEmailConsumer(eventBus, transactionalEmailConsumer);
+  const eventCoverFinancialConsumer = createEventCoverFinancialConsumer({
+    eventCoverAccounts: repositories.eventCoverAccounts,
+    financialJournals: repositories.financialJournals,
+  });
+  eventBus.subscribe('event-cover.redeemed', eventCoverFinancialConsumer);
+  eventBus.subscribe('event-cover.reversed', eventCoverFinancialConsumer);
+
   // V2 partner inbox producer consumer: domain events → notification rows.
   // Subscribed to each producer event type; the handler is a named function
   // (its `handler.name` keys the bus's per-event dedupe set).
   const notificationConsumer = createNotificationConsumer({
     notifications: repositories.notifications,
+    orders: repositories.orders,
+    organizations: repositories.organizations,
     config: coreConfig,
     logger: deps.logger,
   });
+  eventBus.subscribe('order.fulfilled', notificationConsumer);
+  eventBus.subscribe('promoter.assignment.invited', notificationConsumer);
+  eventBus.subscribe('promoter.assignment.accepted', notificationConsumer);
+  eventBus.subscribe('promoter.assignment.rejected', notificationConsumer);
+  eventBus.subscribe('promoter.assignment.revoked', notificationConsumer);
+  eventBus.subscribe('promoter.campaign.activated', notificationConsumer);
+  eventBus.subscribe('promoter.campaign.revoked', notificationConsumer);
+  eventBus.subscribe('promoter.onboarding.approved', notificationConsumer);
+  eventBus.subscribe('promoter.assignments.status_changed', notificationConsumer);
+  eventBus.subscribe('finance.chargeback.updated', notificationConsumer);
+  eventBus.subscribe('finance.refund.settled', notificationConsumer);
+  eventBus.subscribe('finance.payout.status_changed', notificationConsumer);
   eventBus.subscribe('promoter_connection.requested', notificationConsumer);
   eventBus.subscribe('partnership.requested', notificationConsumer);
   eventBus.subscribe('event.published', notificationConsumer);
+  eventBus.subscribe('event.updated', notificationConsumer);
+
+  const eventMaterialChangeNoticeConsumer = createEventMaterialChangeNoticeConsumer({
+    orders: repositories.orders,
+    entitlements: repositories.entitlements,
+    notifications: repositories.socialNotifications,
+    config: coreConfig,
+  });
+  eventBus.subscribe('event.material_change.order_affected', eventMaterialChangeNoticeConsumer);
 
   // B11: analytics projection. Built here (not with the audit subscriptions
   // above) because the projector IS the AnalyticsService instance the returned
@@ -544,7 +701,9 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
     logger: deps.logger,
   });
 
-  const checkout = new CheckoutService(deps);
+  const providerPayments = new ProviderPaymentService(deps);
+  const checkout = new CheckoutService(deps, providerPayments);
+  const waitlist = new WaitlistService(deps, checkout, adminAuthority);
   const fulfilmentRepair = new FulfilmentRepairService(deps, checkout);
 
   // The paid walk-up sale. `settleOrder` is injected from the checkout
@@ -566,6 +725,7 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
 
   // Phase 6 services
   const finance = createFinanceService({
+    financialExposure: repositories,
     ledger: repositories.ledger,
     financialJournals: repositories.financialJournals,
     journalTransition: repositories.journalTransition,
@@ -576,6 +736,7 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
   });
 
   const payout = createPayoutService({
+    financialExposure: repositories,
     payouts: repositories.payouts,
     bankAccounts: repositories.bankAccounts,
     ledger: repositories.ledger,
@@ -585,6 +746,7 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
     reconciliations: repositories.reconciliations,
     platformSettings: repositories.platformSettings,
     config: coreConfig,
+    outbox: eventBus,
   });
 
   const bankAccount = createBankAccountService({
@@ -598,7 +760,6 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
   });
 
   const refund = new RefundService(deps, adminAuthority);
-  const providerPayments = new ProviderPaymentService(deps);
   const reconciliation = new ReconciliationService(deps);
   const journalTransition = new JournalTransitionService(deps);
   const adminPayout = new AdminPayoutService(deps, adminAuthority);
@@ -614,6 +775,7 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
 
   const emailOtp = createEmailOtpService({
     emailOtp: repositories.emailOtp,
+    users: repositories.users,
     emailSender,
     config: coreConfig,
   });
@@ -623,7 +785,7 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
     config: coreConfig,
   });
 
-  if (gw.STORAGE_DRIVER === 'firestore') {
+  if (gw.STORAGE_DRIVER === 'firestore' && gw.BACKGROUND_WORKERS_ENABLED) {
     const drainPersistedOutbox = () => {
       void eventBus.drain().catch((error: unknown) => {
         resolvedLogger.error('outbox.drain_failed', {
@@ -658,8 +820,15 @@ function buildV2Services(logger?: Logger): PartnerV2Services {
     fulfilmentRepair,
     public: new PublicService(deps),
     paymentProvider,
+    objectStorage: deps.objectStorage,
     orders: new OrderService(deps),
     tickets: new TicketService(deps),
+    ticketAccess: new TicketAccessService(deps),
+    complimentaryAllocations: new ComplimentaryAllocationService(deps, adminAuthority),
+    waitlist,
+    eventCoverPolicies: new EventCoverPolicyService(deps),
+    eventCoverWallet: new EventCoverWalletService(deps),
+    eventCoverRedemption: new EventCoverRedemptionService(deps),
     // Replay protection must outlive the process: a restart mid-retry with an
     // in-memory store turns a client's retry into a second business result.
 

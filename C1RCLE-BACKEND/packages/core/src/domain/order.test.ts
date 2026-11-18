@@ -5,6 +5,7 @@ import {
   canAdmit,
   entitlementId,
   issueEntitlements,
+  redeemTicketAddonEntitlement,
   remainingAdmissions,
   scanEntitlement,
   voidEntitlement,
@@ -20,11 +21,13 @@ import {
   lockOrderForRefund,
   markFailed,
   markPaid,
+  bookingReferenceForOrderId,
   refundableBalance,
   restoreOrderAfterRefundFailure,
   totalUnits,
 } from './models/order.js';
 import { calculatePricing } from './models/pricing.js';
+import { committedTierQuantity } from './models/tier-inventory.js';
 
 import type { TicketTier } from './models/event-catalog.js';
 import type { Order } from './models/order.js';
@@ -71,6 +74,15 @@ function paidOrder(): Order {
 }
 
 describe('order lifecycle', () => {
+  it('assigns a deterministic support-safe booking reference', () => {
+    const created = order();
+
+    expect(created.bookingReference).toBe(bookingReferenceForOrderId(created.id));
+    expect(created.bookingReference).toMatch(/^C1-[A-F0-9]{5}(?:-[A-F0-9]{5}){3}$/);
+    expect(bookingReferenceForOrderId(created.id)).toBe(created.bookingReference);
+    expect(bookingReferenceForOrderId('ord_2')).not.toBe(created.bookingReference);
+  });
+
   it('freezes the pricing breakdown onto the order', () => {
     const created = order();
     expect(created.subtotalPaise).toBe(200_000);
@@ -181,6 +193,55 @@ describe('entitlement issuance', () => {
     expect(issued[0]?.id).toMatch(/^ENT-[0-9a-f]{32}$/);
   });
 
+  it('issues deterministic add-on grants per admission and voids them with the ticket', () => {
+    const paid = paidOrder();
+    const line = paid.lines[0];
+    if (!line) throw new Error('expected a paid order line');
+    const orderWithAddons = {
+      ...paid,
+      lines: [
+        {
+          ...line,
+          quantity: 1,
+          ticketAddons: [
+            {
+              addonId: 'addon-parking',
+              name: 'Parking pass',
+              kind: 'parking' as const,
+              unitPricePaise: 5_000,
+              quantityPerEntitlement: 2,
+            },
+          ],
+        },
+      ],
+    };
+
+    const ticket = issueEntitlements({ order: orderWithAddons, now: T0 })[0];
+    if (!ticket) throw new Error('expected one admission entitlement');
+    expect(ticket?.ticketAddons).toHaveLength(2);
+    expect(new Set(ticket?.ticketAddons?.map((addon) => addon.id)).size).toBe(2);
+    expect(ticket?.ticketAddons?.every((addon) => addon.status === 'active')).toBe(true);
+    expect(issueEntitlements({ order: orderWithAddons, now: T0 })[0]?.ticketAddons).toEqual(
+      ticket?.ticketAddons,
+    );
+
+    const grant = ticket.ticketAddons?.[0];
+    if (!grant) throw new Error('expected an add-on entitlement');
+    const redeemed = redeemTicketAddonEntitlement(ticket, grant.id, T0);
+    expect(redeemed.status).toBe('valid');
+    expect(redeemed.scanCount).toBe(ticket.scanCount);
+    expect(redeemed.ticketAddons?.[0]).toMatchObject({
+      id: grant.id,
+      status: 'redeemed',
+      redeemedAt: T0.toISOString(),
+    });
+    expect(() => redeemTicketAddonEntitlement(redeemed, grant.id, T0)).toThrow(/already been used/);
+
+    const voided = voidEntitlement(redeemed, T0);
+    expect(voided.status).toBe('void');
+    expect(voided.ticketAddons?.map((addon) => addon.status)).toEqual(['redeemed', 'void']);
+  });
+
   it('id stays within the 64-char opaque-ID cap even with realistic long inputs', () => {
     // Regression: ORD-{razorpay paymentId} + a UUID tierId overflowed 64
     // chars under the old ENT-{orderId}-{tierId}-{index} scheme — surfaced
@@ -219,6 +280,37 @@ describe('entitlement issuance', () => {
     // is exactly what a couple ticket is priced not to allow.
     expect(issued).toHaveLength(1);
     expect(issued[0]?.scanCountAllowed).toBe(2);
+  });
+
+  it('issues one independently claimable entitlement per attendee for new group units', () => {
+    const paid = paidOrder();
+    const sourceLine = paid.lines[0];
+    if (!sourceLine) throw new Error('expected a paid order line');
+    const groupOrder = {
+      ...paid,
+      lines: [
+        {
+          ...sourceLine,
+          quantity: 2,
+          guestCount: 3,
+          admissionMode: 'per_person' as const,
+        },
+      ],
+    };
+
+    const issued = issueEntitlements({ order: groupOrder, now: T0 });
+
+    expect(issued).toHaveLength(6);
+    expect(issued.every((entitlement) => entitlement.scanCountAllowed === 1)).toBe(true);
+    expect(issued.map((entitlement) => entitlement.currentHolderUserId)).toEqual([
+      'user_1',
+      null,
+      null,
+      'user_1',
+      null,
+      null,
+    ]);
+    expect(new Set(issued.map((entitlement) => entitlement.id)).size).toBe(6);
   });
 });
 
@@ -379,5 +471,62 @@ describe('admin refunds', () => {
     ord = lockOrderForRefund(ord, T0);
     ord = applyOrderRefund(ord, ord.grandTotalPaise, T0);
     expect(ord.status).toBe('refunded');
+  });
+});
+
+describe('settled attendee inventory releases', () => {
+  it('releases exactly the selected ticket once while preserving original purchase lines', () => {
+    const paid = paidOrder();
+    const locked = lockOrderForRefund(paid, T0);
+    const released = applyOrderRefund(locked, 1000, T0, 'refund-riya', [
+      { entitlementId: 'riya', tierId: 'tier_1', pricingPhaseId: null },
+    ]);
+    expect(released.lines).toEqual(paid.lines);
+    expect(released.lines[0]?.quantity).toBe(2);
+    expect(committedTierQuantity('tier_1', [released], [], T0)).toBe(1);
+    const replay = applyOrderRefund(released, 1000, T0, 'refund-riya', [
+      { entitlementId: 'riya', tierId: 'tier_1', pricingPhaseId: null },
+    ]);
+    expect(replay).toBe(released);
+    expect(committedTierQuantity('tier_1', [replay], [], T0)).toBe(1);
+    expect(() =>
+      applyOrderRefund(lockOrderForRefund(released, T0), 1000, T0, 'another-refund', [
+        { entitlementId: 'riya', tierId: 'tier_1' },
+      ]),
+    ).toThrow('duplicate');
+  });
+  it('counts independent group attendees but releases a Couple bundle as one ticket unit', () => {
+    const base = paidOrder();
+    const originalLine = base.lines[0];
+    if (!originalLine) throw new Error('Missing order fixture line');
+    const group = {
+      ...base,
+      lines: [
+        { ...originalLine, quantity: 1, guestCount: 3, admissionMode: 'per_person' as const },
+      ],
+    };
+    const groupRefund = applyOrderRefund(lockOrderForRefund(group, T0), 1000, T0, 'group-refund', [
+      { entitlementId: 'riya', tierId: 'tier_1' },
+    ]);
+    expect(committedTierQuantity('tier_1', [groupRefund], [], T0)).toBe(2);
+    const couple = {
+      ...base,
+      lines: [{ ...originalLine, quantity: 1, guestCount: 2, admissionMode: 'bundle' as const }],
+    };
+    const coupleRefund = applyOrderRefund(
+      lockOrderForRefund(couple, T0),
+      1000,
+      T0,
+      'couple-refund',
+      [{ entitlementId: 'couple', tierId: 'tier_1' }],
+    );
+    expect(committedTierQuantity('tier_1', [coupleRefund], [], T0)).toBe(0);
+  });
+  it('does not subtract ticket releases again from fully refunded orders', () => {
+    const locked = lockOrderForRefund(paidOrder(), T0);
+    const full = applyOrderRefund(locked, locked.grandTotalPaise, T0, 'full-refund', [
+      { entitlementId: 'riya', tierId: 'tier_1' },
+    ]);
+    expect(committedTierQuantity('tier_1', [full], [], T0)).toBe(0);
   });
 });

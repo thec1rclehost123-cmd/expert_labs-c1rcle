@@ -35,6 +35,13 @@ export interface PartnershipWithNames {
   venueName: string | null;
   venueSlug: string | null;
   venueCity: string | null;
+  hostPhotoUrl: string | null;
+  hostCoverUrl: string | null;
+  hostBio: string;
+  venuePhotoUrl: string | null;
+  venueCoverUrl: string | null;
+  venueBio: string;
+  venueGenres: string[];
 }
 
 /**
@@ -219,11 +226,41 @@ export class PartnershipService {
       const venueOrg = venueOrgByName.get(partnership.venueOrganizationId);
       return {
         partnership,
-        hostName: hostOrg?.name ?? null,
+        hostName: hostOrg ? (hostOrg.settings.partnerProfile?.displayName ?? hostOrg.name) : null,
         hostSlug: hostOrg?.slug ?? null,
-        venueName: venue?.public.name ?? venueOrg?.name ?? null,
+        venueName:
+          venue?.public.name ??
+          (venueOrg ? (venueOrg.settings.partnerProfile?.displayName ?? venueOrg.name) : null),
         venueSlug: venue?.public.slug ?? venueOrg?.slug ?? null,
         venueCity: venue?.public.address?.city ?? null,
+        hostPhotoUrl:
+          (hostOrg?.settings.partnerPrivacy?.profileVisible ?? true)
+            ? (hostOrg?.settings.partnerProfile?.photoUrl ?? null)
+            : null,
+        hostCoverUrl:
+          (hostOrg?.settings.partnerPrivacy?.profileVisible ?? true)
+            ? (hostOrg?.settings.partnerProfile?.coverUrl ?? null)
+            : null,
+        hostBio:
+          (hostOrg?.settings.partnerPrivacy?.profileVisible ?? true)
+            ? (hostOrg?.settings.partnerProfile?.bio ?? '')
+            : '',
+        venuePhotoUrl:
+          (venueOrg?.settings.partnerPrivacy?.profileVisible ?? true)
+            ? (venue?.public.photoUrl ?? null)
+            : null,
+        venueCoverUrl:
+          (venueOrg?.settings.partnerPrivacy?.profileVisible ?? true)
+            ? (venue?.public.coverUrl ?? null)
+            : null,
+        venueBio:
+          (venueOrg?.settings.partnerPrivacy?.profileVisible ?? true)
+            ? (venue?.public.description ?? '')
+            : '',
+        venueGenres:
+          (venueOrg?.settings.partnerPrivacy?.profileVisible ?? true)
+            ? (venue?.public.genres ?? [])
+            : [],
       };
     });
     return { ...page, items };
@@ -231,12 +268,14 @@ export class PartnershipService {
 
   async approve(actor: ActorContext, partnershipId: EntityId): Promise<Partnership> {
     const partnership = await this.fetchParty(actor, partnershipId);
-    const approved = approvePartnership(
-      partnership,
-      actor.organizationId,
-      this.deps.config.clock.now(),
-    );
+    const now = this.deps.config.clock.now();
+    const approved = approvePartnership(partnership, actor.organizationId, now);
     await this.repo.save(approved);
+    await this.deps.repositories.notifications.resolveAction(
+      'partnership',
+      partnershipId,
+      now.toISOString(),
+    );
     return approved;
   }
 
@@ -246,32 +285,40 @@ export class PartnershipService {
     reason?: string,
   ): Promise<Partnership> {
     const partnership = await this.fetchParty(actor, partnershipId);
-    const rejected = rejectPartnership(
-      partnership,
-      actor.organizationId,
-      reason,
-      this.deps.config.clock.now(),
-    );
+    const now = this.deps.config.clock.now();
+    const rejected = rejectPartnership(partnership, actor.organizationId, reason, now);
     await this.repo.save(rejected);
+    await this.deps.repositories.notifications.resolveAction(
+      'partnership',
+      partnershipId,
+      now.toISOString(),
+    );
     return rejected;
   }
 
   async block(actor: ActorContext, partnershipId: EntityId, reason?: string): Promise<Partnership> {
     const partnership = await this.fetchParty(actor, partnershipId);
-    const blocked = blockPartnership(
-      partnership,
-      actor.organizationId,
-      reason,
-      this.deps.config.clock.now(),
-    );
+    const now = this.deps.config.clock.now();
+    const blocked = blockPartnership(partnership, actor.organizationId, reason, now);
     await this.repo.save(blocked);
+    await this.deps.repositories.notifications.resolveAction(
+      'partnership',
+      partnershipId,
+      now.toISOString(),
+    );
     return blocked;
   }
 
   async end(actor: ActorContext, partnershipId: EntityId): Promise<Partnership> {
     const partnership = await this.fetchParty(actor, partnershipId);
-    const ended = endPartnership(partnership, actor.organizationId, this.deps.config.clock.now());
+    const now = this.deps.config.clock.now();
+    const ended = endPartnership(partnership, actor.organizationId, now);
     await this.repo.save(ended);
+    await this.deps.repositories.notifications.resolveAction(
+      'partnership',
+      partnershipId,
+      now.toISOString(),
+    );
     return ended;
   }
 

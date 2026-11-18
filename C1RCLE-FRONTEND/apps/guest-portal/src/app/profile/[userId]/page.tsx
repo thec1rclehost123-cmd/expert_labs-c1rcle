@@ -1,52 +1,47 @@
+import { cookies } from 'next/headers';
 import { notFound } from 'next/navigation';
 
-import { PublicProfileView } from '@/features/profile/components/PublicProfileView';
-import { findPublicProfileFixture } from '@/features/profile/fixtures/public-profile.fixture';
-import { buildPrivateMetadata } from '@/lib/seo/metadata';
-import { isProductionSeo } from '@/lib/seo/site';
+import { createApiClient, isApiClientError } from '@c1rcle/api-client';
+import { opaqueIdSchema } from '@c1rcle/contracts';
+import { socialGuestProfileSchema } from '@c1rcle/contracts/guest-social';
 
-import type { ProfileEventFilter } from '@/features/profile/types/profile.types';
+import { SocialProfileView } from '@/features/social/SocialProfileView';
+import { requireGuestSession } from '@/lib/auth/require-session';
+import { buildPrivateMetadata } from '@/lib/seo/metadata';
+
 import type { Metadata } from 'next';
 
-interface PublicProfilePageProps {
+interface Props {
   params: Promise<{ userId: string }>;
-  searchParams?: Promise<{ filter?: string | string[] }>;
 }
-
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
-
-function firstValue(value: string | string[] | undefined) {
-  return Array.isArray(value) ? value[0] : value;
+/** Never publish a person's name/photo in link previews or search metadata. */
+export function generateMetadata(): Metadata {
+  return buildPrivateMetadata('Guest profile', 'Guest social profile on C1RCLE.');
 }
-
-function resolveEventFilter(value: string | undefined): ProfileEventFilter {
-  return value === 'attended' ? 'attended' : 'upcoming';
-}
-
-export async function generateMetadata({ params }: PublicProfilePageProps): Promise<Metadata> {
+export default async function PublicProfilePage({ params }: Props) {
   const { userId } = await params;
-  if (isProductionSeo()) notFound();
-  const profile = findPublicProfileFixture(decodeURIComponent(userId));
-
-  if (!profile) {
-    return buildPrivateMetadata('Member unavailable', 'This C1RCLE member profile is unavailable.');
+  if (!opaqueIdSchema.safeParse(userId).success) notFound();
+  const session = await requireGuestSession(`/profile/${encodeURIComponent(userId)}`);
+  let profile;
+  try {
+    profile = await createApiClient().get({
+      path: `/api/v2/social/profiles/${encodeURIComponent(userId)}`,
+      schema: socialGuestProfileSchema,
+      headers: { cookie: (await cookies()).toString() },
+    });
+  } catch (error) {
+    if (isApiClientError(error) && error.status === 404) notFound();
+    return (
+      <section className="mx-auto max-w-xl px-5 pb-24 pt-36 text-white">
+        <h1 className="text-2xl font-semibold">Profile unavailable</h1>
+        <p className="mt-4 text-white/60">
+          Social profiles require a verified Guest account and completed onboarding. If you already
+          have access, try refreshing.
+        </p>
+      </section>
+    );
   }
-
-  return buildPrivateMetadata('Member profile', 'View a C1RCLE member profile.');
-}
-
-export default async function PublicProfilePage({ params, searchParams }: PublicProfilePageProps) {
-  const [{ userId }, query] = await Promise.all([params, searchParams]);
-  if (isProductionSeo()) notFound();
-  const profile = findPublicProfileFixture(decodeURIComponent(userId));
-
-  if (!profile) notFound();
-
-  return (
-    <PublicProfileView
-      activeFilter={resolveEventFilter(firstValue(query?.filter))}
-      profile={profile}
-    />
-  );
+  return <SocialProfileView profile={profile} isSelf={session.user.id === userId} />;
 }

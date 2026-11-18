@@ -16,13 +16,14 @@ import {
   disputeResponseSchema,
   disputeListResponseSchema,
 } from '@c1rcle/contracts/client';
-import { maskAccountNumber } from '@c1rcle/core/domain';
+import { ForbiddenError, maskAccountNumber } from '@c1rcle/core/domain';
 import { z } from 'zod';
 
 import type { FinanceOrderRow } from '@c1rcle/core/application';
 import type { BankAccount, Dispute, LedgerEntry, Payout } from '@c1rcle/core/domain';
 
-import { requirePayoutsEnabled } from '../../../lib/payouts-gate.js';
+import { getGatewayConfig } from '../../../config/index.js';
+import { payoutsEnabled, requirePayoutsEnabled } from '../../../lib/payouts-gate.js';
 import { isIdempotencyConflict, runIdempotent } from '../../../lib/v2-idempotency.js';
 import { validateV2Response } from '../../../lib/v2-response-validation.js';
 import { createV2Services } from '../../../lib/v2-services.js';
@@ -71,7 +72,10 @@ export default async function financeRoutes(fastify: FastifyInstance) {
         .getBalances(organizationId, actor)
         .catch((error: unknown) => mapDomainError(reply, request, organizationId, error));
       if (balances === undefined) return reply;
-      const validated = validateV2Response(reply, request, balanceSummaryResponseSchema, balances);
+      const validated = validateV2Response(reply, request, balanceSummaryResponseSchema, {
+        ...balances,
+        payoutsEnabled: payoutsEnabled(getGatewayConfig()),
+      });
       if (validated === undefined) return reply;
       return reply.send(validated);
     },
@@ -138,6 +142,27 @@ export default async function financeRoutes(fastify: FastifyInstance) {
       const { organizationId } = request.params as z.infer<typeof organizationIdParam>;
       const query = request.query as z.infer<typeof paginationQuerySchema>;
       const actor = services.actor(request);
+      if (actor.organizationId !== organizationId) {
+        mapDomainError(
+          reply,
+          request,
+          organizationId,
+          new ForbiddenError('Finance organization does not match the active organization'),
+        );
+        return reply;
+      }
+      const onboarding = await services
+        .repos()
+        .onboarding.findByProvisionedOrganizationId(organizationId);
+      if (onboarding?.requestedType === 'promoter') {
+        mapDomainError(
+          reply,
+          request,
+          organizationId,
+          new ForbiddenError('Promoter workspaces cannot access purchaser order details'),
+        );
+        return reply;
+      }
       const page = await services.orders
         .listForOrganization(organizationId, actor, {
           cursor: query.cursor ?? null,
@@ -416,6 +441,7 @@ export default async function financeRoutes(fastify: FastifyInstance) {
             organizationId,
             orderId: body.orderId,
             ledgerEntryId: body.ledgerEntryId,
+            journalId: body.journalId,
             reason: body.reason,
             amount: body.amountPaise,
           },
@@ -555,13 +581,14 @@ export default async function financeRoutes(fastify: FastifyInstance) {
 }
 
 function financeOrderToDto(row: FinanceOrderRow) {
-  const { order, eventName, ticketCount } = row;
+  const { order, eventName, ticketCount, ticketLines } = row;
   return {
     id: order.id,
     eventId: order.eventId,
     eventName,
     buyerName: order.contact.name,
     ticketCount,
+    ticketLines,
     currency: order.currency,
     grandTotalPaise: order.grandTotalPaise,
     refundedPaise: order.refundedPaise,
@@ -620,6 +647,7 @@ function disputeToDto(dispute: Dispute) {
     organizationId: dispute.organizationId,
     orderId: dispute.orderId,
     ledgerEntryId: dispute.ledgerEntryId,
+    journalId: dispute.journalId ?? null,
     raisedBy: dispute.raisedBy,
     reason: dispute.reason,
     amountPaise: dispute.amount,

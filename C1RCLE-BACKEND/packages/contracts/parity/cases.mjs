@@ -1,3 +1,6 @@
+import { runGeneratedParityCases } from './cases-generated.mjs';
+import { runWireParityCases } from './cases-wire.mjs';
+
 /**
  * ─── Contract parity cases ───────────────────────────────────────────────────
  * The fixtures behind `scripts/contract-parity.mjs`: every case parses one value
@@ -40,6 +43,43 @@ export async function runParityCases({
     mustChangePassword: false,
   };
 
+  for (const status of ['approved', 'staging_only', 'test_fixture']) {
+    agree(
+      'promoterAgreementDtoSchema',
+      `accepts versioned agreement ${status}`,
+      {
+        version: 'synthetic-v1',
+        status,
+        text: 'Synthetic contract parity text',
+        textSha256: 'a'.repeat(64),
+      },
+      true,
+    );
+  }
+  agree(
+    'promoterAgreementDtoSchema',
+    'rejects unknown agreement status',
+    {
+      version: 'synthetic-v1',
+      status: 'unreviewed',
+      text: 'Synthetic',
+      textSha256: 'a'.repeat(64),
+    },
+    false,
+  );
+  agree(
+    'promoterAgreementAcceptanceSchema',
+    'preserves staging-only acceptance',
+    {
+      version: 'staging-v1',
+      artifactStatus: 'staging_only',
+      textSha256: 'a'.repeat(64),
+      acceptedBy: 'synthetic-user',
+      acceptedAt: '2026-11-06T19:00:00.000Z',
+    },
+    true,
+  );
+
   /* ── role ─────────────────────────────────────────────────────────────────── */
   for (const role of ['guest', 'partner', 'admin']) {
     agree('roleSchema', `accepts ${role}`, role, true);
@@ -49,6 +89,28 @@ export async function runParityCases({
 
   /* ── user ─────────────────────────────────────────────────────────────────── */
   agree('userSchema', 'accepts the canonical user', VALID_USER, true);
+  for (const emailVerified of [true, false]) {
+    agree(
+      'userSchema',
+      `accepts emailVerified=${emailVerified}`,
+      { ...VALID_USER, emailVerified },
+      true,
+    );
+    for (const [side, schema] of [
+      ['frontend', frontend.userSchema],
+      ['backend', backend.userSchema],
+    ]) {
+      if (schema.parse({ ...VALID_USER, emailVerified }).emailVerified !== emailVerified) {
+        failures.push(`${side} drops emailVerified=${emailVerified}`);
+      }
+    }
+  }
+  agree(
+    'userSchema',
+    'rejects a non-boolean emailVerified',
+    { ...VALID_USER, emailVerified: 'true' },
+    false,
+  );
   agree(
     'userSchema',
     'accepts an https avatar',
@@ -162,9 +224,9 @@ export async function runParityCases({
   );
   agree(
     'authBridgeResponseSchema',
-    'rejects a missing accessToken',
+    'accepts tokenless response for same-origin Guest BFF sessions',
     { user: VALID_USER, expiresAt: 1_800_000_000_000 },
-    false,
+    true,
   );
   agree(
     'authBridgeResponseSchema',
@@ -314,6 +376,7 @@ export async function runParityCases({
     plan: 'basic',
     profile: VALID_ONBOARDING_PROFILE,
     documents: [],
+    promoterAgreementAcceptances: [],
     missingDocuments: ['id_front', 'id_back', 'selfie'],
     submittedAt: null,
     reviewedBy: null,
@@ -426,6 +489,23 @@ export async function runParityCases({
     'eventPublicDetailDtoSchema',
     'rejects an invalid organizer slug',
     { ...VALID_PUBLIC_EVENT_DETAIL, organizer: { id: 'org_1', name: 'Host', slug: 'Bad Slug' } },
+    false,
+  );
+  agree(
+    'updateEventSchema',
+    'accepts a Venue-approved replacement slot reference',
+    {
+      venueId: 'ven_2',
+      slotRequestId: 'req_1',
+      startAt: '2027-01-15T18:00:00.000Z',
+      endAt: '2027-01-15T23:00:00.000Z',
+    },
+    true,
+  );
+  agree(
+    'updateEventSchema',
+    'rejects a replacement slot request without a valid Venue id',
+    { venueId: ' ', slotRequestId: 'req_1' },
     false,
   );
 
@@ -595,8 +675,19 @@ export async function runParityCases({
     status: 'active',
     ratePercent: 5,
     flatPaise: 0,
+    termsVersion: 1,
+    startsAt: null,
+    expiresAt: null,
+    eligibleTierIds: null,
     createdAt: '2026-08-01T00:00:00.000Z',
+    invitedAt: '2026-08-01T00:00:00.000Z',
+    invitedBy: 'usr_0002',
+    acceptedAt: null,
+    respondedBy: null,
     endedAt: null,
+    revokedAt: null,
+    revokedBy: null,
+    revocationReason: null,
     suspendedAt: null,
   };
   agree(
@@ -616,6 +707,150 @@ export async function runParityCases({
     'rejects when status is invalid',
     { ...VALID_ADMIN_PROMOTER_ASSIGNMENT, status: 'deleted' },
     false,
+  );
+
+  /* ── minimal admin promoter referral-link DTO ───────────────────────────── */
+  const VALID_ADMIN_PROMOTER_LINK = {
+    id: 'ref_0001',
+    eventId: 'evt_0001',
+    assignmentId: 'asgn_0001',
+    eventTitle: 'Test Event',
+    code: 'PROMO123',
+    label: 'Summer',
+    isActive: true,
+    clicks: 12,
+    lastClickedAt: '2026-08-01T00:00:00.000Z',
+    conversions: 2,
+    createdAt: '2026-08-01T00:00:00.000Z',
+    updatedAt: '2026-08-02T00:00:00.000Z',
+  };
+  agree(
+    'adminPromoterReferralLinkDtoSchema',
+    'accepts status and bounded activity counters',
+    VALID_ADMIN_PROMOTER_LINK,
+    true,
+  );
+  const VALID_PROMOTER_ATTRIBUTED_ORDER = {
+    id: 'ord_0001',
+    bookingReference: 'BK000001',
+    eventId: 'evt_0001',
+    status: 'paid',
+    ticketCount: 2,
+    attributedTicketValuePaise: 45000,
+    promoterCommissionPaise: 4500,
+    attributedAt: '2026-08-02T00:00:00.000Z',
+  };
+  agree(
+    'promoterAttributedOrderDtoSchema',
+    'accepts the privacy-minimized order projection',
+    VALID_PROMOTER_ATTRIBUTED_ORDER,
+    true,
+  );
+  agree(
+    'promoterAttributedOrderDtoSchema',
+    'rejects guest contact data',
+    { ...VALID_PROMOTER_ATTRIBUTED_ORDER, contact: { email: 'guest@example.test' } },
+    false,
+  );
+  const VALID_EVENT_PROMOTER_ANALYTICS = {
+    eventId: 'evt_0001',
+    complete: true,
+    refundValueComplete: true,
+    historicalConversionCount: 2,
+    historicalRsvpConversionCount: 0,
+    activeRsvpCount: 0,
+    capturedTicketCount: 10,
+    attributedTicketCount: 4,
+    attributedTicketValuePaise: 90000,
+    grossAttributedTicketValuePaise: 90000,
+    refundedAttributedTicketValuePaise: 0,
+    netAttributedTicketValuePaise: 90000,
+    recordedCommissionPaise: 9000,
+    reversedCommissionPaise: null,
+    netAttributedValuePaise: 81000,
+    commissionPayableBalancePaise: 9000,
+    liabilityComplete: true,
+    liabilityReadModel: 'legacy_ledger_v1',
+    items: [
+      {
+        promoterOrganizationId: 'org_promoter_1',
+        attributedOrderCount: 2,
+        historicalRsvpConversionCount: 0,
+        activeRsvpCount: 0,
+        attributedTicketCount: 4,
+        attributedTicketValuePaise: 90000,
+        grossAttributedTicketValuePaise: 90000,
+        refundedAttributedTicketValuePaise: 0,
+        netAttributedTicketValuePaise: 90000,
+        recordedCommissionPaise: 9000,
+        reversedCommissionPaise: null,
+        netAttributedValuePaise: 81000,
+        commissionPayableBalancePaise: 9000,
+        liabilityComplete: true,
+        liabilityReadModel: 'legacy_ledger_v1',
+      },
+    ],
+  };
+  agree(
+    'eventPromoterAnalyticsDtoSchema',
+    'accepts backend-derived event promoter metrics',
+    VALID_EVENT_PROMOTER_ANALYTICS,
+    true,
+  );
+  agree(
+    'eventPromoterAnalyticsDtoSchema',
+    'rejects negative attributed ticket values',
+    {
+      ...VALID_EVENT_PROMOTER_ANALYTICS,
+      attributedTicketValuePaise: -1,
+    },
+    false,
+  );
+  agree(
+    'adminPromoterReferralLinkDtoSchema',
+    'rejects negative counters',
+    { ...VALID_ADMIN_PROMOTER_LINK, clicks: -1 },
+    false,
+  );
+  const VALID_ADMIN_PROMOTER_RISK_FLAG = {
+    paymentId: 'pay_0001',
+    disputeId: 'disp_0001',
+    orderId: 'ord_0001',
+    bookingReference: 'BK000001',
+    eventId: 'evt_0001',
+    status: 'open',
+    amountPaise: 45000,
+    providerOccurredAt: '2026-08-02T00:00:00.000Z',
+  };
+  agree(
+    'adminPromoterRiskFlagSchema',
+    'accepts an active attributed-order dispute',
+    VALID_ADMIN_PROMOTER_RISK_FLAG,
+    true,
+  );
+  agree(
+    'adminPromoterRiskFlagSchema',
+    'rejects a resolved status',
+    { ...VALID_ADMIN_PROMOTER_RISK_FLAG, status: 'won' },
+    false,
+  );
+  agree(
+    'adminPromoterRiskFlagsResponseSchema',
+    'accepts a complete risk response',
+    { promoterId: 'org_promoter_1', complete: true, flags: [VALID_ADMIN_PROMOTER_RISK_FLAG] },
+    true,
+  );
+  agree(
+    'adminPromoterRiskFlagsResponseSchema',
+    'rejects a missing completeness marker',
+    { promoterId: 'org_promoter_1', flags: [] },
+    false,
+  );
+  agree(
+    'adminPromoterReferralLinkActionResponseSchema',
+    'accepts deactivation result',
+    { linkId: 'ref_0001', action: 'deactivated', changed: true, at: '2026-08-02T00:00:00.000Z' },
+    true,
   );
 
   /* ── admin promoter action response ─────────────────────────────────────── */
@@ -691,6 +926,25 @@ export async function runParityCases({
     true,
   );
   agree('platformSettingsUpdateRequestSchema', 'rejects unknown field', { bogus: 1 }, false);
+
+  agree(
+    'reconcileRefundRequestSchema',
+    'accepts a provider id hint and reason',
+    { providerRefundId: 'rfnd_synthetic', reason: 'Approved review' },
+    true,
+  );
+  agree(
+    'reconcileRefundRequestSchema',
+    'rejects an operator-supplied refund state',
+    { providerRefundId: 'rfnd_synthetic', reason: 'Approved review', status: 'processed' },
+    false,
+  );
+  agree(
+    'reconcileRefundRequestSchema',
+    'rejects a blank operator reason',
+    { providerRefundId: 'rfnd_synthetic', reason: ' ' },
+    false,
+  );
 
   /* ── admin order DTO ────────────────────────────────────────────────────── */
   const VALID_ADMIN_ORDER = {
@@ -1400,6 +1654,128 @@ export async function runParityCases({
     false,
   );
 
+  /* M3 event, custody, refund-review and immutable phase contracts. */
+  agree('eventStatusSchema', 'M3 accepts canonical postponement', 'postponed', true);
+  agree(
+    'updateTicketTierLimitsSchema',
+    'M3 updates inventory and future price',
+    { quantity: 50, priceInPaise: 65000 },
+    true,
+  );
+  agree('updateTicketTierLimitsSchema', 'M3 rejects empty tier edits', {}, false);
+  agree('updateTicketTierLimitsSchema', 'M3 rejects negative inventory', { quantity: -1 }, false);
+  agree(
+    'updateEventSchema',
+    'M3 standardized refund policy',
+    { refundPolicy: { kind: 'no_refunds' } },
+    true,
+  );
+  agree(
+    'updateEventSchema',
+    'M3 cutoff policy requires date',
+    { refundPolicy: { kind: 'until_cutoff' } },
+    false,
+  );
+  agree(
+    'requestRefundSchema',
+    'M3 identifies a specific attendee',
+    {
+      orderId: 'ORD-m3-parity',
+      amountPaise: 50000,
+      reason: 'Selected attendee cannot attend',
+      targetEntitlementIds: ['ENT-m3-riya'],
+    },
+    true,
+  );
+  agree(
+    'requestRefundSchema',
+    'M3 rejects an empty attendee selection',
+    { orderId: 'ORD-m3-parity', amountPaise: 50000, reason: 'No target', targetEntitlementIds: [] },
+    false,
+  );
+  agree(
+    'guestRefundReviewRequestSchema',
+    'M3 Guest requests review only',
+    { reason: 'I cannot attend' },
+    true,
+  );
+  agree(
+    'guestRefundReviewRequestSchema',
+    'M3 Guest cannot inject refund execution amount',
+    { reason: 'Review', amountPaise: 50000 },
+    false,
+  );
+  agree(
+    'guestRefundReviewDtoSchema',
+    'M3 persisted review status',
+    { id: 'SUP-REF-m3-parity', status: 'open', requestedAt: '2026-11-04T20:00:00.000Z' },
+    true,
+  );
+  const m3Managed = {
+    id: 'ENT-m3-parity',
+    orderId: 'ORD-m3-parity',
+    eventId: 'EVT-m3-parity',
+    tierId: 'tier-m3',
+    tierName: 'General',
+    holderName: null,
+    ownership: 'unassigned',
+    unitKind: 'paid',
+    status: 'active',
+    eventTitle: 'NYE-20261231-VIP',
+    eventStatus: 'published',
+    eventSlug: null,
+    startsAt: '2026-12-31T20:00:00.000Z',
+    endsAt: null,
+    posterUrl: null,
+    bookingReference: null,
+    canPresent: false,
+    qrUnavailableReason: 'Accept an assignment first.',
+    venueId: null,
+    venueName: null,
+    venueCity: null,
+    canTransfer: true,
+    transferUnavailableReason: null,
+    pendingTransfer: null,
+    canRequestRefund: true,
+    refundUnavailableReason: null,
+    refundReview: null,
+  };
+  agree('managedTicketSchema', 'M3 explicit unassigned projection', m3Managed, true);
+  for (const [side, schema] of [
+    ['frontend', frontend.managedTicketSchema],
+    ['backend', backend.managedTicketSchema],
+  ]) {
+    const parsed = schema.parse({
+      ...m3Managed,
+      recipientEmail: 'private@example.test',
+      recipientEmailHash: 'private-binding',
+    });
+    checks.push(`${side} M3 managed ticket excludes delivery identity`);
+    if (
+      'recipientEmail' in parsed ||
+      'recipientEmailHash' in parsed ||
+      parsed.eventTitle !== m3Managed.eventTitle
+    )
+      failures.push(
+        `${side} M3 custody projection leaks delivery identity or rewrites event title`,
+      );
+  }
+  for (const pricingPhaseId of ['phase-early-bird', null]) {
+    agree(
+      'pricingLineDtoSchema',
+      `M3 retains phase snapshot ${pricingPhaseId}`,
+      {
+        tierId: 'tier-m3',
+        tierName: 'General',
+        quantity: 1,
+        unitPricePaise: 50000,
+        subtotalPaise: 50000,
+        pricingPhaseId,
+      },
+      true,
+    );
+  }
+
   /* ── error codes: the closed union must match exactly ─────────────────────── */
   {
     const FRONTEND_CODES = [
@@ -1428,4 +1804,10 @@ export async function runParityCases({
       );
     }
   }
+
+  /* ── money, tickets, door, sign-in, social (kept in a sibling file) ───────── */
+  runWireParityCases({ agree });
+
+  /* ── every other exported schema: differential, generated from the backend ─── */
+  runGeneratedParityCases({ frontend, backend, checks, failures });
 }

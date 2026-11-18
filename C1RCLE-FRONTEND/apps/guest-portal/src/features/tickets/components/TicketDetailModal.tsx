@@ -1,242 +1,522 @@
 'use client';
 
 import { QRCodeSVG } from 'qrcode.react';
-import React, { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 
-import { magicQrResponseSchema } from '@c1rcle/contracts';
+import { managedTicketSchema, magicQrResponseSchema } from '@c1rcle/contracts';
+import { Dialog } from '@c1rcle/ui';
 
 import { bffClient } from '@/lib/bff/bff-client';
 
-import type { UserTicketItem } from '../types/tickets.types';
-import type { MagicQrResponse } from '@c1rcle/contracts';
+import { formatEventTitle } from '../ticket-presentation';
 
+import { GuestRefundRequest } from './GuestRefundRequest';
+import { RsvpCancellation } from './RsvpCancellation';
+import { TicketTransferPanel } from './TicketTransferPanel';
+
+import type { UserTicketItem } from '../types/tickets.types';
+import type { ManagedTicket, MagicQrResponse } from '@c1rcle/contracts';
+
+export type TicketModalView = 'booking' | 'details' | 'qr';
 export interface TicketDetailModalProps {
   ticket: UserTicketItem | null;
+  bookingTickets?: readonly UserTicketItem[] | undefined;
+  onSelectTicket?: ((ticket: UserTicketItem) => void) | undefined;
+  initialView?: TicketModalView;
   onClose: () => void;
+  onOwnershipChanged?: (() => void) | undefined;
+}
+const STATUS_COPY = {
+  processing: {
+    label: 'Processing',
+    detail:
+      'Payment received. Admission and QR access are unavailable until booking fulfillment completes.',
+  },
+  active: { label: 'Active', detail: 'Booking confirmed.' },
+  postponed: {
+    label: 'Postponed',
+    detail: 'New date to be announced. Your ticket is preserved; admission is on hold.',
+  },
+  used: { label: 'Used', detail: 'This ticket has already been used.' },
+  cancelled: { label: 'Cancelled', detail: 'This ticket is no longer valid.' },
+  pending: { label: 'Pending', detail: 'This ticket is still being confirmed.' },
+  refund_pending: {
+    label: 'Refund processing',
+    detail: 'A refund is being processed. This ticket cannot be used.',
+  },
+  refunded: { label: 'Refunded', detail: 'This ticket was refunded and is no longer valid.' },
+  unavailable: { label: 'Unavailable', detail: 'Current event details could not be loaded.' },
+} as const;
+const coverMoney = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' });
+const action =
+  'inline-flex min-h-11 items-center justify-center rounded-full px-5 text-sm font-semibold disabled:opacity-40';
+
+export function TicketDetailModal(props: TicketDetailModalProps) {
+  return (
+    <TicketDetailContent
+      key={`${props.ticket?.id ?? 'closed'}:${props.initialView ?? 'details'}`}
+      {...props}
+    />
+  );
 }
 
-/**
- * The rotating entry credential, fetched from `GET /api/tickets/:id/qr`
- * (holder-only, never cached) whenever an open pass is still usable, and
- * re-fetched on the interval the gateway asks for — the payload is an HMAC of
- * the ticket id + a time window, so it changes while the modal is open. A
- * code that cannot be fetched says so rather than showing a placeholder id.
- */
-type EntryCodeState =
-  | { phase: 'idle' }
-  | { phase: 'loading' }
-  | { phase: 'ready'; code: MagicQrResponse }
-  | { phase: 'failed' };
-
-function unusableMessage(status: UserTicketItem['status']): string | null {
-  if (status === 'used') return 'This pass has already been used at the door.';
-  if (status === 'cancelled') return 'This pass was cancelled and admits nobody.';
-  if (status === 'pending') return 'The entry code appears once payment completes.';
-  return null;
-}
-
-export function TicketDetailModal({ ticket, onClose }: TicketDetailModalProps) {
-  const [stored, setStored] = useState<{ ticketId: string | null; state: EntryCodeState }>({
-    ticketId: null,
-    state: { phase: 'idle' },
-  });
+function TicketDetailContent({
+  ticket,
+  bookingTickets,
+  onSelectTicket,
+  initialView = 'details',
+  onClose,
+  onOwnershipChanged,
+}: TicketDetailModalProps) {
+  const ticketId = ticket?.id;
+  const [view, setView] = useState<TicketModalView | 'transfer'>(initialView);
+  const [management, setManagement] = useState<ManagedTicket | null>(ticket?.management ?? null);
+  const [readState, setReadState] = useState<'loading' | 'ready' | 'failed'>('loading');
   const [attempt, setAttempt] = useState(0);
-  const ticketId = ticket !== null && ticket.status === 'active' ? ticket.id : null;
-  // Derived, not reset inside the effect: a code recorded for another pass (or
-  // none) is not this pass's code, so opening or switching tickets lands in
-  // the loading branch without a synchronous setState cascade.
-  const entryCode: EntryCodeState =
-    ticketId === null
-      ? { phase: 'idle' }
-      : stored.ticketId === ticketId
-        ? stored.state
-        : { phase: 'loading' };
-
+  const [changed, setChanged] = useState(false);
   useEffect(() => {
-    if (ticketId === null) {
-      return;
-    }
+    if (!ticketId) return;
     let cancelled = false;
-    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    void bffClient
+      .get({
+        path: `/api/tickets/${encodeURIComponent(ticketId)}/management`,
+        schema: managedTicketSchema,
+        retries: 0,
+        timeoutMs: 15000,
+      })
+      .then((data) => {
+        if (!cancelled) {
+          setManagement(data);
+          setReadState('ready');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setReadState('failed');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ticketId, attempt]);
+  const close = useCallback(() => {
+    onClose();
+    if (changed) onOwnershipChanged?.();
+  }, [onClose, onOwnershipChanged, changed]);
+  const owner =
+    management?.ownership === 'you'
+      ? `You · ${management.holderName ?? ticket?.holderName ?? 'Guest'}`
+      : management?.ownership === 'unassigned' || ticket?.custody === 'unassigned'
+        ? 'Unassigned'
+        : (management?.holderName ?? ticket?.holderName ?? 'Guest');
+  const canPresent = readState === 'ready' && management?.canPresent === true;
+  const status = ticket
+    ? STATUS_COPY[
+        management?.eventStatus === 'postponed' && management.status === 'active'
+          ? 'postponed'
+          : (management?.status ?? ticket.status)
+      ]
+    : null;
+  const holderChanged = management?.ownership === 'transferred';
+  if (typeof document === 'undefined') return null;
+  return createPortal(
+    <Dialog
+      open={ticket !== null}
+      onClose={close}
+      title={
+        view === 'transfer'
+          ? 'Ticket transfer'
+          : view === 'qr'
+            ? 'Entry code'
+            : ticket
+              ? formatEventTitle(ticket.eventTitle)
+              : 'Ticket details'
+      }
+      className="max-h-[calc(100dvh-2rem)] max-w-xl rounded-2xl border-white/15 bg-[#0a0a0a] p-5 text-white shadow-2xl sm:p-7"
+    >
+      {ticket && status ? (
+        view === 'transfer' && management ? (
+          <TicketTransferPanel
+            key={management.id}
+            management={management}
+            onBack={() => {
+              setView('details');
+            }}
+            onChanged={() => {
+              setChanged(true);
+              setAttempt((value) => value + 1);
+            }}
+          />
+        ) : view === 'qr' ? (
+          <div className="space-y-5">
+            <button
+              type="button"
+              className="min-h-10 text-sm text-white/60 hover:text-white"
+              onClick={() => {
+                setView('details');
+              }}
+            >
+              ← Ticket details
+            </button>
+            <p className="text-sm text-white/70">
+              {ticket.tierName} · {owner}
+            </p>
+            {canPresent ? (
+              <EntryCode ticket={ticket} />
+            ) : (
+              <p role="status" className="text-sm text-white/65">
+                {management?.qrUnavailableReason ??
+                  'Entry code unavailable. Refresh ticket details.'}
+              </p>
+            )}
+          </div>
+        ) : view === 'booking' && bookingTickets ? (
+          <div className="space-y-4">
+            <p className="text-sm text-white/55">
+              {bookingTickets.length} individual{' '}
+              {bookingTickets.length === 1 ? 'ticket' : 'tickets'} in this booking
+            </p>
+            <ul className="divide-y divide-white/10">
+              {bookingTickets.map((item, index) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSelectTicket?.(item);
+                      setView('details');
+                    }}
+                    className="flex min-h-20 w-full items-center justify-between gap-4 py-4 text-left focus-visible:outline-2 focus-visible:outline-white"
+                  >
+                    <span className="min-w-0">
+                      <span className="block text-sm font-semibold">
+                        {item.tierName} · Ticket {index + 1}
+                      </span>
+                      <span className="mt-1 block text-xs text-white/55">
+                        {item.management?.ownership === 'you'
+                          ? 'You'
+                          : item.custody === 'unassigned'
+                            ? 'Unassigned'
+                            : item.holderName}
+                        {item.management?.pendingTransfer ? ' · Invitation pending' : ''}
+                      </span>
+                    </span>
+                    <span className="shrink-0 text-xs text-white/60">
+                      {item.management?.ownership === 'transferred'
+                        ? 'Transferred'
+                        : item.status.replace('_', ' ')}{' '}
+                      <span aria-hidden="true">→</span>
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <div className="space-y-5">
+            {bookingTickets && bookingTickets.length > 1 ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setView('booking');
+                }}
+                className="min-h-10 text-sm text-white/60 hover:text-white"
+              >
+                ← All tickets in booking
+              </button>
+            ) : null}
+            <div className="flex items-start justify-between gap-4 border-b border-white/10 pb-4">
+              <div>
+                <p className="text-base font-semibold">{ticket.tierName}</p>
+                <p className="mt-1 text-xs text-white/50">
+                  {holderChanged
+                    ? 'Held by another attendee'
+                    : ticket.custody === 'unassigned'
+                      ? 'Waiting for an attendee to claim it'
+                      : status.detail}
+                </p>
+              </div>
+              <span
+                className={`shrink-0 text-xs ${status.label === 'Active' && !holderChanged && ticket.custody !== 'unassigned' ? 'text-emerald-400' : 'text-white/60'}`}
+              >
+                {holderChanged
+                  ? 'Transferred'
+                  : ticket.custody === 'unassigned'
+                    ? 'Unassigned'
+                    : status.label}
+              </span>
+            </div>
+            <dl className="grid gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
+              <Detail
+                label="Date and time"
+                value={
+                  management?.eventStatus === 'postponed'
+                    ? 'New date to be announced'
+                    : [ticket.date, ticket.time].filter(Boolean).join(' · ') || 'Unavailable'
+                }
+              />
+              <Detail
+                label="Venue"
+                value={[ticket.venueName, ticket.city].filter(Boolean).join(', ') || 'Unavailable'}
+              />
+              <Detail label="Current holder" value={owner} />
+              {ticket.ticketCount > 1 ? (
+                <Detail label="Quantity" value={String(ticket.ticketCount)} />
+              ) : null}
+            </dl>
+            {ticket.custody === 'unassigned' ? (
+              <p role="status" className="text-sm leading-6 text-white/60">
+                This ticket is unassigned and cannot be used yet. Invite an attendee to claim it.
+              </p>
+            ) : null}
+            {readState === 'ready' && !canPresent && management?.qrUnavailableReason ? (
+              <p role="status" className="text-sm text-white/65">
+                {management.qrUnavailableReason}
+              </p>
+            ) : null}
+            <div className="flex flex-wrap gap-3 border-t border-white/10 pt-5">
+              {canPresent ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setView('qr');
+                  }}
+                  className={`${action} bg-white text-black hover:bg-white/90`}
+                >
+                  Show entry code
+                </button>
+              ) : null}
+              {management &&
+              readState === 'ready' &&
+              (management.canTransfer || management.pendingTransfer) ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setView('transfer');
+                  }}
+                  className={`${action} border border-white/20 text-white/85 hover:bg-white/5`}
+                >
+                  {management.pendingTransfer
+                    ? 'Manage invitation'
+                    : management.ownership === 'unassigned'
+                      ? 'Invite attendee'
+                      : 'Transfer ticket'}
+                </button>
+              ) : null}
+            </div>
+            {readState === 'loading' ? (
+              <p role="status" className="text-xs text-white/45">
+                Checking ticket ownership…
+              </p>
+            ) : readState === 'failed' ? (
+              <p role="status" className="text-xs leading-5 text-white/55">
+                Ownership details could not be refreshed.{' '}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setReadState('loading');
+                    setAttempt((value) => value + 1);
+                  }}
+                  className="min-h-8 underline underline-offset-4"
+                >
+                  Retry
+                </button>
+              </p>
+            ) : management?.transferUnavailableReason && !management.pendingTransfer ? (
+              <p className="text-xs leading-5 text-white/45">
+                {management.transferUnavailableReason}
+              </p>
+            ) : null}
+            {readState === 'ready' && management && management.unitKind !== 'free_rsvp' ? (
+              <GuestRefundRequest
+                key={management.id}
+                ticketId={management.id}
+                initialReview={management.refundReview}
+                allowed={management.canRequestRefund}
+                reason={management.refundUnavailableReason}
+              />
+            ) : null}
+            {readState === 'ready' &&
+            management?.unitKind === 'free_rsvp' &&
+            management.ownership === 'you' &&
+            management.status === 'active' ? (
+              <RsvpCancellation
+                orderId={management.orderId}
+                onCancelled={() => {
+                  setChanged(true);
+                  setReadState('loading');
+                  setAttempt((value) => value + 1);
+                }}
+              />
+            ) : null}
 
-    const load = async (): Promise<void> => {
+            {ticket.ticketAddons?.length ? (
+              <section aria-label="Ticket extras" className="border-t border-white/10 pt-4">
+                <h3 className="text-xs font-black uppercase tracking-[0.16em] text-white/75">
+                  Ticket extras
+                </h3>
+                <ul className="mt-3 space-y-2">
+                  {ticket.ticketAddons.map((addon) => (
+                    <li key={addon.id} className="flex items-center justify-between gap-3 text-sm">
+                      <span className="text-white/75">{addon.name}</span>
+                      <span className="rounded-full border border-white/15 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider text-white/55">
+                        {addon.status}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+
+            {ticket.eventCover ? (
+              <section
+                aria-label="Event cover wallet"
+                className="space-y-3 border-t border-white/10 pt-4"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-xs font-black uppercase tracking-[0.16em] text-white/75">
+                    Event cover
+                  </h3>
+                  <span className="rounded-full border border-white/15 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider text-white/55">
+                    {ticket.eventCover.status.replace('_', ' ')}
+                  </span>
+                </div>
+                <dl className="grid grid-cols-2 gap-3 text-xs">
+                  <Detail
+                    label="Remaining"
+                    value={coverMoney.format(ticket.eventCover.remainingPaise / 100)}
+                  />
+                  <Detail
+                    label="Issued"
+                    value={coverMoney.format(ticket.eventCover.issuedPaise / 100)}
+                  />
+                  <Detail
+                    label="Reserved"
+                    value={coverMoney.format(ticket.eventCover.reservedPaise / 100)}
+                  />
+                  <Detail
+                    label="Redeemed"
+                    value={coverMoney.format(ticket.eventCover.redeemedPaise / 100)}
+                  />
+                </dl>
+                <p className="text-[11px] leading-5 text-white/45">
+                  This balance belongs to this ticket and is separate from admission.
+                </p>
+                {ticket.eventCover.history.length > 0 ? (
+                  <ol className="space-y-2 border-t border-white/10 pt-3 text-[11px] text-white/55">
+                    {ticket.eventCover.history.map((entry, index) => (
+                      <li
+                        key={`${entry.type}-${entry.createdAt}-${String(index)}`}
+                        className="flex items-center justify-between gap-3"
+                      >
+                        <span>
+                          {entry.type.replace('_', ' ')} ·{' '}
+                          {new Date(entry.createdAt).toLocaleDateString('en-IN')}
+                        </span>
+                        <span>{coverMoney.format(entry.amountPaise / 100)}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
+              </section>
+            ) : null}
+
+            {ticket.bookingReference ? (
+              <details className="border-t border-white/10 pt-3 text-xs text-white/50">
+                <summary className="min-h-8 cursor-pointer py-2">Booking reference</summary>
+                <p className="break-all pb-2 font-mono text-white/70">{ticket.bookingReference}</p>
+              </details>
+            ) : null}
+          </div>
+        )
+      ) : null}
+    </Dialog>,
+    document.body,
+  );
+}
+
+function EntryCode({ ticket }: { ticket: UserTicketItem }) {
+  const [code, setCode] = useState<MagicQrResponse | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const load = async () => {
       try {
-        const code = await bffClient.get({
-          path: `/api/tickets/${encodeURIComponent(ticketId)}/qr`,
+        const next = await bffClient.get({
+          path: `/api/tickets/${encodeURIComponent(ticket.id)}/qr`,
           schema: magicQrResponseSchema,
         });
-        if (cancelled) return;
-        setStored({ ticketId, state: { phase: 'ready', code } });
-        refreshTimer = setTimeout(
-          () => {
-            void load();
-          },
-          Math.max(code.refreshIntervalSec, 1) * 1000,
-        );
+        if (!cancelled) {
+          setCode(next);
+          setFailed(false);
+          timer = setTimeout(() => void load(), Math.max(next.refreshIntervalSec, 1) * 1000);
+        }
       } catch {
-        if (cancelled) return;
-        setStored({ ticketId, state: { phase: 'failed' } });
+        if (!cancelled) {
+          setCode(null);
+          setFailed(true);
+        }
       }
     };
-
     void load();
     return () => {
       cancelled = true;
-      if (refreshTimer !== undefined) clearTimeout(refreshTimer);
+      if (timer) clearTimeout(timer);
     };
-  }, [ticketId, attempt]);
-
-  if (!ticket) return null;
-
-  const unusable = unusableMessage(ticket.status);
-
+  }, [ticket.id, attempt]);
   return (
-    <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/88 p-0 backdrop-blur-2xl md:p-8"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
-      <div className="pointer-events-none absolute left-1/2 top-1/2 h-[620px] w-[620px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#FF4400]/22 blur-[150px]" />
-
-      <section
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="ticket-detail-title"
-        className="relative h-full w-full overflow-hidden text-white shadow-[0_32px_120px_-20px_rgba(0,0,0,0.72)] md:h-auto md:max-w-[410px] md:rounded-[48px] md:border md:border-white/20"
-      >
-        <div className="absolute inset-0 bg-[linear-gradient(145deg,rgba(255,68,0,0.34),rgba(255,255,255,0.02)_38%,rgba(255,68,0,0.12))]" />
-        <div className="relative flex h-full w-full flex-col items-center overflow-y-auto bg-black/68 p-4 pt-8 backdrop-blur-3xl sm:pt-10 md:h-auto md:rounded-[46px] md:p-6">
+    <div className="flex flex-col items-center gap-4 py-3 text-center">
+      {code ? (
+        <>
+          <div className="rounded-xl bg-white p-4">
+            <QRCodeSVG
+              value={code.qrPayload}
+              size={220}
+              level="M"
+              marginSize={2}
+              title={`Entry code for ${ticket.eventTitle}`}
+              role="img"
+              aria-label={`Entry code for ${ticket.eventTitle}`}
+            />
+          </div>
+          <p className="text-xs text-white/45">
+            Refreshes every {code.refreshIntervalSec}s · scan at the door
+          </p>
+        </>
+      ) : failed ? (
+        <>
+          <p className="text-sm text-white/65">Entry code unavailable.</p>
           <button
             type="button"
-            onClick={onClose}
-            aria-label="Close ticket view"
-            className="absolute right-5 top-5 z-10 flex size-10 items-center justify-center rounded-full border border-white/10 bg-white/[0.07] text-white/60 transition-colors hover:bg-white/15 hover:text-white"
+            className={`${action} border border-white/20 text-white`}
+            onClick={() => {
+              setFailed(false);
+              setAttempt((value) => value + 1);
+            }}
           >
-            ✕
+            Try again
           </button>
-
-          <p className="mb-2 pr-12 text-[9px] font-black uppercase tracking-[0.32em] text-[#FF5A2B]">
-            THE C1RCLE PASS
+        </>
+      ) : (
+        <>
+          <span
+            aria-hidden="true"
+            className="size-7 rounded-full border-2 border-white/15 border-t-white/70 motion-safe:animate-spin"
+          />
+          <p role="status" className="text-sm text-white/55">
+            Loading entry code…
           </p>
-          <h2
-            id="ticket-detail-title"
-            className="mx-auto mb-2 max-w-[320px] text-center text-2xl font-black uppercase leading-[0.94] tracking-[-0.04em] md:text-3xl"
-          >
-            {ticket.eventTitle}
-          </h2>
+        </>
+      )}
+    </div>
+  );
+}
 
-          <div className="mb-4 flex flex-col items-center gap-2">
-            <p className="text-[9px] font-black uppercase tracking-[0.28em] text-white/38">
-              TICKET 1 OF {ticket.ticketCount}
-            </p>
-            <div className="flex gap-1.5" aria-hidden="true">
-              {Array.from({ length: ticket.ticketCount }).map((_, index) => (
-                <span
-                  key={index}
-                  className={`h-1 rounded-full ${index === 0 ? 'w-4 bg-[#FF4400]' : 'w-1 bg-white/15'}`}
-                />
-              ))}
-            </div>
-          </div>
-
-          <div className="relative flex aspect-square w-full max-w-[280px] items-center justify-center overflow-hidden rounded-[32px] border border-white/45 bg-white p-6 text-center shadow-2xl">
-            {ticketId !== null && entryCode.phase === 'ready' ? (
-              <QRCodeSVG
-                value={entryCode.code.qrPayload}
-                size={232}
-                level="M"
-                marginSize={2}
-                title={`Entry code for ${ticket.eventTitle}`}
-                role="img"
-                aria-label={`Entry code for ${ticket.eventTitle}`}
-                className="relative h-auto w-full"
-              />
-            ) : (
-              <>
-                <div className="absolute inset-0 bg-[repeating-linear-gradient(135deg,#f6f6f6_0,#f6f6f6_13px,#ececec_13px,#ececec_26px)]" />
-                <div className="relative">
-                  {ticketId === null ? (
-                    <>
-                      <p className="text-3xl font-black uppercase leading-[0.9] tracking-[-0.045em] text-black">
-                        No entry
-                        <br />
-                        code
-                      </p>
-                      <p className="mt-4 text-[9px] font-black uppercase tracking-[0.28em] text-[#FF4400]">
-                        {unusable}
-                      </p>
-                    </>
-                  ) : entryCode.phase === 'failed' ? (
-                    <>
-                      <p className="text-xl font-black uppercase leading-[0.95] tracking-[-0.03em] text-black">
-                        Entry code
-                        <br />
-                        unavailable
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          // Drop the stale failure so the retry reads as
-                          // loading instead of "unavailable" for a moment.
-                          setStored({ ticketId: null, state: { phase: 'idle' } });
-                          setAttempt((current) => current + 1);
-                        }}
-                        className="mt-5 rounded-full border border-black/25 px-5 py-2 text-[9px] font-black uppercase tracking-[0.28em] text-black transition-colors hover:bg-black hover:text-white"
-                      >
-                        Try again
-                      </button>
-                    </>
-                  ) : (
-                    <p className="text-xl font-black uppercase leading-[0.95] tracking-[-0.03em] text-black">
-                      Fetching
-                      <br />
-                      entry code…
-                    </p>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
-
-          {ticketId !== null && entryCode.phase === 'ready' ? (
-            <p className="mt-3 text-[9px] font-black uppercase tracking-[0.24em] text-white/45">
-              Refreshes every {entryCode.code.refreshIntervalSec}s · scan at the door
-            </p>
-          ) : null}
-
-          <div className="mt-4 flex flex-col items-center gap-2">
-            <span className="rounded-full border border-white/10 bg-white/[0.055] px-3 py-1 text-[10px] font-black uppercase tracking-[0.18em] text-white">
-              {ticket.tierName}
-            </span>
-            <span
-              className={`rounded-full border px-3 py-1 text-[9px] font-black uppercase tracking-[0.18em] ${
-                ticket.status === 'used'
-                  ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-300'
-                  : ticket.status === 'cancelled'
-                    ? 'border-red-400/20 bg-red-400/10 text-red-300'
-                    : 'border-blue-400/20 bg-blue-400/10 text-blue-300'
-              }`}
-            >
-              {ticket.status === 'used'
-                ? 'CHECKED IN'
-                : ticket.status === 'cancelled'
-                  ? 'CANCELLED'
-                  : 'ACTIVE'}
-            </span>
-          </div>
-
-          <div className="mt-5 w-full border-t border-white/10 pt-4 text-center">
-            <p className="text-xs font-bold text-white/82">
-              {ticket.date} • {ticket.time}
-            </p>
-            <p className="mt-1 text-[11px] font-medium uppercase tracking-[0.12em] text-white/45">
-              {ticket.venueName}, {ticket.city}
-            </p>
-          </div>
-        </div>
-      </section>
+function Detail({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <dt className="text-xs font-medium text-white/50">{label}</dt>
+      <dd className="mt-1 break-words text-sm leading-5 text-white/90">{value}</dd>
     </div>
   );
 }

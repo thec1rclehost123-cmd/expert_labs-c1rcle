@@ -50,6 +50,7 @@ const SCAN_LEDGER_TRANSITIONS: Readonly<Record<ScanLedgerStatus, readonly ScanLe
 };
 
 export type ScanDenyReason =
+  | 'event_closed'
   | 'invalid_signature'
   | 'already_used'
   | 'expired'
@@ -60,6 +61,7 @@ export type ScanDenyReason =
   | 'wrong_gate'
   | 'offline_expired'
   | 'override_required'
+  | 'eligibility_required'
   | 'promoter_not_authorized';
 
 export interface ScanLedger extends VersionedEntity {

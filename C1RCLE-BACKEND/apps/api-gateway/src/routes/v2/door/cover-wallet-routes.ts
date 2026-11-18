@@ -42,7 +42,7 @@ const walletIdParam = z.object({ walletId: opaqueIdSchema });
 /**
  * `coverWalletDebitRequestSchema` (packages/contracts/src/contracts/phase5.ts)
  * has no `isOnline` field — the field genuinely doesn't exist in the shared
- * contract. But the v1 rule (original v1 wiring plan, not included in this handoff, point 3) is
+ * contract. But the v1 rule (docs/PHASE_5_HTTP_WIRING_PLAN.md point 3) is
  * "offline debits blocked at the API layer": `CoverWalletService.debitWallet`
  * (packages/core/src/application/cover-wallet/cover-wallet-service.ts:340-380)
  * has no offline/online concept at all — only a velocity check and an
@@ -233,7 +233,7 @@ export default async function phase5CoverWalletRoutes(fastify: FastifyInstance) 
         idempotencyKey: body.idempotencyKey,
         context: { path: { walletId }, body },
         run: async () => {
-          // v1 rule (original v1 wiring plan, not included in this handoff, point 3): offline debits
+          // v1 rule (docs/PHASE_5_HTTP_WIRING_PLAN.md point 3): offline debits
           // are blocked at the API layer. CoverWalletService.debitWallet has
           // no offline/online concept — this check has to live here.
           if (!body.isOnline) {
@@ -604,7 +604,7 @@ export function reconciliationToDto(reconciliation: CoverWalletReconciliation) {
  * file's `mapDomainError` (as `partner/organizations.ts` does) would silently
  * fall through Phase 5's `not_found` errors into an unlogged 500. `'not_found'`
  * is handled here as its own first-class branch instead of a per-resource
- * string, per the original v1 wiring plan (not included in this handoff), point 4.
+ * string, per docs/PHASE_5_HTTP_WIRING_PLAN.md point 4.
  *
  * Separately: there is no wallet-terminated-specific error class/code in
  * `packages/core/src/domain/errors.ts` — `debitWallet`/`creditWallet`/

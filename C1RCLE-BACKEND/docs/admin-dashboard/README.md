@@ -56,7 +56,7 @@ graph TD
     subgraph FE["C1RCLE-FRONTEND/ · Next.js 16 monorepo"]
         F1["apps/admin-console/ · /support /commissions /proposals desks"]
         F2["apps/guest-portal/ · /help + app/api/help/* BFF"]
-        F3["docs/ · frontend architecture & runbooks"]
+        F3["docs/superpowers/ · sprint & task authority"]
     end
 
     B4 -.generates.-> F1

@@ -5,8 +5,8 @@ import { AuthoritativeEventView } from './AuthoritativeEventView';
 
 import type { EventDto, EventPublicDetailDto } from '@c1rcle/contracts';
 
-vi.mock('@/lib/seo/site', () => ({
-  absoluteUrl: (path: string) => `https://thec1rcle.com${path}`,
+vi.mock('@/lib/seo/client-site', () => ({
+  absoluteClientUrl: (path: string) => `https://guest.thec1rcle.com${path}`,
 }));
 
 const event: EventDto = {
@@ -21,6 +21,20 @@ const event: EventDto = {
   startAt: '2030-01-01T18:00:00.000Z',
   endAt: null,
   status: 'published',
+  visibilityMode: 'public',
+  addressDisclosure: 'public',
+  entryRules: {
+    doorsOpenAt: '2030-01-01T17:00:00.000Z',
+    lastEntryAt: '2030-01-01T22:00:00.000Z',
+    reentryAllowed: false,
+    minimumAge: 21,
+    idRequired: true,
+    accessibilityNotes: 'Step-free entrance at the north door.',
+    dressCode: 'Smart casual',
+    alcoholPolicy: 'Venue ID check required for alcohol service.',
+    prohibitedItems: ['Weapons', 'Glass bottles'],
+    supportDetails: 'Ask the event desk for assistance.',
+  },
   isPublic: true,
   tags: [],
   startingPricePaise: null,
@@ -53,7 +67,7 @@ const detail: EventPublicDetailDto = {
 
 describe('AuthoritativeEventView structured data', () => {
   it('uses the authoritative venue and links its public relationships', () => {
-    const { container, getByRole } = render(<AuthoritativeEventView detail={detail} />);
+    const { container, getByRole, getByText } = render(<AuthoritativeEventView detail={detail} />);
     const script = [...container.querySelectorAll('script[type="application/ld+json"]')].find(
       (candidate) => candidate.textContent.includes('"@type":"Event"'),
     );
@@ -65,11 +79,11 @@ describe('AuthoritativeEventView structured data', () => {
       name: 'Public Event',
       image: ['https://images.example.test/event.webp'],
       startDate: '2030-01-01T18:00:00.000Z',
-      url: 'https://thec1rcle.com/event/public-event',
+      url: 'https://guest.thec1rcle.com/event/public-event',
       location: {
         '@type': 'Place',
         name: 'Public Venue',
-        url: 'https://thec1rcle.com/venue/public-venue',
+        url: 'https://guest.thec1rcle.com/venue/public-venue',
         address: {
           '@type': 'PostalAddress',
           streetAddress: '1 Test Street',
@@ -86,6 +100,11 @@ describe('AuthoritativeEventView structured data', () => {
       '/venue/public-venue',
     );
     expect(getByRole('link', { name: 'Public Host' })).toHaveAttribute('href', '/host/public-host');
+    expect(getByRole('heading', { name: 'Entry information' })).toBeInTheDocument();
+    expect(getByText('Not allowed')).toBeInTheDocument();
+    expect(getByText('21+')).toBeInTheDocument();
+    expect(getByText('Required')).toBeInTheDocument();
+    expect(getByText('Weapons, Glass bottles')).toBeInTheDocument();
     expect(jsonLd).not.toHaveProperty('organizer');
     expect(jsonLd).not.toHaveProperty('offers');
     expect(JSON.stringify(jsonLd)).not.toContain('org-1');
@@ -105,4 +124,16 @@ describe('AuthoritativeEventView structured data', () => {
     expect(jsonLd).not.toHaveProperty('organizer');
     expect(jsonLd).not.toHaveProperty('offers');
   });
+});
+
+it('does not promise automatic re-entry from a legacy organizer field', () => {
+  const rules = detail.entryRules;
+  if (!rules) throw new Error('Missing fixture entry rules');
+  const { getByText, queryByText } = render(
+    <AuthoritativeEventView
+      detail={{ ...detail, entryRules: { ...rules, reentryAllowed: true } }}
+    />,
+  );
+  expect(getByText('Not allowed')).toBeInTheDocument();
+  expect(queryByText('Allowed')).not.toBeInTheDocument();
 });

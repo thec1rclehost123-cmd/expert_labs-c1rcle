@@ -1,0 +1,73 @@
+# Minimal CI for the handoff snapshot (the original workflows are intentionally absent:
+# they referenced the original organisation, cross-repo tokens and deploy pipeline).
+# It runs the same checks used to verify this snapshot: install from the lockfile, typecheck,
+# unit tests. No secrets are used. Recreate lint, security scanning and deploy jobs for your own
+# environment.
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (typecheck, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: C1RCLE-BACKEND
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: C1RCLE-BACKEND/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: C1RCLE-BACKEND/.node-version
+          cache: pnpm
+          cache-dependency-path: C1RCLE-BACKEND/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  frontend:
+    name: Frontend (build packages, typecheck, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: C1RCLE-FRONTEND
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: C1RCLE-FRONTEND/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: C1RCLE-FRONTEND/.nvmrc
+          cache: pnpm
+          cache-dependency-path: C1RCLE-FRONTEND/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build the shared workspace packages
+        run: pnpm --filter "./packages/*" build
+      - name: Typecheck apps
+        # guest-portal is excluded on purpose: it has 8 pre-existing type errors in two test files
+        # (login/page.test.tsx, CheckoutFlowClient.test.tsx), identical in the source repository.
+        run: |
+          for app in partner-dashboard scanner-app admin-console; do
+            echo "::group::typecheck $app"
+            (cd "apps/$app" && npx tsc --noEmit)
+            echo "::endgroup::"
+          done
+      - name: Partner dashboard tests
+        run: cd apps/partner-dashboard && npx vitest run
+      - name: Scanner app tests
+        run: cd apps/scanner-app && npx jest --passWithNoTests

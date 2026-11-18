@@ -1,18 +1,32 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import {
+  ConflictError,
   DeviceNotAuthorizedError,
   InvalidOperationError,
   ForbiddenError,
   NotFoundError,
+  ServiceUnavailableError,
   UnauthorizedError,
 } from '../../domain/errors.js';
-import { evaluateAdmission } from '../../domain/models/entitlement.js';
+import { deterministicDomainEventId, domainEvent } from '../../domain/events.js';
+import {
+  currentEntitlementHolderId,
+  entitlementRequiresEligibilityVerification,
+  entitlementCredentialVersion,
+  evaluateAdmission,
+  requiresEligibilityVerification,
+} from '../../domain/models/entitlement.js';
 import {
   isSessionValid,
   canSessionScan,
   hashSessionToken,
 } from '../../domain/models/event-code.js';
+import {
+  eventAdmissionUnavailableReason,
+  eventQrUnavailableReason,
+} from '../../domain/models/event-policy.js';
+import { fulfilmentPending } from '../../domain/models/fulfilment.js';
 import {
   bindScannerDevice,
   isDeviceAuthorized,
@@ -21,6 +35,16 @@ import {
   unbindScannerDevice,
 } from '../../domain/models/scanner-device.js';
 import { requireOrgAccess } from '../context.js';
+
+import {
+  MAGIC_WINDOW_SEC,
+  buildRotatingQr,
+  checkRotatingQr,
+  deriveManifestSigningKey,
+  deriveTicketKey,
+  parseRotatingQr,
+  signManifest,
+} from './offline-ticket-crypto.js';
 
 import type { EntityId } from '../../domain/identity.js';
 import type { Entitlement } from '../../domain/models/entitlement.js';
@@ -133,6 +157,13 @@ export interface ScannerService {
 
   // ── Scanning ─────────────────────────────────────────────────────────────
   scan(input: ScanInput, actor: ActorContext): Promise<ScanResult>;
+  manualScan(input: ManualScanInput, actor: ActorContext): Promise<ScanResult>;
+  redeemTicketAddon(input: {
+    eventId: EntityId;
+    entitlementId: EntityId;
+    addonEntitlementId: EntityId;
+    sessionToken: string;
+  }): Promise<Entitlement>;
   resolve(input: ResolveInput, actor: ActorContext): Promise<TicketResolution>;
   getScan(checkInId: EntityId, actor: ActorContext): Promise<ScanLedger>;
   overrideScan(checkInId: EntityId, reason: string, actor: ActorContext): Promise<ScanLedger>;
@@ -170,9 +201,18 @@ export interface ScannerService {
 
 /**
  * One scan request. `qrPayload` is whatever the camera read — the service
- * decides whether it is a rotating "magic" payload or a bare ticket id, so a
- * caller can never steer that choice.
+ * validates its rotating signature. Bare identifiers belong only to the
+ * separately authorized manual-admission path.
  */
+export interface ManualScanInput {
+  eventId: EntityId;
+  entitlementId: EntityId;
+  sessionToken: string;
+  eligibilityVerified?: boolean;
+  coupleConfirmed?: boolean;
+  reason?: string;
+}
+
 export interface ScanInput {
   eventId: EntityId;
   qrPayload: string;
@@ -184,6 +224,8 @@ export interface ScanInput {
   /** Ignored when the code is gate-restricted; the code's gate wins. */
   gate?: string;
   scannedAt?: string;
+  /** Set only after the authorized operator checked the attendee against the sold policy. */
+  eligibilityVerified?: boolean;
 }
 
 export interface BindDeviceCommand {
@@ -245,6 +287,8 @@ export interface TicketSummary {
   scansUsed: number;
   scansAllowed: number;
   status: string;
+  ticketAddons?: Entitlement['ticketAddons'];
+  eligibilityPolicy?: { audienceType: string; minAge: number | null; maxAge: number | null };
 }
 
 export interface ScanResult {
@@ -274,13 +318,33 @@ export interface OfflineManifestEntry {
   entitlementId: EntityId;
   validFrom: string;
   validTo: string;
-  signature: string;
+  /**
+   * Seats this ticket could still admit when the manifest was signed
+   * (`scanCountAllowed - scanCount`). A couple ticket is 2. The device counts
+   * its own offline admissions against this; the server re-checks at sync.
+   */
+  seatsRemaining: number;
+  /**
+   * Per-ticket verification key (hex). Lets the device check this ticket's
+   * rotating QR offline; it verifies nothing else and is useless after the
+   * manifest expires. Treat it like a session token: keep it in secure storage.
+   */
+  ticketKey: string;
 }
 
 export interface OfflineManifest {
+  /** Format version. Devices must refuse a version they do not understand. */
+  version: 1;
+  eventId: EntityId;
   manifest: OfflineManifestEntry[];
   signedAt: string;
   expiresAt: string;
+  /** Identifies `publicKey`, so a rotated key is recognisable. */
+  keyId: string;
+  /** Raw Ed25519 public key, base64. */
+  publicKey: string;
+  /** Ed25519 over the canonical manifest bytes (see `manifestSigningBytes`), base64. */
+  manifestSignature: string;
 }
 
 export interface OfflineSyncInput {
@@ -294,10 +358,15 @@ export interface OfflineSyncResult {
   conflicts: { payload: string; reason: string }[];
 }
 
-/** Rotating-QR window. Both sides of ±1 window are accepted (±65s of drift). */
-const MAGIC_WINDOW_SEC = 30;
 /** An offline manifest is a short-lived pre-authorization, not a licence. */
 const OFFLINE_MANIFEST_TTL_MS = 12 * 60 * 60 * 1000;
+/**
+ * How long after a manifest expires a device may still sync scans it took
+ * under it (a shift ends, the van has no signal, the sync happens next day).
+ */
+const OFFLINE_SYNC_GRACE_MS = 24 * 60 * 60 * 1000;
+/** A device clock may run ahead of the server by this much before a scan is refused. */
+const OFFLINE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 /**
  * How long staff have to answer "are both guests here?". Long enough to look
  * up from the phone and count two people; short enough that a token screenshot
@@ -401,7 +470,10 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
     sessionId: EntityId;
     deviceId: string;
     expectedScansUsed: number;
+    expectedCredentialVersion: number;
     seats: number;
+    eligibilityVerified: boolean;
+    eligibilityRequired: boolean;
     expiresAtMs: number;
   }): string {
     const body = [
@@ -410,7 +482,10 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
       args.sessionId,
       args.deviceId,
       String(args.expectedScansUsed),
+      String(args.expectedCredentialVersion),
       String(args.seats),
+      String(args.eligibilityVerified),
+      String(args.eligibilityRequired),
       String(args.expiresAtMs),
     ].join('|');
     return `${Buffer.from(body, 'utf8').toString('base64url')}.${hmacHex(`confirm:${body}`)}`;
@@ -422,7 +497,10 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
     sessionId: EntityId;
     deviceId: string;
     expectedScansUsed: number;
+    expectedCredentialVersion: number;
     seats: number;
+    eligibilityVerified: boolean;
+    eligibilityRequired: boolean;
     expiresAtMs: number;
   }
 
@@ -437,16 +515,24 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
     }
     if (!hmacMatches(signature, hmacHex(`confirm:${body}`))) return null;
     const parts = body.split('|');
-    if (parts.length !== 7) return null;
-    const [entitlementId, eventId, sessionId, deviceId, used, seats, expiresAt] = parts as [
-      string,
-      string,
-      string,
-      string,
-      string,
-      string,
-      string,
-    ];
+    if (parts.length !== 10) return null;
+    const [
+      entitlementId,
+      eventId,
+      sessionId,
+      deviceId,
+      used,
+      credentialVersion,
+      seats,
+      eligibilityVerified,
+      eligibilityRequired,
+      expiresAt,
+    ] = parts as [string, string, string, string, string, string, string, string, string, string];
+    if (
+      (eligibilityVerified !== 'true' && eligibilityVerified !== 'false') ||
+      (eligibilityRequired !== 'true' && eligibilityRequired !== 'false')
+    )
+      return null;
     const expiresAtMs = Number.parseInt(expiresAt, 10);
     if (!Number.isFinite(expiresAtMs) || expiresAtMs < Date.now()) return null;
     return {
@@ -455,7 +541,10 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
       sessionId,
       deviceId,
       expectedScansUsed: Number.parseInt(used, 10),
+      expectedCredentialVersion: Number.parseInt(credentialVersion, 10),
       seats: Number.parseInt(seats, 10),
+      eligibilityVerified: eligibilityVerified === 'true',
+      eligibilityRequired: eligibilityRequired === 'true',
       expiresAtMs,
     };
   }
@@ -471,30 +560,34 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
    * fall-through to the bare-id path, which is exactly how a signature check
    * gets bypassed.
    */
-  function decodeQr(qrPayload: string): { entitlementId: EntityId | null; magic: boolean } {
-    const parts = qrPayload.split(':');
-    if (parts.length !== 3 || !parts.every((p) => p.length > 0)) {
-      return { entitlementId: qrPayload, magic: false };
-    }
-    const [entitlementId, windowStr, signature] = parts as [string, string, string];
-    const windowStart = Number.parseInt(windowStr, 10);
-    if (!Number.isFinite(windowStart)) return { entitlementId: null, magic: true };
-    const current = hmacMatches(signature, hmacHex(`${entitlementId}:${windowStart}`));
-    const previous = hmacMatches(
-      signature,
-      hmacHex(`${entitlementId}:${windowStart - MAGIC_WINDOW_SEC}`),
-    );
-    if (!current && !previous) return { entitlementId: null, magic: true };
-    // A signature that verifies for a window far in the past or future is a
+  function decodeQr(
+    qrPayload: string,
+    atMs: number = Date.now(),
+  ): { entitlementId: EntityId | null; magic: boolean; credentialVersion: number | null } {
+    const parsed = parseRotatingQr(qrPayload);
+    if (parsed === null) return { entitlementId: qrPayload, magic: false, credentialVersion: null };
+    // `atMs` is "now" for an online scan and the device's own scan time for an
+    // offline one. A signature that verifies for a window far from `atMs` is a
     // replayed screenshot, not clock drift.
-    const nowWindow = Math.floor(Date.now() / 1000 / MAGIC_WINDOW_SEC) * MAGIC_WINDOW_SEC;
-    if (Math.abs(nowWindow - windowStart) > MAGIC_WINDOW_SEC * 2) {
-      return { entitlementId: null, magic: true };
+    const ticketKey = deriveTicketKey(
+      config.magicTicketSecret,
+      parsed.entitlementId,
+      parsed.credentialVersion,
+    );
+    if (!checkRotatingQr({ ticketKey, parsed, atMs })) {
+      return { entitlementId: null, magic: true, credentialVersion: parsed.credentialVersion };
     }
-    return { entitlementId, magic: true };
+    return {
+      entitlementId: parsed.entitlementId,
+      magic: true,
+      credentialVersion: parsed.credentialVersion,
+    };
   }
 
-  function ticketSummary(entitlement: Entitlement): TicketSummary {
+  function ticketSummary(
+    entitlement: Entitlement,
+    eligibilityPolicy?: { audienceType: string; minAge: number | null; maxAge: number | null },
+  ): TicketSummary {
     return {
       id: entitlement.id,
       tierName: entitlement.tierName,
@@ -503,6 +596,35 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
       scansUsed: entitlement.scanCount,
       scansAllowed: entitlement.scanCountAllowed,
       status: entitlement.status,
+      ...(entitlement.ticketAddons ? { ticketAddons: entitlement.ticketAddons } : {}),
+      ...(eligibilityPolicy
+        ? { eligibilityPolicy }
+        : entitlement.eligibility
+          ? {
+              eligibilityPolicy: {
+                audienceType: entitlement.eligibility.audienceType ?? 'GENERAL',
+                minAge: entitlement.eligibility.minAge ?? null,
+                maxAge: entitlement.eligibility.maxAge ?? null,
+              },
+            }
+          : {}),
+    };
+  }
+
+  async function eligibilityPolicyFor(entitlement: Entitlement) {
+    if (entitlement.eligibility) {
+      return {
+        audienceType: entitlement.eligibility.audienceType,
+        minAge: entitlement.eligibility.minAge,
+        maxAge: entitlement.eligibility.maxAge,
+      };
+    }
+    const tier = await deps.repositories.catalog.getTierById(entitlement.tierId);
+    if (!tier || !requiresEligibilityVerification(tier)) return undefined;
+    return {
+      audienceType: tier.audienceType ?? 'GENERAL',
+      minAge: tier.minAge ?? null,
+      maxAge: tier.maxAge ?? null,
     };
   }
 
@@ -556,7 +678,9 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
       guestName: args.entitlement?.holderName ?? null,
       guestEmail: null,
       guestPhone: null,
-      scannedAt: args.input.scannedAt ?? new Date().toISOString(),
+      scannedAt: args.isOffline
+        ? (args.input.scannedAt ?? config.clock.now().toISOString())
+        : config.clock.now().toISOString(),
       admittedCount: args.admitted ? (args.admittedCount ?? 1) : 0,
       scanCountUsed: args.scansUsed,
       scanCountAllowed: args.scansAllowed,
@@ -797,17 +921,24 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
    * The claim is last because everything before it is a reason to refuse
    * *without* spending an admission.
    */
-  async function scan(input: ScanInput, actor: ActorContext): Promise<ScanResult> {
+  async function scan(
+    input: ScanInput,
+    actor: ActorContext,
+    manual?: ManualScanInput,
+  ): Promise<ScanResult> {
     const event = await requireEvent(input.eventId, actor);
+    const eventReason = eventAdmissionUnavailableReason(event, config.clock.now());
     const session = await authenticateSession(input.sessionToken, input.eventId);
     // The session belongs to the code, the code to the org — re-checked here
     // so a token minted under one tenant can never be replayed under another.
     requireOrgAccess(actor, session.organizationId);
+    if (session.venueId !== null && session.venueId !== event.venueId)
+      throw new DeviceNotAuthorizedError('The event venue changed. Start a new Scanner shift.');
     if (!canSessionScan(session)) {
       throw new ForbiddenError('This scanner session may not scan tickets');
     }
 
-    await requireBoundDevice(session);
+    const boundDevice = await requireBoundDevice(session);
 
     const code = await eventCodes.findById(session.codeId);
     // A gate-restricted code pins the gate; a free code takes the operator's.
@@ -825,8 +956,29 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
       input: { ...input, gate },
     };
 
-    const decoded = decodeQr(input.qrPayload);
-    if (!decoded.entitlementId) {
+    if (eventReason) {
+      const scanRecord = await recordScan({
+        ...scanArgs,
+        entitlementId: null,
+        entitlement: null,
+        admitted: false,
+        denyReason: 'event_closed',
+        denyMessage: eventReason,
+        scansUsed: null,
+        scansAllowed: null,
+      });
+      return {
+        scan: scanRecord,
+        status: 'denied',
+        denyReason: 'event_closed',
+        denyMessage: eventReason,
+      };
+    }
+
+    const decoded = manual
+      ? { entitlementId: manual.entitlementId, magic: false, credentialVersion: null }
+      : decodeQr(input.qrPayload, config.clock.now().getTime());
+    if (!decoded.entitlementId || (!manual && !decoded.magic)) {
       const scanRecord = await recordScan({
         ...scanArgs,
         entitlementId: null,
@@ -853,20 +1005,63 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
     // system says is half-used. So an untouched couple ticket stops here and
     // asks — and NOTHING is written, because a question is not an admission.
     const preview = await entitlements.findById(decoded.entitlementId);
+    const eligibilityPolicy = preview ? await eligibilityPolicyFor(preview) : undefined;
+    const eligibilityRequired = Boolean(
+      preview &&
+      (entitlementRequiresEligibilityVerification(preview) ||
+        (eligibilityPolicy !== undefined && requiresEligibilityVerification(eligibilityPolicy))),
+    );
+    if (
+      preview &&
+      preview.eventId === event.id &&
+      decoded.magic &&
+      decoded.credentialVersion !== entitlementCredentialVersion(preview)
+    ) {
+      const scanRecord = await recordScan({
+        ...scanArgs,
+        entitlementId: decoded.entitlementId,
+        entitlement: preview,
+        admitted: false,
+        denyReason: 'invalid_signature',
+        denyMessage: 'Ticket credential has been replaced',
+        scansUsed: preview.scanCount,
+        scansAllowed: preview.scanCountAllowed,
+      });
+      await bumpCodeUsage(session.codeId);
+      return {
+        scan: scanRecord,
+        status: 'denied',
+        denyReason: 'invalid_signature',
+        denyMessage: 'Ticket credential has been replaced',
+        entitlement: ticketSummary(preview, eligibilityPolicy),
+      };
+    }
+    if (
+      manual &&
+      preview?.eventId === event.id &&
+      preview.scanCountAllowed === 2 &&
+      !manual.coupleConfirmed
+    ) {
+      throw new ConflictError(
+        'Confirm one male and one female are present together before manual admission',
+      );
+    }
     if (
       preview &&
       preview.eventId === event.id &&
       preview.status !== 'void' &&
+      currentEntitlementHolderId(preview) !== null &&
       !preview.refundLock &&
       preview.scanCountAllowed === 2 &&
       preview.scanCount === 0 &&
-      session.deviceId !== null
+      session.deviceId !== null &&
+      !manual?.coupleConfirmed
     ) {
       const expiresAtMs = Date.now() + COUPLE_CONFIRMATION_TTL_MS;
       return {
         scan: null,
         status: 'confirmation_required',
-        entitlement: ticketSummary(preview),
+        entitlement: ticketSummary(preview, eligibilityPolicy),
         confirmation: {
           token: mintConfirmationToken({
             entitlementId: preview.id,
@@ -874,7 +1069,10 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
             sessionId: session.id,
             deviceId: session.deviceId,
             expectedScansUsed: preview.scanCount,
+            expectedCredentialVersion: entitlementCredentialVersion(preview),
             seats: 2,
+            eligibilityVerified: input.eligibilityVerified === true,
+            eligibilityRequired,
             expiresAtMs,
           }),
           expiresAt: new Date(expiresAtMs).toISOString(),
@@ -885,21 +1083,44 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
 
     // THE atomic step. Everything this returns already accounts for every
     // concurrent scanner.
-    const claim = await entitlements.claimAdmission(decoded.entitlementId, event.id);
+    const claim = await entitlements.claimAdmission(decoded.entitlementId, event.id, {
+      requireEventValidation: true,
+      expectedVenueId: event.venueId,
+      admissionAudit: {
+        operatorUserId: actor.userId,
+        deviceId: boundDevice.deviceId,
+        method: manual ? 'manual' : 'camera',
+        ...(gate ? { gate } : {}),
+        ...(session.deviceName ? { deviceName: session.deviceName } : {}),
+        ...(input.operatorName ? { operatorName: input.operatorName } : {}),
+        ...(input.operatorRole ? { operatorRole: input.operatorRole } : {}),
+        ...(manual?.reason ? { reason: manual.reason } : {}),
+      },
+      now: config.clock.now(),
+      ...(manual?.coupleConfirmed ? { seats: 2, eligibilityRequired: true } : {}),
+      ...(decoded.magic && decoded.credentialVersion !== null
+        ? { expectedCredentialVersion: decoded.credentialVersion }
+        : {}),
+      ...(input.eligibilityVerified === true ? { eligibilityVerified: true } : {}),
+      ...(eligibilityRequired ? { eligibilityRequired: true } : {}),
+    });
     const entitlement = claim.entitlement;
 
-    const scanRecord = await recordScan({
-      ...scanArgs,
-      entitlementId: decoded.entitlementId,
-      // A wrong-event ticket belongs to another tenant: record the attempt,
-      // but never copy that tenant's guest name onto this org's ledger.
-      entitlement: claim.denyReason === 'wrong_event' ? null : entitlement,
-      admitted: claim.admitted,
-      denyReason: claim.denyReason,
-      denyMessage: claim.denyMessage,
-      scansUsed: claim.scansUsed,
-      scansAllowed: claim.scansAllowed,
-    });
+    const scanRecord =
+      claim.scan ??
+      (await recordScan({
+        ...scanArgs,
+        entitlementId: decoded.entitlementId,
+        // A wrong-event ticket belongs to another tenant: record the attempt,
+        // but never copy that tenant's guest name onto this org's ledger.
+        entitlement: claim.denyReason === 'wrong_event' ? null : entitlement,
+        admitted: claim.admitted,
+        admittedCount: manual?.coupleConfirmed ? 2 : 1,
+        denyReason: claim.denyReason,
+        denyMessage: claim.denyMessage,
+        scansUsed: claim.scansUsed,
+        scansAllowed: claim.scansAllowed,
+      }));
     await bumpCodeUsage(session.codeId);
     await touchDevice(session, {
       lastSeenAt: new Date().toISOString(),
@@ -917,44 +1138,108 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
         ...(claim.denyReason ? { denyReason: claim.denyReason } : {}),
         ...(claim.denyMessage ? { denyMessage: claim.denyMessage } : {}),
         ...(entitlement && claim.denyReason !== 'wrong_event'
-          ? { entitlement: ticketSummary(entitlement) }
+          ? { entitlement: ticketSummary(entitlement, eligibilityPolicy) }
           : {}),
       };
     }
 
-    await adminAudit.write({
-      id: `audit-${scanRecord.id}-${Date.now()}`,
-      adminId: actor.userId,
-      actorId: actor.userId,
-      organizationId: event.organizationId,
-      action: 'door.scan_admitted',
-      targetType: 'scan_ledger',
-      targetId: scanRecord.id,
-      after: {
-        entitlementId: decoded.entitlementId,
-        scansUsed: claim.scansUsed,
-        scansAllowed: claim.scansAllowed,
-      },
-    });
+    // The canonical admission and audit were committed atomically. A redundant
+    // admin-console projection must never turn that success into an API failure.
+    try {
+      await adminAudit.write({
+        id: `audit-${scanRecord.id}-${Date.now()}`,
+        adminId: actor.userId,
+        actorId: actor.userId,
+        organizationId: event.organizationId,
+        action: 'door.scan_admitted',
+        targetType: 'scan_ledger',
+        targetId: scanRecord.id,
+        after: {
+          entitlementId: decoded.entitlementId,
+          scansUsed: claim.scansUsed,
+          scansAllowed: claim.scansAllowed,
+        },
+      });
+    } catch (error) {
+      deps.logger.warn('scanner_secondary_audit_failed', {
+        scanId: scanRecord.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     return {
       scan: scanRecord,
       status: 'consumed',
-      ...(entitlement ? { entitlement: ticketSummary(entitlement) } : {}),
+      ...(entitlement ? { entitlement: ticketSummary(entitlement, eligibilityPolicy) } : {}),
     };
   }
 
   /** Non-consuming preview — same rule, no write. */
+  async function redeemTicketAddon(input: {
+    eventId: EntityId;
+    entitlementId: EntityId;
+    addonEntitlementId: EntityId;
+    sessionToken: string;
+  }): Promise<Entitlement> {
+    const session = await authenticateSession(input.sessionToken, input.eventId);
+    if (!session.permissions.canScan) {
+      throw new ForbiddenError('This scanner session cannot redeem ticket extras');
+    }
+    const current = await deps.entitlements.getById(input.entitlementId);
+    if (!current || current.eventId !== input.eventId) {
+      throw new NotFoundError('Ticket extra', input.addonEntitlementId);
+    }
+    const now = deps.config.clock.now();
+    const addon = current.ticketAddons?.find((item) => item.id === input.addonEntitlementId);
+    if (!addon) throw new InvalidOperationError('Ticket extra was not found on this admission');
+    const event = domainEvent({
+      id: deterministicDomainEventId(
+        'ticket.addon.redeemed',
+        current.id,
+        addon.id,
+        String(now.getTime()),
+      ),
+      type: 'ticket.addon.redeemed',
+      aggregateId: current.id,
+      organizationId: current.organizationId,
+      actorId: session.createdBy,
+      payload: {
+        entitlementId: current.id,
+        addonEntitlementId: addon.id,
+        addonId: addon.addonId,
+        eventId: current.eventId,
+      },
+      occurredAt: now.getTime(),
+    });
+    const updated = await deps.entitlements.redeemTicketAddon(
+      {
+        entitlementId: current.id,
+        addonEntitlementId: addon.id,
+        eventId: input.eventId,
+        now,
+      },
+      event,
+    );
+    await deps.outbox.append(event);
+    return updated;
+  }
+
   async function resolve(input: ResolveInput, actor: ActorContext): Promise<TicketResolution> {
     const event = await requireEvent(input.eventId, actor);
+    const eventReason = eventAdmissionUnavailableReason(event, config.clock.now());
     const session = await authenticateSession(input.sessionToken, input.eventId);
     requireOrgAccess(actor, session.organizationId);
+    if (session.venueId !== null && session.venueId !== event.venueId)
+      throw new DeviceNotAuthorizedError('The event venue changed. Start a new Scanner shift.');
     if (!canSessionScan(session)) {
       throw new ForbiddenError('This scanner session may not scan tickets');
     }
 
-    const decoded = decodeQr(input.qrPayload);
-    if (!decoded.entitlementId) {
+    await requireBoundDevice(session);
+    if (eventReason)
+      return { status: 'invalid', denyReason: 'event_closed', denyMessage: eventReason };
+    const decoded = decodeQr(input.qrPayload, config.clock.now().getTime());
+    if (!decoded.entitlementId || !decoded.magic) {
       return {
         status: 'invalid',
         denyReason: 'invalid_signature',
@@ -962,6 +1247,19 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
       };
     }
     const entitlement = await entitlements.findById(decoded.entitlementId);
+    const eligibilityPolicy = entitlement ? await eligibilityPolicyFor(entitlement) : undefined;
+    if (
+      entitlement &&
+      entitlement.eventId === event.id &&
+      decoded.magic &&
+      decoded.credentialVersion !== entitlementCredentialVersion(entitlement)
+    ) {
+      return {
+        status: 'invalid',
+        denyReason: 'invalid_signature',
+        denyMessage: 'Ticket credential has been replaced',
+      };
+    }
     const decision = evaluateAdmission(entitlement, event.id);
     if (!decision.admitted) {
       return {
@@ -969,7 +1267,7 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
         denyReason: decision.denyReason,
         denyMessage: decision.denyMessage,
         ...(entitlement && decision.denyReason !== 'wrong_event'
-          ? { entitlement: ticketSummary(entitlement) }
+          ? { entitlement: ticketSummary(entitlement, eligibilityPolicy) }
           : {}),
       };
     }
@@ -977,7 +1275,7 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
       status: 'valid',
       denyReason: null,
       denyMessage: null,
-      ...(entitlement ? { entitlement: ticketSummary(entitlement) } : {}),
+      ...(entitlement ? { entitlement: ticketSummary(entitlement, eligibilityPolicy) } : {}),
     };
   }
 
@@ -988,34 +1286,16 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
     return scanRecord;
   }
 
-  /**
-   * Manually admits a guest whose scan was denied.
-   *
-   * Deliberately does NOT touch the entitlement's `scanCount`: an override is
-   * a human decision recorded against one refusal, not a repaired ticket. If
-   * it topped the ticket back up, one override would silently grant unlimited
-   * further entries.
-   */
+  /** V1 admission must use the validated camera or manual-admission path. */
   async function overrideScan(
     checkInId: EntityId,
-    reason: string,
+    _reason: string,
     actor: ActorContext,
   ): Promise<ScanLedger> {
-    const before = await getScan(checkInId, actor);
-    const updated = await scanLedger.markOverridden(checkInId, actor.userId, reason);
-    if (!updated) throw new NotFoundError('Scan', checkInId);
-    await adminAudit.write({
-      id: `audit-override-${checkInId}-${Date.now()}`,
-      adminId: actor.userId,
-      actorId: actor.userId,
-      organizationId: actor.organizationId,
-      action: 'door.scan_override',
-      targetType: 'scan_ledger',
-      targetId: checkInId,
-      before: { status: before.status, denyReason: before.denyReason },
-      after: { status: updated.status, overriddenBy: updated.overriddenBy, reason },
-    });
-    return updated;
+    await getScan(checkInId, actor);
+    throw new ConflictError(
+      'Admission overrides are unavailable. Use validated manual admission from the guest roster.',
+    );
   }
 
   /**
@@ -1032,13 +1312,41 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
   ): Promise<{ qrPayload: string; expiresAt: string; refreshIntervalSec: number }> {
     const entitlement = await entitlements.findById(ticketId);
     if (!entitlement) throw new NotFoundError('Ticket', ticketId);
-    const isHolder = entitlement.userId !== null && entitlement.userId === actor.userId;
-    const isStaff = entitlement.organizationId === actor.organizationId;
-    if (!isHolder && !isStaff) throw new NotFoundError('Ticket', ticketId);
+    const currentHolder = currentEntitlementHolderId(entitlement);
+    if (currentHolder === null || currentHolder !== actor.userId)
+      throw new NotFoundError('Ticket', ticketId);
+    if (
+      entitlement.status !== 'valid' ||
+      entitlement.refundLock ||
+      entitlement.scanCount >= entitlement.scanCountAllowed
+    ) {
+      throw new ConflictError('A ticket QR is available only while the entitlement is active.');
+    }
 
-    const windowStart = Math.floor(Date.now() / 1000 / MAGIC_WINDOW_SEC) * MAGIC_WINDOW_SEC;
+    if (entitlement.fulfillmentRequired) {
+      const order = await deps.repositories.orders.getById(entitlement.orderId);
+      if (fulfilmentPending(entitlement, order))
+        throw new ConflictError('Payment is still processing.');
+    }
+    const event = await deps.repositories.events.findById(entitlement.eventId);
+    if (!event || event.organizationId !== entitlement.organizationId)
+      throw new ConflictError('The event is unavailable.');
+    const now = config.clock.now();
+    const reason = eventQrUnavailableReason(event, now);
+    if (reason) throw new ConflictError(reason);
+    const nowMs = now.getTime();
+    const windowStart = Math.floor(nowMs / 1000 / MAGIC_WINDOW_SEC) * MAGIC_WINDOW_SEC;
     return {
-      qrPayload: `${ticketId}:${windowStart}:${hmacHex(`${ticketId}:${windowStart}`)}`,
+      qrPayload: buildRotatingQr(
+        deriveTicketKey(
+          config.magicTicketSecret,
+          ticketId,
+          entitlementCredentialVersion(entitlement),
+        ),
+        ticketId,
+        nowMs,
+        entitlementCredentialVersion(entitlement),
+      ),
       expiresAt: new Date((windowStart + MAGIC_WINDOW_SEC) * 1000).toISOString(),
       refreshIntervalSec: MAGIC_WINDOW_SEC,
     };
@@ -1210,18 +1518,39 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
    * ticket, a different door, or a ticket whose state has moved since staff
    * were asked the question.
    */
+  async function manualScan(input: ManualScanInput, actor: ActorContext): Promise<ScanResult> {
+    return scan(
+      {
+        eventId: input.eventId,
+        qrPayload: '',
+        sessionToken: input.sessionToken,
+        ...(input.eligibilityVerified === true ? { eligibilityVerified: true } : {}),
+      },
+      actor,
+      input,
+    );
+  }
+
   async function confirmCouple(
     command: ConfirmCoupleCommand,
     actor: ActorContext,
   ): Promise<ScanResult> {
     const event = await requireEvent(command.eventId, actor);
+    const eventReason = eventAdmissionUnavailableReason(event, config.clock.now());
     const session = await authenticateSession(command.sessionToken, command.eventId);
     requireOrgAccess(actor, session.organizationId);
+    if (session.venueId !== null && session.venueId !== event.venueId)
+      throw new DeviceNotAuthorizedError('The event venue changed. Start a new Scanner shift.');
     if (!canSessionScan(session)) {
       throw new ForbiddenError('This scanner session may not scan tickets');
     }
-    await requireBoundDevice(session);
+    const boundDevice = await requireBoundDevice(session);
 
+    const code = await eventCodes.findById(session.codeId);
+    const gate = code?.gate ?? command.gate;
+    if (code?.gate && command.gate && command.gate !== code.gate) {
+      throw new ForbiddenError('This scanner session is restricted to a different gate');
+    }
     const claims = verifyConfirmationToken(command.confirmationToken);
     if (
       !claims ||
@@ -1239,9 +1568,27 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
       venueId: event.venueId,
       session,
       actor,
-      input: { ...command, gate: command.gate ?? null },
+      input: { ...command, gate: gate ?? null },
       entitlementId: claims.entitlementId,
     };
+
+    if (eventReason) {
+      const denied = await recordScan({
+        ...base,
+        entitlement: null,
+        admitted: false,
+        denyReason: 'event_closed',
+        denyMessage: eventReason,
+        scansUsed: null,
+        scansAllowed: null,
+      });
+      return {
+        scan: denied,
+        status: 'denied',
+        denyReason: 'event_closed',
+        denyMessage: eventReason,
+      };
+    }
 
     if (!command.confirmed) {
       // Staff looked and only one guest is there. Recorded as a real denial,
@@ -1267,20 +1614,37 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
     }
 
     const claim = await entitlements.claimAdmission(claims.entitlementId, event.id, {
+      requireEventValidation: true,
+      expectedVenueId: event.venueId,
+      admissionAudit: {
+        operatorUserId: actor.userId,
+        deviceId: boundDevice.deviceId,
+        method: 'camera',
+        ...(gate ? { gate } : {}),
+        ...(session.deviceName ? { deviceName: session.deviceName } : {}),
+        ...(command.operatorName ? { operatorName: command.operatorName } : {}),
+        ...(command.operatorRole ? { operatorRole: command.operatorRole } : {}),
+      },
+      now: config.clock.now(),
       seats: claims.seats,
       expectedScansUsed: claims.expectedScansUsed,
+      expectedCredentialVersion: claims.expectedCredentialVersion,
+      eligibilityVerified: command.confirmed,
+      eligibilityRequired: true,
     });
-    const scanRecord = await recordScan({
-      ...base,
-      entitlement: claim.entitlement,
-      admitted: claim.admitted,
-      denyReason: claim.denyReason,
-      denyMessage: claim.denyMessage,
-      scansUsed: claim.scansUsed,
-      scansAllowed: claim.scansAllowed,
-      // Both guests walk through on one record — the door counted two people.
-      admittedCount: claim.admitted ? claims.seats : 0,
-    });
+    const scanRecord =
+      claim.scan ??
+      (await recordScan({
+        ...base,
+        entitlement: claim.entitlement,
+        admitted: claim.admitted,
+        denyReason: claim.denyReason,
+        denyMessage: claim.denyMessage,
+        scansUsed: claim.scansUsed,
+        scansAllowed: claim.scansAllowed,
+        // Both guests walk through on one record — the door counted two people.
+        admittedCount: claim.admitted ? claims.seats : 0,
+      }));
     await bumpCodeUsage(session.codeId);
     await touchDevice(session, {
       lastSeenAt: new Date().toISOString(),
@@ -1371,12 +1735,33 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
     sessionToken: string,
     actor: ActorContext,
   ): Promise<OfflineManifest> {
+    if (
+      config.features.m5OfflineTicketManifests === false ||
+      config.features.m5TicketTransfers === true
+    ) {
+      throw new ServiceUnavailableError(
+        'Offline ticket manifests are disabled for this deployment',
+      );
+    }
     const event = await requireEvent(eventId, actor);
+    if (event.status === 'cancelled') {
+      throw new InvalidOperationError(
+        'Offline admission is closed because this event was cancelled',
+      );
+    }
     const session = await authenticateSession(sessionToken, eventId);
     requireOrgAccess(actor, session.organizationId);
     if (!canSessionScan(session)) {
       throw new ForbiddenError('This scanner session may not scan tickets');
     }
+
+    // Offline admission cannot perform the required per-holder staff check.
+    // Fail closed for restricted entitlements, including legacy tickets whose
+    // immutable purchase snapshot predates M5.
+    const tiers = await deps.repositories.catalog.listTiers(event.id);
+    const restrictedTierIds = new Set(
+      tiers.filter((tier) => requiresEligibilityVerification(tier)).map((tier) => tier.id),
+    );
 
     const signedAt = new Date();
     const expiresAt = new Date(signedAt.getTime() + OFFLINE_MANIFEST_TTL_MS);
@@ -1390,23 +1775,52 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
       for (const entitlement of page.items) {
         if (entitlement.status === 'void' || entitlement.refundLock) continue;
         if (entitlement.scanCount >= entitlement.scanCountAllowed) continue;
+        if (
+          entitlementRequiresEligibilityVerification(entitlement) ||
+          (!entitlement.eligibility && restrictedTierIds.has(entitlement.tierId))
+        ) {
+          throw new ServiceUnavailableError(
+            'Offline admission is unavailable for tickets that require eligibility verification',
+          );
+        }
         entries.push({
           entitlementId: entitlement.id,
           validFrom: signedAt.toISOString(),
           validTo: expiresAt.toISOString(),
-          signature: hmacHex(
-            `manifest:${event.id}:${entitlement.id}:${signedAt.toISOString()}:${expiresAt.toISOString()}`,
+          seatsRemaining: entitlement.scanCountAllowed - entitlement.scanCount,
+          ticketKey: deriveTicketKey(
+            config.magicTicketSecret,
+            entitlement.id,
+            entitlementCredentialVersion(entitlement),
           ),
         });
       }
       cursor = page.nextCursor;
     } while (cursor);
 
+    const signingKey = getManifestSigningKey();
     return {
+      version: 1,
+      eventId: event.id,
       manifest: entries,
       signedAt: signedAt.toISOString(),
       expiresAt: expiresAt.toISOString(),
+      keyId: signingKey.keyId,
+      publicKey: signingKey.publicKey,
+      manifestSignature: signManifest(signingKey, {
+        eventId: event.id,
+        signedAt: signedAt.toISOString(),
+        expiresAt: expiresAt.toISOString(),
+        entries,
+      }),
     };
+  }
+
+  let manifestSigningKey: ReturnType<typeof deriveManifestSigningKey> | undefined;
+  /** Derived once per service instance; deterministic, so all instances agree. */
+  function getManifestSigningKey(): ReturnType<typeof deriveManifestSigningKey> {
+    manifestSigningKey ??= deriveManifestSigningKey(config.magicTicketSecret);
+    return manifestSigningKey;
   }
 
   /**
@@ -1423,6 +1837,11 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
     actor: ActorContext,
   ): Promise<OfflineSyncResult> {
     const event = await requireEvent(input.eventId, actor);
+    if (event.status === 'cancelled') {
+      throw new InvalidOperationError(
+        'Offline admission is closed because this event was cancelled',
+      );
+    }
     const session = await authenticateSession(input.sessionToken, input.eventId);
     requireOrgAccess(actor, session.organizationId);
     if (!canSessionScan(session)) {
@@ -1431,9 +1850,41 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
 
     const conflicts: { payload: string; reason: string }[] = [];
     let synced = 0;
+    const nowMs = Date.now();
 
     for (const offline of input.scans) {
-      const decoded = decodeQr(offline.payload);
+      // The device's clock is untrusted input, so it is bounded: not in the
+      // future beyond ordinary skew, and not older than a manifest could have
+      // been valid plus the grace to sync a shift's backlog.
+      const scannedAtMs = Date.parse(offline.scannedAt);
+      if (
+        !Number.isFinite(scannedAtMs) ||
+        scannedAtMs > nowMs + OFFLINE_CLOCK_SKEW_MS ||
+        scannedAtMs < nowMs - (OFFLINE_MANIFEST_TTL_MS + OFFLINE_SYNC_GRACE_MS)
+      ) {
+        conflicts.push({ payload: offline.payload, reason: 'offline_expired' });
+        await recordScan({
+          eventId: event.id,
+          organizationId: event.organizationId,
+          venueId: event.venueId,
+          session,
+          actor,
+          input: { scannedAt: offline.scannedAt },
+          entitlementId: null,
+          entitlement: null,
+          admitted: false,
+          denyReason: 'offline_expired',
+          denyMessage: 'Offline scan time is outside the window this event accepts',
+          scansUsed: null,
+          scansAllowed: null,
+          isOffline: true,
+          offlineDeviceId: offline.deviceId,
+        });
+        continue;
+      }
+
+      // Verify against when the device scanned, not when it reached the server.
+      const decoded = decodeQr(offline.payload, scannedAtMs);
       if (!decoded.entitlementId) {
         conflicts.push({ payload: offline.payload, reason: 'invalid_signature' });
         await recordScan({
@@ -1456,7 +1907,11 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
         continue;
       }
 
-      const claim = await entitlements.claimAdmission(decoded.entitlementId, event.id);
+      const claim = await entitlements.claimAdmission(decoded.entitlementId, event.id, {
+        ...(decoded.magic && decoded.credentialVersion !== null
+          ? { expectedCredentialVersion: decoded.credentialVersion }
+          : {}),
+      });
       await recordScan({
         eventId: event.id,
         organizationId: event.organizationId,
@@ -1493,6 +1948,8 @@ function createScannerServiceImpl(deps: ScannerServiceDeps): ScannerService {
     getSession,
     revokeSession,
     scan,
+    manualScan,
+    redeemTicketAddon,
     resolve,
     bindDevice,
     reauthorizeDevice,

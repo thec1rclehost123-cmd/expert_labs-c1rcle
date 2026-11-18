@@ -17,27 +17,33 @@ import { EventListRow } from './EventListRow';
 
 import type { PartnerEventParty, PartnerEventsData } from '@/data/partner-data-source';
 
-export type PartnerEventStatusFilter = 'all' | 'Live' | 'Draft';
+export type PartnerEventStatusFilter = 'all' | 'Live' | 'Draft' | 'Completed';
 export type PartnerEventView = 'list' | 'grid';
 
 export interface PartnerEventsScreenConfig {
   readonly accent: 'orange' | 'lavender';
   readonly analyticsHref: string;
   readonly createEventHref: string;
+  readonly defaultParty: PartnerEventParty;
   readonly eventsBaseHref: string;
   readonly eventSectionLabel: string;
+  readonly emptyDescription?: string;
   readonly partyFilterLabel: string;
+  readonly showAllPartyFilter?: boolean;
   readonly showViewToggle: boolean;
   readonly slotRequestsHref: string;
+  readonly hideDraftsForHostParty?: boolean;
 }
 
 export function parseEventStatus(value: string | undefined): PartnerEventStatusFilter {
   if (value === 'live') return 'Live';
   if (value === 'draft') return 'Draft';
+  if (value === 'completed') return 'Completed';
   return 'all';
 }
 
 export function parseEventParty(value: string | undefined): PartnerEventParty {
+  if (value === 'all') return 'all';
   return value === 'hosts' ? 'hosts' : 'venue';
 }
 
@@ -50,7 +56,7 @@ export function PartnerEventsScreen({
   data,
   initialSearch = '',
   initialStatus = 'all',
-  initialParty = 'venue',
+  initialParty,
   initialView = 'grid',
 }: {
   readonly config: PartnerEventsScreenConfig;
@@ -63,21 +69,29 @@ export function PartnerEventsScreen({
   const router = useRouter();
   const pathname = usePathname();
   const [query, setQuery] = useState(initialSearch);
-  const [status, setStatus] = useState<PartnerEventStatusFilter>(initialStatus);
-  const [party, setParty] = useState<PartnerEventParty>(initialParty);
+  const [party, setParty] = useState<PartnerEventParty>(initialParty ?? config.defaultParty);
+  const [status, setStatus] = useState<PartnerEventStatusFilter>(() =>
+    config.hideDraftsForHostParty &&
+    (initialParty ?? config.defaultParty) === 'hosts' &&
+    initialStatus === 'Draft'
+      ? 'all'
+      : initialStatus,
+  );
   const [view, setView] = useState<PartnerEventView>(initialView);
 
   const visibleEvents = useMemo(() => {
     const search = query.trim().toLowerCase();
     return data.events.filter((event) => {
+      if (config.hideDraftsForHostParty && party === 'hosts' && event.status === 'Draft')
+        return false;
       if (status !== 'all' && event.status !== status) return false;
-      if (party !== event.party) return false;
+      if (party !== 'all' && party !== event.party) return false;
       if (!search) return true;
       return `${event.name} ${event.tag} ${event.venue} ${event.host}`
         .toLowerCase()
         .includes(search);
     });
-  }, [data.events, party, query, status]);
+  }, [config.hideDraftsForHostParty, data.events, party, query, status]);
 
   const updateUrl = (next: {
     readonly query?: string;
@@ -92,7 +106,7 @@ export function PartnerEventsScreen({
     const nextView = next.view ?? view;
     if (nextQuery.trim()) params.set('search', nextQuery.trim());
     if (nextStatus !== 'all') params.set('status', nextStatus.toLowerCase());
-    if (nextParty !== 'venue') params.set('party', nextParty);
+    if (nextParty !== config.defaultParty) params.set('party', nextParty);
     if (nextView !== 'grid') params.set('view', nextView);
     const search = params.toString();
     router.replace(search ? `${pathname}?${search}` : pathname, { scroll: false });
@@ -108,15 +122,24 @@ export function PartnerEventsScreen({
   };
   const onPartyChange = (value: PartnerEventParty) => {
     setParty(value);
-    updateUrl({ party: value });
+    const nextStatus =
+      config.hideDraftsForHostParty && value === 'hosts' && status === 'Draft' ? 'all' : status;
+    setStatus(nextStatus);
+    updateUrl({ party: value, status: nextStatus });
   };
   const onViewChange = (value: PartnerEventView) => {
     setView(value);
     updateUrl({ view: value });
   };
 
-  const liveCount = data.events.filter((event) => event.status === 'Live').length;
-  const draftCount = data.events.filter((event) => event.status === 'Draft').length;
+  const partyEvents = data.events.filter(
+    (event) =>
+      (party === 'all' || event.party === party) &&
+      !(config.hideDraftsForHostParty && party === 'hosts' && event.status === 'Draft'),
+  );
+  const liveCount = partyEvents.filter((event) => event.status === 'Live').length;
+  const draftCount = partyEvents.filter((event) => event.status === 'Draft').length;
+  const completedCount = partyEvents.filter((event) => event.status === 'Completed').length;
   const themeClass = config.accent === 'lavender' ? styles['hostTheme'] : '';
 
   return (
@@ -126,7 +149,7 @@ export function PartnerEventsScreen({
           <h1>Events</h1>
           <div className={styles['pageHeaderActions']}>
             <Link className={styles['requestCount']} href={config.slotRequestsHref}>
-              <strong>{data.pendingRequestCount}</strong>
+              <strong>{data.pendingRequestCount ?? '—'}</strong>
               <span>Requests</span>
             </Link>
             <Link className={styles['headerAction']} href={config.slotRequestsHref}>
@@ -143,6 +166,9 @@ export function PartnerEventsScreen({
         </header>
 
         <FixtureBadge dataStatus={data.dataStatus} />
+        {data.complete === false ? (
+          <p role="status">Some event records could not be loaded. Counts may be incomplete.</p>
+        ) : null}
 
         <div className={styles['subTabs']} role="tablist" aria-label="Event views">
           <Link className={styles['subTab']} href={pathname} role="tab" aria-selected="true">
@@ -163,9 +189,16 @@ export function PartnerEventsScreen({
           status={status}
           party={party}
           partyLabel={config.partyFilterLabel}
+          showAllPartyFilter={config.showAllPartyFilter ?? false}
+          showDrafts={!(config.hideDraftsForHostParty && party === 'hosts')}
           showViewToggle={config.showViewToggle}
           view={view}
-          counts={{ all: data.events.length, live: liveCount, drafts: draftCount }}
+          counts={{
+            all: partyEvents.length,
+            live: liveCount,
+            drafts: draftCount,
+            completed: completedCount,
+          }}
           onQueryChange={onQueryChange}
           onStatusChange={onStatusChange}
           onPartyChange={onPartyChange}
@@ -174,7 +207,8 @@ export function PartnerEventsScreen({
 
         {visibleEvents.length === 0 ? (
           <EventEmptyState
-            filtered={Boolean(query.trim()) || status !== 'all' || party !== 'venue'}
+            description={config.emptyDescription}
+            filtered={Boolean(query.trim()) || status !== 'all' || party !== config.defaultParty}
           />
         ) : view === 'list' ? (
           <section
@@ -194,6 +228,7 @@ export function PartnerEventsScreen({
                 event={event}
                 href={`${config.eventsBaseHref}/${event.id}`}
                 editHref={config.createEventHref}
+                canEdit={data.dataStatus === 'fixture'}
               />
             ))}
           </section>
@@ -208,14 +243,34 @@ export function PartnerEventsScreen({
                 event={event}
                 href={`${config.eventsBaseHref}/${event.id}`}
                 editHref={config.createEventHref}
+                canEdit={data.dataStatus === 'fixture'}
               />
             ))}
           </section>
         )}
 
         <div className={styles['srOnly']} aria-live="polite">
-          {visibleEvents.length} events shown. {liveCount} live, {draftCount} drafts.
+          {visibleEvents.length} events shown. {liveCount} live, {draftCount} drafts,{' '}
+          {completedCount} completed.
         </div>
+        {data.dataStatus === 'api' &&
+        data.total !== undefined &&
+        data.total > data.events.length ? (
+          <nav aria-label="Event list pagination" className={styles['pagination']}>
+            <span>
+              Showing {data.events.length} of {data.total} events
+            </span>
+            {data.nextCursor ? (
+              <Link
+                href={`${pathname}?${new URLSearchParams({ cursor: data.nextCursor }).toString()}`}
+              >
+                Next page
+              </Link>
+            ) : (
+              <span>End of list</span>
+            )}
+          </nav>
+        ) : null}
       </div>
     </PageContainer>
   );

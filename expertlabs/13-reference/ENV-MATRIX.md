@@ -36,7 +36,7 @@
 | `RESEND_API_KEY` | string |  | optional (feature off) |  | Email falls back to a logging sender: no OTP, reset or invitation emails are delivered Email OTP delivery and at-rest OTP HMAC key. |
 | `EMAIL_OTP_SECRET` | string |  | optional | Required: at least 32 characters |  |
 | `PARTNER_DASHBOARD_URL` | url |  | optional |  | Invitation emails omit the accept link Public origin of the partner dashboard (e.g. https://partners.thec1rcle.com). Used to build absolute staff-invitation accept links in invitation emails. Optional: when absent, emails omit the link rather than linking nowh |
-| `CORS_ALLOWED_ORIGINS` | string |  | optional | If set: exact https origins, no wildcard; if unset in production: no cross-origin browser access at all | Comma-separated list of exact browser origins allowed to call the gateway cross-origin (CORS) and trusted by Better Auth, e.g. `https://c1rcle-v2-admin-console.vercel.app,https://partners.example.com`. Unset -> the local dev frontend origins outside production |
+| `CORS_ALLOWED_ORIGINS` | string |  | optional | If set: exact https origins, no wildcard; if unset in production: no cross-origin browser access at all | Comma-separated list of exact browser origins allowed to call the gateway cross-origin (CORS) and trusted by Better Auth, e.g. `https://app.example.com,https://partners.example.com`. Unset -> the local dev frontend origins outside production |
 | `ALLOW_MEMORY_STORAGE_IN_PRODUCTION` | string | `'false'` | optional |  | Escape hatch for CI's Docker smoke-boot only — it exercises the production config guards (NODE_ENV=production) without real Firestore credentials, by design (see ci.yml's "Smoke-boot the container" step). `render.yaml` never sets this, so the real deploy still |
 
 Other config facts: a missing or invalid variable makes the process **refuse to start** (`GatewayConfigError`, issues listed per variable). `BUILD_SHA` falls back to `RENDER_GIT_COMMIT`. The development defaults are `BETTER_AUTH_SECRET=dev-only-change-me` (rejected in production), the local frontend origins `http://localhost:3000`, `3001`, `3002`, and the default Firestore project id `c1rcle-staging`. Memory storage in production is refused unless the CI-only escape hatch is set.
@@ -75,3 +75,34 @@ Scanner app: `EXPO_PUBLIC_API_BASE_URL`, `EXPO_PUBLIC_ENV`, `EXPO_PUBLIC_ORGANIZ
 - `FIRESTORE_PROJECT_ID` default `c1rcle-staging` vs `.firebaserc` default `c1rcle-v2`.
 - `NODE_ENV` must be `production`, not `staging` (the schema accepts only development, test, production).
 - `MAGIC_TICKET_SECRET` and `ENCRYPTION_KEY` rotation effects are undocumented in the repo (rotating the first invalidates every QR, manifest and ticket key at once; losing the second makes newly written bank accounts unreadable, while legacy-key records stay readable).
+
+## Changes since this file was generated
+
+Verified 2026-11-18 against backend `staging` @ `3802889`. The gateway reads **54** variables in `apps/api-gateway/src/config/index.ts`; this file listed names as of 2026-10-24.
+
+**Variables read by the gateway now and not named above (20):**
+
+| Name | Schema (first line) |
+|---|---|
+| `BACKGROUND_WORKERS_ENABLED` | `z` |
+| `DEPLOYMENT_ENVIRONMENT` | `z.enum(['production', 'staging', 'local']).optional(),` |
+| `FIREBASE_AUTH_EMULATOR_HOST` | `z.string().min(1).optional(),` |
+| `GUEST_PORTAL_URL` | `z` |
+| `M5_COVER_ACCOUNTING_APPROVED` | `z` |
+| `M5_COVER_ACTIVATION_APPROVED` | `z` |
+| `M5_COVER_MERCHANT_APPROVED` | `z` |
+| `M5_COVER_SALES_ENABLED` | `z` |
+| `M5_ELIGIBILITY_RULES_ENABLED` | `z` |
+| `M5_OFFLINE_MANIFEST_DRAIN_COMPLETE` | `z` |
+| `M5_OFFLINE_TICKET_MANIFESTS_ENABLED` | `z` |
+| `M5_PRIVATE_ACCESS_ENABLED` | `z` |
+| `M5_TICKET_ADDONS_ENABLED` | `z` |
+| `M5_TICKET_TRANSFERS_ENABLED` | `z` |
+| `PROMOTER_AGREEMENT_ARTIFACT` | `z` |
+| `RENDER_EXTERNAL_URL` | `z.string().optional(),` |
+| `RENDER_GIT_BRANCH` | `z.string().optional(),` |
+| `RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST` | `z` |
+| `RESEND_FROM_EMAIL` | `z.string().trim().min(1).optional(),` |
+| `RESEND_NON_PROD_TEST_RECIPIENT` | `z.email().trim().toLowerCase().optional(),` |
+
+Names only; values live in the hosting dashboard. Relevant new behaviour: `PARTNER_DASHBOARD_URL` (optional) builds every absolute partner link (invitation accept, onboarding, promoter); when unset the gateway omits the link. `RATE_LIMIT_STORE` defaults to `memory`; set `redis` plus `REDIS_URL` for limits shared across instances.

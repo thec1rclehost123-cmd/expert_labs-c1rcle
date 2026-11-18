@@ -1,4 +1,7 @@
-import { markNotificationRead } from '../../domain/models/notification.js';
+import {
+  markNotificationRead,
+  resolveNotificationAction,
+} from '../../domain/models/notification.js';
 
 import type { EntityId } from '../../domain/identity.js';
 import type { Notification } from '../../domain/models/notification.js';
@@ -18,6 +21,12 @@ export class MemoryNotificationRepository implements NotificationRepository {
 
   async create(notification: Notification, _tx?: TxContext | null): Promise<void> {
     this.entries.set(notification.id, notification);
+  }
+
+  async createIfAbsent(notification: Notification): Promise<boolean> {
+    if (this.entries.has(notification.id)) return false;
+    this.entries.set(notification.id, notification);
+    return true;
   }
 
   async save(notification: Notification, _tx?: TxContext | null): Promise<void> {
@@ -63,6 +72,25 @@ export class MemoryNotificationRepository implements NotificationRepository {
       }
     }
     return flipped;
+  }
+
+  async resolveAction(
+    resourceType: 'promoter_connection' | 'partnership' | 'slot_request',
+    resourceId: EntityId,
+    nowIso: string,
+  ): Promise<number> {
+    const now = new Date(nowIso);
+    let resolved = 0;
+    for (const notification of this.entries.values()) {
+      if (
+        notification.action?.resourceType === resourceType &&
+        notification.action.resourceId === resourceId
+      ) {
+        this.entries.set(notification.id, resolveNotificationAction(notification, now));
+        resolved += 1;
+      }
+    }
+    return resolved;
   }
 
   async countUnread(recipientId: EntityId): Promise<number> {

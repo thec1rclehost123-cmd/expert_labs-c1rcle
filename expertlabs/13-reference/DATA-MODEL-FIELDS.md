@@ -2307,3 +2307,166 @@
 | `endTime` | `string` |  |
 | `status` | `Exclude<VenueSlotStatus, 'cancelled'>` |  |
 | `capacityFor` | `number \| null` |  |
+
+## Changes since this file was generated
+
+Verified 2026-11-18 against backend `staging` @ `3802889`. Compared field by field with `packages/core/src/domain/models/*.ts`.
+
+- **Types and interfaces added since (69):** `AccountCode`, `AdminAction`, `ApplicantKycDetails`, `ApplicantKycIdentity`, `BookingFeePolicy`, `ComplimentaryAllocation`, `ComplimentaryAllocationClaim`, `ComplimentaryCategory`, `CreateEventCoverAccountInput`, `CreateTicketAddonInput`, `CurrencyCode`, `EntitlementUnitKind`, `EventAddressDisclosure`, `EventCoverAccount`, `EventCoverAlcoholRule`, `EventCoverEntry`, `EventCoverEntryType`, `EventCoverPolicyAcceptance`, `EventCoverPolicyProposal`, `EventCoverPolicyTerms`, `EventCoverReconciliation`, `EventCoverRedemptionChallenge`, `EventCoverRedemptionChallengeStatus`, `EventCoverRefundPolicy`, `EventCoverStatus`, `EventDraft`, `EventEntryRules`, `EventMaterialChangeResponse`, `EventMedia`, `EventRefundPolicy`, `EventVisibilityMode`, `ExternalEventLocation`, `FollowTargetType`, `FulfilmentCompletionInput`, `GuestOnboardingPatch`, `GuestSocialPrivacy`, `NotificationType`, `OrderEventCancellation`, `OrderReceiptFacts`, `OriginalPurchaseRefundSnapshot`, `PromoterAgreementAcceptance`, `PromoterAgreementArtifact`, `PromoterAgreementStatus`, `RefundCause`, `RefundComponents`, `RefundIntakeInput`, `RefundedTicketClaim`, `SaleAllocationSnapshot`, `ScanLedgerStatus`, `SettlementReleaseSchedule`, `SocialEventSummary`, `SocialGuestIdentity`, `TabVisibility`, `TicketAccessCode`, `TicketAccessCodeStatus`, `TicketAccessGrant`, `TicketAccessScope`, `TicketAddon`, `TicketAddonEntitlement`, `TicketAddonKind`, `TicketAddonSelection`, `TicketAddonStatus`, `TicketAdmissionMode`, `TicketTierAccessMode`, `TicketTransfer`, `TicketTransferStatus`, `TicketUpgradeSnapshot`, `WaitlistEntry`, `WaitlistStatus`
+- **Removed since (0):** none
+- **Interfaces whose fields changed (77):**
+  - `AccountingPolicyConfig`: added `releaseSchedule`
+  - `AccountingPolicySnapshot`: added `releaseSchedule`
+  - `AdminRefundRequest`: added `executionActor`, `intakeFingerprint`, `purchasePolicyVersion`, `refundCause`, `refundComponents`, `remedyForRefundRequestId`, `settlementAudit`, `sourceEventVersion`
+  - `AdmissionClaim`: added `scan`
+  - `BanUserInput`: added `now`, `reason`
+  - `BankAccountCreateInput`: added `now`
+  - `BindScannerDeviceInput`: added `now`
+  - `CalculatePricingInput`: added `currency`, `feePolicy`, `promo`
+  - `CartReservation`: added `attendee`, `providerOrderCreation`, `providerOrderId`, `saleAllocation`, `sequence`, `upgrade`
+  - `CommissionTerms`: added `tierRates`
+  - `CoverWalletCreateInput`: added `metadata`, `now`, `rules`
+  - `CoverWalletCreditInput`: added `now`
+  - `CoverWalletDebitInput`: added `now`
+  - `CoverWalletReconciliationCreateInput`: added `now`
+  - `CreateAdminRefundRequestInput`: added `intakeFingerprint`, `now`, `purchasePolicyVersion`, `refundCause`, `refundComponents`, `remedyForRefundRequestId`, `scope`, `sourceEventVersion`, `targetEntitlementIds`, `thresholds`, `ticketLines`
+  - `CreateCartReservationInput`: added `now`, `reservationTtlMs`
+  - `CreateEventInput`: added `addressDisclosure`, `capacity`, `compensation`, `description`, `endAt`, `entryRules`, `externalLocation`, `imageUrl`, `media`, `now`, `privateImageStoragePath`, `refundPolicy`, `summary`, `tags`, `visibilityMode`
+  - `CreateInvitationInput`: added `capabilities`, `now`, `ttlDays`
+  - `CreateJournalInput`: added `components`, `evidenceOnly`, `postedAt`, `reversalOfJournalId`
+  - `CreateNotificationInput`: added `action`, `data`, `dedupeKey`, `priority`
+  - `CreateOnboardingRequestInput`: added `now`
+  - `CreateOrderInput`: added `attribution`, `now`, `reservationTtlMs`, `userId`
+  - `CreateOrganizationInput`: added `capabilities`, `now`, `platformFeePercent`, `settings`
+  - `CreatePartnershipInput`: added `message`, `now`, `venueShareRate`
+  - `CreatePlatformAdminInput`: added `now`
+  - `CreatePromoCodeInput`: added `endsAt`, `maxPerUser`, `maxRedemptions`, `name`, `now`, `startsAt`, `tierIds`, `type`
+  - `CreatePromoterAssignmentInput`: added `eligibleTierIds`, `expiresAt`, `invitedBy`, `now`, `startsAt`, `status`
+  - `CreatePromoterConnectionInput`: added `message`, `now`
+  - `CreateProviderFinancialEventInput`: added `disputeId`, `providerEventId`, `providerOccurredAt`, `providerOrderId`, `refundId`, `replayOfEventId`
+  - `CreateReferralLinkInput`: added `assignmentId`, `assignmentVersion`, `attributionSignature`, `code`, `commercialPolicyVersion`, `commissionPolicyVersion`, `eligibleTierIds`, `eventTitle`, `label`, `now`, `random`, `termsSnapshot`, `vanityPrefix`, `vanitySlug`
+  - `CreateSafetyReportInput`: added `context`, `details`, `now`
+  - `CreateSupportTicketInput`: added `now`
+  - `CreateTablePackageInput`: added `minSpendPaise`, `now`
+  - `CreateTicketTierInput`: added `accessMode`, `accessType`, `admissionMode`, `audienceType`, `benefits`, `commissionEligible`, `coverAmountPaise`, `currency`, `description`, `doorPriceInPaise`, `entryType`, `guestCount`, `maxAge`, `maxPerOrder`, `maxPerUser`, `minAge`, `minPerOrder`, `now`, `priceInPaise`, `pricingPhases`, `salesEndAt`, `salesStartAt`, `tableConfig`
+  - `CreateVenueInput`: added `capacity`, `city`, `description`, `now`
+  - `Dispute`: added `journalId`, `resolutionIntent`
+  - `DisputeCreateInput`: added `journalId`, `ledgerEntryId`, `now`
+  - `DoorSaleCreateInput`: added `now`
+  - `EmailOtp`: added `userId`
+  - `Entitlement`: added `credentialVersion`, `currentHolderUserId`, `eligibility`, `fulfillmentRequired`, `pendingTransferId`, `refundLock`, `ticketAddons`, `unitKind`, `upgradeFromEntitlementId`, `upgradeRefundRequestId`, `upgradedToEntitlementId`
+  - `Event`: added `addressDisclosure`, `compensation`, `entryRules`, `externalLocation`, `lastMaterialChangeAt`, `media`, `postponement`, `privateImageStoragePath`, `refundPolicy`, `visibilityMode`
+  - `EventCodeCreateInput`: added `allowReuse`, `maxDevices`, `now`
+  - `FinancialComponentBreakdown`: added `eventCoverLiabilityPaise`, `refundedAdmissionPaise`, `refundedFeeTaxPaise`, `refundedOtherPaidPaise`, `refundedPaymentFeePaise`, `refundedPlatformFeePaise`
+  - `GuestProfile`: added `phoneNumber`, `phoneVerifiedAt`
+  - `InviteMemberInput`: added `capabilities`, `now`
+  - `IssueEntitlementsInput`: added `admitsPerUnit`, `now`, `unitKind`
+  - `OnboardingProfile`: added `area`, `bio`, `businessType`, `capacity`, `entityType`, `instagram`, `kyc`, `registrationNumber`, `website`
+  - `OnboardingRequest`: added `promoterAgreementAcceptances`
+  - `Order`: added `accountingPolicy`, `addOnSubtotalPaise`, `admissionSubtotalPaise`, `bookedAt`, `bookingReference`, `compensationRequired`, `coverSubtotalPaise`, `discountedAdmissionSubtotalPaise`, `eventCancellation`, `feePolicy`, `fulfillmentCompletedAt`, `fulfillmentState`, `receiptFacts`, `refundSnapshot`, `refundedTicketClaims`, `saleAllocation`
+  - `OrderAttribution`: added `attributedAt`, `commercialPolicyVersion`, `commissionPolicyVersion`, `eligibleTierIds`
+  - `OrderLine`: added `addOnSubtotalPaise`, `admissionMode`, `admissionSubtotalPaise`, `admissionUnitPricePaise`, `coverPolicy`, `coverSubtotalPaise`, `coverUnitPricePaise`, `discountedAdmissionSubtotalPaise`, `eligibility`, `guestCount`, `pricingPhaseId`, `ticketAddons`
+  - `OrganizationMember`: added `email`, `invitedBy`, `name`
+  - `PayoutCreateInput`: added `id`, `now`
+  - `PlatformSettings`: added `bookingFeePolicy`, `revision`
+  - `PostingSource`: added `assignmentId`, `commercialPolicyVersion`, `commissionPolicyVersion`
+  - `PricingBreakdown`: added `addOnSubtotalPaise`, `admissionSubtotalPaise`, `coverSubtotalPaise`, `discountFundingOwner`, `discountedAdmissionSubtotalPaise`, `feePolicy`
+  - `PricingLine`: added `addOnSubtotalPaise`, `admissionSubtotalPaise`, `admissionUnitPricePaise`, `baseAdmissionUnitPricePaise`, `coverEntitlementsPerUnit`, `coverPolicy`, `coverSubtotalPaise`, `coverUnitPricePaise`, `discountedAdmissionSubtotalPaise`, `pricingPhaseId`, `pricingPhaseName`, `ticketAddons`
+  - `PricingLineInput`: added `baseAdmissionUnitPricePaise`, `pricingPhaseId`, `pricingPhaseName`, `ticketAddons`
+  - `PromoterAssignment`: added `acceptedAt`, `eligibleTierIds`, `expiresAt`, `invitedAt`, `invitedBy`, `rejectedAt`, `respondedAt`, `respondedBy`, `revocationReason`, `revokedAt`, `revokedBy`, `startsAt`, `suspendedFromStatus`
+  - `ProposeActionInput`: added `now`, `payload`
+  - `ReferralLink`: added `commercialPolicyVersion`, `commissionPolicyVersion`, `eligibleTierIds`, `lastClickedAt`
+  - `ResolveActionInput`: added `now`, `reason`
+  - `ReviewOnboardingInput`: added `note`, `now`
+  - `ScanLedgerCreateInput`: added `denyMessage`, `denyReason`, `now`, `status`
+  - `ScannerSessionCreateInput`: added `now`
+  - `SlotRequest`: added `eventDraft`, `message`, `rejectionReason`, `slotEndTime`, `slotId`, `slotStartTime`, `timezone`
+  - `SocialNotification`: added `eventChange`, `eventChangeResponse`
+  - `SupportTicket`: added `refundReview`
+  - `TicketPricingPhase`: added `coverAmountPaise`
+  - `TicketTier`: added `accessMode`, `accessType`, `admissionMode`, `audienceType`, `benefits`, `commissionEligible`, `coverAmountPaise`, `doorPriceInPaise`, `guestCount`, `maxAge`, `maxPerUser`, `minAge`, `minPerOrder`, `pricingPhases`, `tableConfig`
+  - `UpdateMenuInput`: added `now`
+  - `UpsertGuestProfileInput`: added `now`
+  - `VenueAvailability`: added `pendingRequests`
+  - `VenueAvailabilitySlot`: added `notes`, `requestable`, `timezone`
+  - `VenueMenuItem`: added `description`
+  - `VenuePublicProfile`: added `coverUrl`, `genres`, `shortDescription`
+  - `VenueSlot`: added `notes`, `requestingHostId`, `slotRequestId`, `timezone`, `visibleToHostIds`
+
+### Definitions that matter for authorization
+
+- **type `OrganizationRole`** = 'owner' | 'admin' | 'manager' | 'door_supervisor' | 'gate_staff' | 'member'
+- **type `Capability`** = 'host' | 'venue' | 'promoter'
+- Role ladder (rank, high to low): `owner` 50, `admin` 40 (Ops lead), `manager` 30 (Venue manager), `door_supervisor` 20, `gate_staff` 10 (scans and sells), `member` 0 (legacy read-only). `assignableRoles(actor)` returns roles strictly below the actor's, never `owner`, and nothing for roles below `manager`.
+
+### Fields of newly added interfaces
+
+- type `AccountCode` = | 'provider_clearing' | 'cash_bank_clearing' | 'customer_refund_liability' | 'gst_tax_liability' | 'venue_payable' | 'host_payable' | 'promoter_payable' | 'partner_payable' | 'platform_fee_revenue' | 
+- type `AdminAction` = | 'EVENT_PAUSE' | 'EVENT_RESUME' | 'EVENT_FORCE_PAUSE' | 'TICKET_TRANSFER_FREEZE' | 'TICKET_TRANSFER_RELEASE' | 'ONBOARDING_APPROVE' | 'VENUE_SUSPEND' | 'VENUE_REINSTATE' | 'ORGANIZATION_SUSPEND' | 'O
+- `ApplicantKycDetails` (`domain/models/onboarding.ts`): `identity`, `business`, `signatory`
+- `ApplicantKycIdentity` (`domain/models/onboarding.ts`): `idType`, `idNumber`
+- `BookingFeePolicy` (`domain/models/booking-fee-policy.ts`): `version`, `label`, `payer`, `environment`, `platformFeeBasisPoints`, `paymentFeeBasisPoints`, `feeTaxBasisPoints`, `guestRefund`, `organizerRefund`
+- `ComplimentaryAllocation` (`domain/models/complimentary-allocation.ts`): `id`, `eventId`, `organizationId`, `tierId`, `category`, `reason`, `quota`, `claimedCount`, `status`, `expiresAt`, `createdBy`
+- `ComplimentaryAllocationClaim` (`domain/models/complimentary-allocation.ts`): `id`, `allocationId`, `eventId`, `organizationId`, `tierId`, `recipientUserId`, `holderName`, `status`, `orderId`, `issuedBy`, `issuedAt`, `revokedBy`, `revokedAt`, `revocationReason`
+- type `ComplimentaryCategory` = 'artist' | 'staff' | 'sponsor' | 'press' | 'influencer'
+- `CreateEventCoverAccountInput` (`domain/models/event-cover.ts`): `entitlementId`, `orderId`, `eventId`, `guestUserId`, `hostOrganizationId`, `venueOrganizationId`, `amountPaise`, `providerCaptureConfirmed`, `merchantApproved`, `policyVersion`, `refundPolicy`, `activationApproved`, `now`
+- `CreateTicketAddonInput` (`domain/models/ticket-addon.ts`): `id`, `eventId`, `organizationId`, `name`, `description`, `kind`, `priceInPaise`, `quantity`, `maxPerEntitlement`, `salesStartAt`, `salesEndAt`, `status`, `now`
+- type `CurrencyCode` = string
+- type `EntitlementUnitKind` = 'paid' | 'free_rsvp' | 'complimentary'
+- type `EventAddressDisclosure` = 'public' | 'after_grant' | 'hidden'
+- `EventCoverAccount` (`domain/models/event-cover.ts`): `id`, `entitlementId`, `orderId`, `eventId`, `guestUserId`, `hostOrganizationId`, `venueOrganizationId`, `currency`, `issuedPaise`, `remainingPaise`, `reservedPaise`, `redeemedPaise`, `refundedPaise`, `status`, `refundRequestId`, `refundPolicy`, `policyVersion`
+- type `EventCoverAlcoholRule` = 'exclude_alcohol' | 'age_restricted' | 'no_alcohol'
+- `EventCoverEntry` (`domain/models/event-cover.ts`): `id`, `accountId`, `entitlementId`, `orderId`, `eventId`, `venueOrganizationId`, `type`, `amountPaise`, `operationId`, `actorUserId`, `terminalId`, `receiptReference`, `policyVersion`, `reversesEntryId`, `reason`
+- type `EventCoverEntryType` = 'issuance' | 'reserve' | 'capture' | 'void' | 'refund' | 'reversal'
+- `EventCoverPolicyAcceptance` (`domain/models/event-cover.ts`): `id`, `proposalId`, `eventId`, `hostOrganizationId`, `venueOrganizationId`, `acceptedByUserId`, `proposalVersion`, `termsDigest`
+- `EventCoverPolicyProposal` (`domain/models/event-cover.ts`): `id`, `hostOrganizationId`, `venueOrganizationId`, `proposedByUserId`, `policyVersion`, `terms`, `termsDigest`
+- `EventCoverPolicyTerms` (`domain/models/event-cover.ts`): `eventId`, `venueOrganizationId`, `merchantOrganizationId`, `coverAmountPaise`, `minimumSpendPaise`, `redemptionOpensAt`, `redemptionClosesAt`, `eligibleCategories`, `excludedCategories`, `alcoholRule`, `partialRedemption`, `splitTender`, `refundPolicy`, `transferUnusedOnly`, `commissionBasis`, `unusedBalancePolicy`
+- `EventCoverReconciliation` (`domain/models/event-cover.ts`): `accountId`, `issuedPaise`, `expectedRemainingPaise`, `expectedReservedPaise`, `expectedRedeemedPaise`, `expectedRefundedPaise`, `actualRemainingPaise`, `actualReservedPaise`, `actualRedeemedPaise`, `actualRefundedPaise`, `entryCount`, `balanced`, `discrepancies`
+- `EventCoverRedemptionChallenge` (`domain/models/event-cover.ts`): `id`, `accountId`, `entitlementId`, `eventId`, `venueOrganizationId`, `guestUserId`, `initiatedByUserId`, `terminalId`, `amountPaise`, `grossSpendPaise`, `categories`, `containsAlcohol`, `receiptReference`, `status`, `expiresAt`, `confirmedAt`, `consumedAt`
+- type `EventCoverRedemptionChallengeStatus` = 'pending' | 'confirmed' | 'consumed' | 'expired'
+- type `EventCoverRefundPolicy` = 'unused_full_before_redemption' | 'saved_policy_review'
+- type `EventCoverStatus` = 'pending_activation' | 'active' | 'frozen' | 'closed' | 'refunded'
+- `EventDraft` (`domain/models/event-draft.ts`): `id`, `userId`, `organizationId`, `schemaVersion`, `data`, `updatedAt`
+- `EventEntryRules` (`domain/models/event.ts`): `doorsOpenAt`, `lastEntryAt`, `reentryAllowed`, `minimumAge`, `idRequired`, `accessibilityNotes`, `dressCode`, `alcoholPolicy`, `prohibitedItems`, `supportDetails`
+- type `EventMaterialChangeResponse` = 'accepted' | 'refund_requested'
+- `EventMedia` (`domain/models/event.ts`): `titleFont`, `youtubeUrl`, `gallery`, `spotlights`
+- `EventRefundPolicy` (`domain/models/event.ts`): `kind`, `cutoffAt`
+- type `EventVisibilityMode` = 'public' | 'unlisted' | 'code' | 'invited'
+- `ExternalEventLocation` (`domain/models/event.ts`): `name`, `address`, `city`, `region`, `postalCode`, `country`, `mapUrl`, `contact`, `review`
+- type `FollowTargetType` = (typeof FOLLOW_TARGET_TYPES)[number]
+- `FulfilmentCompletionInput` (`domain/models/fulfilment.ts`): `orderId`, `holdId`, `event`, `now`
+- `GuestOnboardingPatch` (`domain/models/guest-profile.ts`): `displayName`, `dateOfBirth`, `tastes`
+- `GuestSocialPrivacy` (`domain/models/guest-social.ts`): `profileVisible`, `showOnGuestlists`, `showUpcomingEvents`
+- type `NotificationType` = (typeof NOTIFICATION_TYPES)[number]
+- `OrderEventCancellation` (`domain/models/order.ts`): `eventVersion`, `eventTitle`, `reason`, `cancelledAt`
+- `OrderReceiptFacts` (`domain/models/fulfilment.ts`): `version`, `orderId`, `bookingReference`, `currency`, `subtotalPaise`, `discountPaise`, `discountedSubtotalPaise`, `admissionPaise`, `coverPaise`, `addOnPaise`, `platformFeePaise`, `paymentFeePaise`, `feeTaxPaise`, `grandTotalPaise`, `providerOrderId`, `providerPaymentId`, `paidAt`, `bookingFeePolicyVersion`, `accountingPolicyVersion`
+- `OriginalPurchaseRefundSnapshot` (`domain/models/purchase-refund-snapshot.ts`): `version`, `policyVersion`, `currency`, `tickets`
+- `PromoterAgreementAcceptance` (`domain/models/promoter-agreement.ts`): `version`, `artifactStatus`, `textSha256`, `acceptedBy`, `acceptedAt`
+- `PromoterAgreementArtifact` (`domain/models/promoter-agreement.ts`): `version`, `status`, `text`, `textSha256`
+- type `PromoterAgreementStatus` = 'test_fixture' | 'approved' | 'staging_only'
+- type `RefundCause` = 'guest_request' | 'organizer_cancel' | 'material_change' | 'fulfillment_failure'
+- `RefundComponents` (`domain/models/purchase-refund-snapshot.ts`): `admissionPaise`, `platformFeePaise`, `paymentFeePaise`, `feeTaxPaise`, `otherPaidPaise`
+- `RefundIntakeInput` (`domain/models/refund-intake.ts`): `request`, `expectedOrderVersion`, `expectedEventVersion`, `expectedEntitlementVersions`, `now`
+- `RefundedTicketClaim` (`domain/models/order.ts`): `refundRequestId`, `entitlementId`, `tierId`, `pricingPhaseId`
+- `SaleAllocationSnapshot` (`domain/models/sale-allocation.ts`): `version`, `grossPaise`, `platformPaise`, `hostPaise`, `venuePaise`, `promoterPaise`, `hostOrganizationId`, `venueOrganizationId`, `promoterOrganizationId`, `partnershipId`, `partnershipVersion`, `onboardingId`, `onboardingVersion`, `capturedAt`
+- type `ScanLedgerStatus` = | 'pending' | 'consumed' | 'denied' | 'cancelled' | 'revoked' | 'expired' | 'overridden'
+- type `SettlementReleaseSchedule` = 'event_end_24h_75_72h_100'
+- `SocialEventSummary` (`domain/models/guest-social.ts`): `id`, `slug`, `title`, `startAt`, `imageUrl`
+- `SocialGuestIdentity` (`domain/models/guest-social.ts`): `id`, `displayName`, `avatarUrl`, `interests`
+- type `TabVisibility` = Readonly<Record<string, boolean>>
+- `TicketAccessCode` (`domain/models/ticket-access.ts`): `id`, `kind`, `scope`, `eventId`, `organizationId`, `tierIds`, `recipientEmailHash`, `createdBy`, `status`, `startsAt`, `expiresAt`, `maxRedemptions`, `redemptionCount`, `revokedAt`, `revokedBy`, `revokedReason`
+- type `TicketAccessCodeStatus` = 'active' | 'revoked'
+- `TicketAccessGrant` (`domain/models/ticket-access.ts`): `id`, `codeId`, `scope`, `eventId`, `organizationId`, `userId`, `tierIds`, `expiresAt`
+- type `TicketAccessScope` = 'tiers' | 'event'
+- `TicketAddon` (`domain/models/ticket-addon.ts`): `id`, `eventId`, `organizationId`, `name`, `description`, `kind`, `currency`, `priceInPaise`, `quantity`, `maxPerEntitlement`, `salesStartAt`, `salesEndAt`, `status`
+- `TicketAddonEntitlement` (`domain/models/ticket-addon.ts`): `id`, `addonId`, `name`, `kind`, `unitPricePaise`, `status`, `createdAt`, `redeemedAt`
+- type `TicketAddonKind` = (typeof TICKET_ADDON_KINDS)[number]
+- `TicketAddonSelection` (`domain/models/ticket-addon.ts`): `addonId`, `name`, `kind`, `unitPricePaise`, `quantityPerEntitlement`
+- type `TicketAddonStatus` = 'active' | 'paused'
+- type `TicketAdmissionMode` = 'bundle' | 'per_person'
+- type `TicketTierAccessMode` = 'public' | 'code' | 'invited'
+- `TicketTransfer` (`domain/models/ticket-transfer.ts`): `id`, `entitlementId`, `eventId`, `senderUserId`, `recipientUserId`, `recipientEmailHash`, `recipientEmail`, `status`, `expiresAt`, `acceptedAt`, `resolvedAt`
+- type `TicketTransferStatus` = 'pending' | 'accepted' | 'declined' | 'cancelled' | 'expired' | 'frozen'
+- `TicketUpgradeSnapshot` (`domain/models/cart-reservation.ts`): `sourceEntitlementId`, `sourceEntitlementVersion`, `sourceOrderId`, `sourceTierId`, `targetTierId`, `priorAdmissionPaidPaise`, `replacementAdmissionPaise`, `incrementalAdmissionPaise`
+- `WaitlistEntry` (`domain/models/waitlist-entry.ts`): `id`, `eventId`, `organizationId`, `tierId`, `userId`, `accessGrantId`, `eligibilityAttested`, `eligibilityAttestedAt`, `sequence`, `status`, `offerReservationId`, `offeredAt`, `offerExpiresAt`, `resolvedAt`
+- type `WaitlistStatus` = 'waiting' | 'offered' | 'accepted' | 'expired' | 'cancelled'

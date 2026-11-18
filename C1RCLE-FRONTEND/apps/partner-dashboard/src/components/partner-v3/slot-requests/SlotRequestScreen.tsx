@@ -2,12 +2,13 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { BackIcon, RefreshIcon } from '@c1rcle/icons';
 
 import { Button } from '@/components/partner-v3/Button';
 import { PageContainer } from '@/components/partner-v3/PagePrimitives';
+import { PartnerDashboardSkeleton } from '@/components/partner-v3/PartnerDashboardSkeleton';
 import {
   applySlotRequestAction,
   loadSlotRequestsData,
@@ -73,10 +74,17 @@ export function SlotRequestScreen({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [busyRequestId, setBusyRequestId] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<SlotRequestActionKind | null>(null);
   const [actionError, setActionError] = useState<{
     readonly id: string;
     readonly message: string;
   } | null>(null);
+  const [actionNotice, setActionNotice] = useState<{
+    readonly id: string;
+    readonly message: string;
+  } | null>(null);
+  const [venueLinkState, setVenueLinkState] = useState<'idle' | 'copied' | 'unavailable'>('idle');
+  const actionLockRef = useRef<string | null>(null);
 
   // The initial read runs directly inside the effect with `.then`/`.finally`
   // callbacks — no synchronous setState in the effect body.
@@ -153,29 +161,125 @@ export function SlotRequestScreen({
   };
 
   const runAction = useCallback(
-    async (slotRequestId: string, kind: SlotRequestActionKind) => {
+    async (slotRequestId: string, kind: SlotRequestActionKind, reason?: string) => {
+      if (actionLockRef.current !== null) return;
+      actionLockRef.current = slotRequestId;
+      const actionStartedAt = performance.now();
       setBusyRequestId(slotRequestId);
+      setBusyAction(kind);
       setActionError(null);
+      setActionNotice({
+        id: slotRequestId,
+        message:
+          kind === 'accept'
+            ? 'Accepting and publishing the approved event…'
+            : kind === 'reject'
+              ? 'Declining request…'
+              : 'Cancelling request…',
+      });
       try {
-        await applySlotRequestAction(slotRequestId, kind);
-        refresh();
+        await applySlotRequestAction(slotRequestId, kind, reason);
+        const authoritative = await loadSlotRequestsData(direction);
+        setData(authoritative);
+        const reconciled = authoritative.requests.find((item) => item.id === slotRequestId);
+        const expectedStatus =
+          kind === 'accept' ? 'approved' : kind === 'reject' ? 'rejected' : 'cancelled';
+        const acceptedEventReady =
+          kind !== 'accept' ||
+          !reconciled?.hasEventDraft ||
+          (reconciled.eventId !== undefined && reconciled.linkedEventStatus === 'published');
+        if (reconciled?.status !== expectedStatus || !acceptedEventReady) {
+          setActionError({
+            id: slotRequestId,
+            message:
+              'The command returned, but the latest request and event status do not confirm completion. Refresh before trying again.',
+          });
+          setActionNotice({
+            id: slotRequestId,
+            message: `Status reconciled in ${((performance.now() - actionStartedAt) / 1000).toFixed(1)}s.`,
+          });
+          return;
+        }
+        setActionNotice({
+          id: slotRequestId,
+          message: `${
+            kind === 'accept'
+              ? 'Request accepted and the published event is confirmed.'
+              : kind === 'reject'
+                ? 'Request declined with a reason.'
+                : 'Request cancelled.'
+          } Reconciled in ${((performance.now() - actionStartedAt) / 1000).toFixed(1)}s.`,
+        });
       } catch (error) {
-        setActionError({ id: slotRequestId, message: errorMessage(error) });
+        const message = errorMessage(error);
+        if (message === 'The venue service did not respond in time.') {
+          try {
+            const latest = await loadSlotRequestsData(direction);
+            setData(latest);
+            const request = latest.requests.find((item) => item.id === slotRequestId);
+            const expectedStatus =
+              kind === 'accept' ? 'approved' : kind === 'reject' ? 'rejected' : 'cancelled';
+            const acceptedEventReady =
+              kind !== 'accept' ||
+              !request?.hasEventDraft ||
+              (request.eventId !== undefined && request.linkedEventStatus === 'published');
+            if (request?.status === expectedStatus && acceptedEventReady) {
+              setActionError(null);
+              setActionNotice({
+                id: slotRequestId,
+                message: `${kind === 'accept' ? 'Acceptance and publication confirmed' : kind === 'reject' ? 'Decline confirmed' : 'Cancellation confirmed'} after ${((performance.now() - actionStartedAt) / 1000).toFixed(1)}s.`,
+              });
+              return;
+            }
+            setActionNotice({
+              id: slotRequestId,
+              message: `Latest status checked in ${((performance.now() - actionStartedAt) / 1000).toFixed(1)}s.`,
+            });
+            if (
+              request?.status === 'approved' &&
+              request.hasEventDraft &&
+              request.linkedEventStatus !== 'published'
+            ) {
+              setActionError({
+                id: slotRequestId,
+                message:
+                  'The request was accepted, but event publishing is incomplete. Use Retry publish to continue.',
+              });
+            } else {
+              setActionError({
+                id: slotRequestId,
+                message:
+                  'The Venue service took longer than expected. The request status has been refreshed; retry only if it is still pending.',
+              });
+            }
+          } catch {
+            setActionError({
+              id: slotRequestId,
+              message:
+                'The Venue service took longer than expected, and the latest request status could not be checked. Refresh before retrying.',
+            });
+          }
+        } else {
+          setActionError({ id: slotRequestId, message });
+        }
       } finally {
+        actionLockRef.current = null;
         setBusyRequestId(null);
+        setBusyAction(null);
       }
     },
-    [refresh],
+    [direction],
   );
 
   const handleAction = useCallback(
-    (id: string, kind: SlotRequestActionKind) => {
-      void runAction(id, kind);
+    (id: string, kind: SlotRequestActionKind, reason?: string) => {
+      void runAction(id, kind, reason);
     },
     [runAction],
   );
 
   const accent = data?.accent ?? (isIncoming ? 'orange' : 'lavender');
+  const venueShareUrl = data?.venueShareUrl;
 
   return (
     <PageContainer>
@@ -203,6 +307,11 @@ export function SlotRequestScreen({
             Refresh
           </Button>
         </div>
+        {actionNotice && !selectedRequest ? (
+          <p className={styles['actionNotice']} role="status" aria-live="polite">
+            {actionNotice.message}
+          </p>
+        ) : null}
         <header className={styles['pageHeader']}>
           <div>
             <span className={styles['eyebrow']}>Requests</span>
@@ -214,7 +323,13 @@ export function SlotRequestScreen({
             </p>
           </div>
         </header>
-        <SlotRequestSummary counts={counts} />
+        {data ? (
+          <SlotRequestSummary counts={counts} />
+        ) : (
+          <p role="status" aria-live="polite">
+            {isLoading ? 'Loading request counts…' : 'Request counts unavailable.'}
+          </p>
+        )}
         <nav className={styles['requestTabs']} aria-label="Slot request views">
           <button
             type="button"
@@ -223,7 +338,7 @@ export function SlotRequestScreen({
               selectView('pending');
             }}
           >
-            Pending <span>{counts.pending}</span>
+            Pending {data ? <span>{counts.pending}</span> : null}
           </button>
           <button
             type="button"
@@ -232,7 +347,7 @@ export function SlotRequestScreen({
               selectView('all');
             }}
           >
-            All Requests <span>{data?.requests.length ?? 0}</span>
+            All Requests {data ? <span>{data.requests.length}</span> : null}
           </button>
         </nav>
         {loadError !== null && data === null ? (
@@ -253,13 +368,7 @@ export function SlotRequestScreen({
             </Button>
           </section>
         ) : isLoading && data === null ? (
-          <section className={styles['emptyState']} aria-busy="true">
-            <span className={styles['emptyMark']} aria-hidden="true">
-              —
-            </span>
-            <h2>Loading slot requests</h2>
-            <p>Fetching live requests…</p>
-          </section>
+          <PartnerDashboardSkeleton label="Loading slot requests" eventContent />
         ) : visibleRequests.length ? (
           <section
             className={styles['requestGrid']}
@@ -270,6 +379,7 @@ export function SlotRequestScreen({
                 key={request.id}
                 request={request}
                 busy={busyRequestId === request.id}
+                busyAction={busyRequestId === request.id ? busyAction : null}
                 actionError={actionError?.id === request.id ? actionError.message : null}
                 onOpen={() => {
                   openRequest(request);
@@ -290,14 +400,37 @@ export function SlotRequestScreen({
                 : 'Slot requests you send to venues will show up here.'}
             </p>
             {isIncoming ? (
-              <Button
-                type="button"
-                variant="secondary"
-                disabled
-                title="Sharing a venue link requires a connected venue profile"
-              >
-                Share your venue link
-              </Button>
+              venueShareUrl ? (
+                <>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={() => {
+                      void (async () => {
+                        try {
+                          await navigator.clipboard.writeText(venueShareUrl);
+                          setVenueLinkState('copied');
+                        } catch {
+                          setVenueLinkState('unavailable');
+                        }
+                      })();
+                    }}
+                  >
+                    Share your venue link
+                  </Button>
+                  {venueLinkState === 'copied' ? <p role="status">Venue link copied.</p> : null}
+                  {venueLinkState === 'unavailable' ? (
+                    <p role="status">
+                      Copy unavailable. Use this link: <a href={venueShareUrl}>{venueShareUrl}</a>
+                    </p>
+                  ) : null}
+                </>
+              ) : (
+                <p>
+                  Your public Venue profile link will appear here after your Venue profile is set
+                  up.
+                </p>
+              )
             ) : (
               <Link
                 className={styles['emptyLink']}
@@ -309,17 +442,31 @@ export function SlotRequestScreen({
           </section>
         )}
         {selectedRequest ? (
-          <SlotRequestReview
-            request={selectedRequest}
-            panel={initialPanel}
-            previewMode={initialPreviewMode}
-            onPanelChange={selectPanel}
-            onPreviewModeChange={selectPreview}
-            onClose={closeReview}
-            busy={busyRequestId === selectedRequest.id}
-            actionError={actionError?.id === selectedRequest.id ? actionError.message : null}
-            onAction={handleAction}
-          />
+          <>
+            {busyRequestId === selectedRequest.id ? (
+              <p className={styles['actionNotice']} role="status" aria-live="polite">
+                Updating request…
+              </p>
+            ) : null}
+            {actionNotice?.id === selectedRequest.id ? (
+              <p className={styles['actionNotice']} role="status" aria-live="polite">
+                {actionNotice.message}
+              </p>
+            ) : null}
+            <SlotRequestReview
+              request={selectedRequest}
+              panel={initialPanel}
+              previewMode={initialPreviewMode}
+              onPanelChange={selectPanel}
+              onPreviewModeChange={selectPreview}
+              onClose={closeReview}
+              busy={busyRequestId === selectedRequest.id}
+              busyAction={busyRequestId === selectedRequest.id ? busyAction : null}
+              actionError={actionError?.id === selectedRequest.id ? actionError.message : null}
+              onAction={handleAction}
+              onBookingCancelled={refresh}
+            />
+          </>
         ) : null}
       </div>
     </PageContainer>

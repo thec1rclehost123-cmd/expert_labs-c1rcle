@@ -12,6 +12,7 @@ import { z } from 'zod';
 const LOCAL_ORIGINS = 'http://localhost:3000,http://localhost:3001,http://localhost:3002';
 const LOCAL_TRUSTED_PROXY_CIDRS = '127.0.0.1,::1';
 const DEVELOPMENT_BETTER_AUTH_URL = 'http://localhost:8080';
+const APPROVED_EMAIL_TEST_RECIPIENT = 'test-recipient@example.com';
 
 /** Parse a comma-separated environment setting without silently accepting blanks. */
 export function parseList(value: string): string[] {
@@ -123,17 +124,75 @@ const envSchema = z.object({
    * Release gate for payouts. While the funds flow (who may hold and distribute
    * ticket money) and the tax rules are awaiting written legal, provider and CA
    * approval, the endpoints that request, batch-run or release a payout are
-   * switched off. Unset: ON outside production (dev, tests), OFF in production.
+   * switched off by default in every environment.
    * Set `true` only once those approvals are on file. Freezing a payout is a
    * safety action and stays available either way; reads are unaffected.
    */
   PAYOUTS_ENABLED: z
     .enum(['true', 'false'])
-    .optional()
-    .transform((value) => (value === undefined ? undefined : value === 'true')),
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Private access activation stays off outside explicit test/config handoff. */
+  M5_PRIVATE_ACCESS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Restricted eligibility sales stay off until policy/legal approval and door controls are ready. */
+  M5_ELIGIBILITY_RULES_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Ticket transfer writes remain off unless explicitly enabled. */
+  M5_TICKET_TRANSFERS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Preserve the existing offline-manifest behavior unless explicitly disabled for drain. */
+  M5_OFFLINE_TICKET_MANIFESTS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  /** Operator attestation; must remain false until the documented drain window is proven. */
+  M5_OFFLINE_MANIFEST_DRAIN_COMPLETE: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Cover sales stay unavailable until policy, merchant and accounting gates are approved. */
+  M5_COVER_SALES_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Add-on sales stay off until their accounting, tax and commercial treatment is approved. */
+  M5_TICKET_ADDONS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Server-side approval of the participating merchant; never inferred from Venue acceptance. */
+  M5_COVER_MERCHANT_APPROVED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Explicitly activate newly issued balances only after business approval. */
+  M5_COVER_ACTIVATION_APPROVED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Reviewed cover account mapping is required before accepting any cover sale. */
+  M5_COVER_ACCOUNTING_APPROVED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
   FIRESTORE_PROJECT_ID: z.string().min(1).default('c1rcle-staging'),
+  /** Explicit emulator endpoints; used to enable non-production test fixtures. */
+  FIRESTORE_EMULATOR_HOST: z.string().min(1).optional(),
+  FIREBASE_AUTH_EMULATOR_HOST: z.string().min(1).optional(),
   /** B12: which repository adapter set `lib/v2-services.ts` wires up. */
   STORAGE_DRIVER: z.enum(['memory', 'firestore']).default('memory'),
+  /** Process-wide workers require an explicit configuration decision. */
+  BACKGROUND_WORKERS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
   /** Firestore service-account credentials (only read/used when STORAGE_DRIVER=firestore). */
   FIREBASE_CLIENT_EMAIL: z.string().optional(),
   FIREBASE_PRIVATE_KEY: z.string().optional(),
@@ -166,7 +225,39 @@ const envSchema = z.object({
   /** Optional scrypt salt for ENCRYPTION_KEY; changing it re-keys new writes. */
   ENCRYPTION_SALT: z.string().min(1).optional(),
   /** Email OTP delivery and at-rest OTP HMAC key. */
+  DEPLOYMENT_ENVIRONMENT: z.enum(['production', 'staging', 'local']).optional(),
+  RENDER_SERVICE_ID: z.string().optional(),
+  RENDER_GIT_BRANCH: z.string().optional(),
+  RENDER_EXTERNAL_URL: z.string().optional(),
+  PROMOTER_AGREEMENT_ARTIFACT: z
+    .string()
+    .transform((value, ctx) => {
+      try {
+        return z
+          .object({
+            version: z.string().trim().min(1).max(120),
+            status: z.enum(['approved', 'staging_only']),
+            text: z.string().min(1).max(10_000),
+            textSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+          })
+          .strict()
+          .parse(JSON.parse(value));
+      } catch {
+        ctx.addIssue({ code: 'custom', message: 'Invalid Promoter agreement artifact JSON' });
+        return z.NEVER;
+      }
+    })
+    .optional(),
   RESEND_API_KEY: z.string().min(1).optional(),
+  /** Verified Resend sender identity, e.g. `THE C1RCLE <hello@example.com>`. */
+  RESEND_FROM_EMAIL: z.string().trim().min(1).optional(),
+  /** Exact allowlisted recipient for intentional non-production provider acceptance. */
+  RESEND_NON_PROD_TEST_RECIPIENT: z.email().trim().toLowerCase().optional(),
+  /** Enforce that allowlist even when NODE_ENV is production-like (for staging). */
+  RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
   EMAIL_OTP_SECRET: z.string().min(1).optional(),
   /**
    * Public origin of the partner dashboard (e.g. https://partners.thec1rcle.com).
@@ -174,10 +265,18 @@ const envSchema = z.object({
    * Optional: when absent, emails omit the link rather than linking nowhere.
    */
   PARTNER_DASHBOARD_URL: z.url().optional(),
+  /** Guest deployment origin for exact-email ticket assignment/transfer invitation links. */
+  GUEST_PORTAL_URL: z
+    .url({ protocol: /^https?$/ })
+    .refine((value) => {
+      const url = new URL(value);
+      return !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash;
+    }, 'Use a Guest HTTP(S) origin without credentials or a path')
+    .optional(),
   /**
    * Comma-separated list of exact browser origins allowed to call the gateway
    * cross-origin (CORS) and trusted by Better Auth, e.g.
-   * `https://admin.example.com,https://partners.example.com`.
+   * `https://app.example.com,https://partners.example.com`.
    * Unset -> the local dev frontend origins outside production, and no
    * cross-origin browser access at all in production. See `allowedBrowserOrigins`.
    */
@@ -261,6 +360,68 @@ export function allowedBrowserOrigins(config: GatewayConfig): readonly string[] 
 
 /** Fail closed: STORAGE_DRIVER=firestore requires real credentials, never a silent memory fallback. */
 const validatedEnvSchema = envSchema.superRefine((value, ctx) => {
+  if (value.PROMOTER_AGREEMENT_ARTIFACT?.status === 'staging_only') {
+    const independentlyIdentifiedStaging =
+      value.DEPLOYMENT_ENVIRONMENT === 'staging' &&
+      value.NODE_ENV === 'production' &&
+      value.STORAGE_DRIVER === 'firestore' &&
+      value.FIRESTORE_PROJECT_ID === 'c1rcle-v2' &&
+      !value.FIRESTORE_EMULATOR_HOST &&
+      value.RENDER_SERVICE_ID === 'srv-REDACTED' &&
+      value.RENDER_GIT_BRANCH === 'staging' &&
+      value.RENDER_EXTERNAL_URL === 'https://api.example.com' &&
+      value.PUBLIC_API_URL === 'https://api.example.com' &&
+      value.BETTER_AUTH_URL === 'https://api.example.com';
+    if (!independentlyIdentifiedStaging)
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PROMOTER_AGREEMENT_ARTIFACT'],
+        message:
+          'Staging agreement requires the explicitly identified staging Render service and origins',
+      });
+  }
+
+  if (value.RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST && !value.RESEND_NON_PROD_TEST_RECIPIENT) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['RESEND_NON_PROD_TEST_RECIPIENT'],
+      message: 'The strict Resend test-recipient guard requires an exact allowlist recipient',
+    });
+  }
+  if (
+    value.RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST &&
+    value.RESEND_NON_PROD_TEST_RECIPIENT !== APPROVED_EMAIL_TEST_RECIPIENT
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['RESEND_NON_PROD_TEST_RECIPIENT'],
+      message: 'The strict Resend test-recipient guard allows only the approved founder address',
+    });
+  }
+
+  const providerFields = [
+    'RAZORPAY_KEY_ID',
+    'RAZORPAY_KEY_SECRET',
+    'RAZORPAY_WEBHOOK_SECRET',
+  ] as const;
+  if (providerFields.some((field) => value[field] !== undefined)) {
+    for (const field of providerFields) {
+      if (!value[field]?.trim()) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [field],
+          message: 'All three Razorpay provider fields must be configured together',
+        });
+      }
+    }
+    if (value.RAZORPAY_KEY_ID && !/^rzp_test_[A-Za-z0-9]+$/.test(value.RAZORPAY_KEY_ID)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['RAZORPAY_KEY_ID'],
+        message: 'M4 requires a Razorpay Test Mode key ID',
+      });
+    }
+  }
   const allowedOrigins = (() => {
     try {
       return validateOrigins(value.ALLOWED_ORIGINS, 'ALLOWED_ORIGINS');
@@ -298,6 +459,24 @@ const validatedEnvSchema = envSchema.superRefine((value, ctx) => {
   }
 
   if (value.STORAGE_DRIVER === 'firestore') {
+    const emulator = value.FIRESTORE_EMULATOR_HOST;
+    const loopback = emulator?.match(/^(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/);
+    const loopbackPort = Number(loopback?.[1]);
+    const localEmulator = Boolean(loopback && loopbackPort > 0 && loopbackPort <= 65535);
+    if (emulator !== undefined && !localEmulator) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIRESTORE_EMULATOR_HOST'],
+        message: 'M4 synthetic Firestore fixtures require an explicit loopback host and valid port',
+      });
+    }
+    if (!localEmulator && value.FIRESTORE_PROJECT_ID !== 'c1rcle-v2') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIRESTORE_PROJECT_ID'],
+        message: 'M4 real Firestore configuration must target c1rcle-v2',
+      });
+    }
     if (!value.FIREBASE_CLIENT_EMAIL) {
       ctx.addIssue({
         code: 'custom',
@@ -318,6 +497,26 @@ const validatedEnvSchema = envSchema.superRefine((value, ctx) => {
     const { errors } = parseOriginList(value.CORS_ALLOWED_ORIGINS, value.NODE_ENV === 'production');
     for (const message of errors) {
       ctx.addIssue({ code: 'custom', path: ['CORS_ALLOWED_ORIGINS'], message });
+    }
+  }
+
+  if (value.FIREBASE_AUTH_EMULATOR_HOST !== undefined) {
+    const emulator = value.FIREBASE_AUTH_EMULATOR_HOST;
+    const loopback = /^(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/.exec(emulator);
+    const port = Number(loopback?.[1]);
+    if (!loopback || port < 1 || port > 65535) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIREBASE_AUTH_EMULATOR_HOST'],
+        message: 'Firebase Auth Emulator must use an explicit loopback host and valid port',
+      });
+    }
+    if (value.NODE_ENV === 'production') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIREBASE_AUTH_EMULATOR_HOST'],
+        message: 'Firebase Auth Emulator is not allowed in production',
+      });
     }
   }
 

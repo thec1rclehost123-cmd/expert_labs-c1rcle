@@ -1,8 +1,9 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 import { TicketTierEditor } from './EventEditorParts';
+import { validateTicketNumbers } from './PartnerEventEditor';
 
 import type { EventEditorTicketTier } from '@/data/partner-data-source';
 
@@ -20,28 +21,40 @@ function renderEditor(
 }
 
 async function openTicketOptions(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(screen.getByText('Ticket options', { exact: true }));
+  await user.click(screen.getByRole('button', { name: 'Edit General' }));
+  await user.click(screen.getByText('Entry & pricing options', { exact: true }));
 }
 
 describe('TicketTierEditor ticket dimensions', () => {
+  beforeAll(() => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) {
+        this.open = true;
+      },
+    });
+  });
   it('edits access, audience, guest count, door price, benefits, and user limit', async () => {
     const user = userEvent.setup();
     renderEditor();
     await openTicketOptions(user);
 
     await user.selectOptions(screen.getByLabelText('Ticket type / access'), 'VIP');
+    expect(screen.queryByRole('option', { name: 'Student' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Member' })).not.toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText('Audience'), 'COUPLE');
-    await user.clear(screen.getByLabelText('Guests'));
-    await user.type(screen.getByLabelText('Guests'), '2');
+    expect(screen.getByLabelText('Guests')).toHaveValue(2);
+    expect(screen.getByLabelText('Guests')).toBeDisabled();
+    expect(screen.queryByLabelText('Admission issuance')).not.toBeInTheDocument();
     await user.type(screen.getByLabelText('Door price (₹)'), '2500');
-    await user.type(screen.getByLabelText('Benefits'), 'Entry, Drinks');
+    await user.type(screen.getByLabelText('Ticket description'), 'Entry, Drinks');
     await user.type(screen.getByLabelText('Max per user'), '2');
 
     expect(screen.getByLabelText('Ticket type / access')).toHaveValue('VIP');
     expect(screen.getByLabelText('Audience')).toHaveValue('COUPLE');
     expect(screen.getByLabelText('Guests')).toHaveValue(2);
     expect(screen.getByLabelText('Door price (₹)')).toHaveValue(2500);
-    expect(screen.getByLabelText('Benefits')).toHaveValue('Entry, Drinks');
+    expect(screen.getByLabelText('Ticket description')).toHaveValue('Entry, Drinks');
     expect(screen.getByLabelText('Max per user')).toHaveValue(2);
   });
 
@@ -67,5 +80,68 @@ describe('TicketTierEditor ticket dimensions', () => {
     expect(screen.getByLabelText('Phase 1 phase price')).toHaveValue(1000);
     expect(screen.getByLabelText('Phase 1 phase start date')).toBeInTheDocument();
     expect(screen.getByLabelText('Phase 1 phase end date')).toBeInTheDocument();
+  });
+
+  it('explains that Couple capacity counts tickets while each ticket admits two', async () => {
+    const user = userEvent.setup();
+    renderEditor();
+    await user.click(screen.getByRole('button', { name: 'Edit General' }));
+    await user.selectOptions(screen.getByLabelText('Ticket template'), 'Couple');
+
+    expect(
+      screen.getByText(
+        'Each Couple ticket admits 2 guests. Capacity counts Couple tickets, not individual attendees.',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('rejects negative ticket prices and non-positive or fractional capacity', () => {
+    expect(validateTicketNumbers(-50, 10, 'General')).toEqual(['Set a valid price for General.']);
+    expect(validateTicketNumbers(500, -10, 'General')).toEqual([
+      'Set a valid quantity for General.',
+    ]);
+    expect(validateTicketNumbers(500, 1.5, 'General')).toEqual([
+      'Set a valid quantity for General.',
+    ]);
+  });
+
+  it('removes one pricing phase and keeps the remaining phase editable', async () => {
+    const user = userEvent.setup();
+    renderEditor({
+      id: 'tier-1',
+      name: 'General',
+      price: 1000,
+      quantity: 100,
+      pricingPhases: [
+        {
+          id: 'phase-1',
+          name: 'Early Bird',
+          priceInPaise: 80000,
+          startDate: '12-11',
+          endDate: '17-11',
+          quantity: null,
+        },
+        {
+          id: 'phase-2',
+          name: 'Final Release',
+          priceInPaise: 120000,
+          startDate: '18-11',
+          endDate: '23-11',
+          quantity: null,
+        },
+      ],
+    });
+    await openTicketOptions(user);
+
+    await user.click(screen.getByRole('button', { name: 'Remove Early Bird phase' }));
+
+    expect(screen.queryByLabelText('Early Bird phase name')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Final Release phase name')).toHaveValue('Final Release');
+    expect(screen.getByLabelText('Final Release phase price')).toHaveValue(1200);
+
+    await user.click(screen.getByRole('button', { name: '+ Add pricing phase' }));
+
+    expect(screen.getByLabelText('Phase 3 phase name')).toHaveValue('Phase 3');
+    expect(screen.getByLabelText('Phase 3 phase price')).toHaveValue(1000);
   });
 });

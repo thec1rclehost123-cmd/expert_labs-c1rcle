@@ -16,7 +16,7 @@ const environment = {
   NGINX_TLS_MODE: 'external',
   NGINX_SERVER_NAME: 'circle-v2-edge-staging.invalid',
   NGINX_FORWARDED_PROTO: 'https',
-  FASTIFY_UPSTREAM: 'circle-v2-backend-staging.internal:8080',
+  FASTIFY_UPSTREAM: 'c1rcle-api-staging.internal:8080',
   FASTIFY_PORT: '8080',
   PORT: '18080',
   NGINX_READINESS_TOKEN: 'dry-run-readiness-token-fixture',
@@ -52,7 +52,7 @@ if (validated.values.redisUrl !== '')
   throw new Error('Redis must remain optional for initial staging');
 if (rendered.content.includes('${')) throw new Error('Rendered Nginx config has placeholders');
 if (!rendered.content.includes('listen 18080;')) throw new Error('Nginx did not consume PORT');
-if (!rendered.content.includes('server circle-v2-backend-staging.internal:8080;')) {
+if (!rendered.content.includes('server c1rcle-api-staging.internal:8080;')) {
   throw new Error('Nginx did not preserve the private Fastify upstream');
 }
 if (!rendered.content.includes('default https;')) {

@@ -1,7 +1,8 @@
-import { InvalidOperationError } from '../errors.js';
+import { ForbiddenError, InvalidOperationError } from '../errors.js';
 import { newVersionedEntity } from '../identity.js';
 
 import type { EntityId, VersionedEntity } from '../identity.js';
+import type { PlatformUser } from './platform-user.js';
 
 /**
  * ─── Organization aggregate ───────────────────────────────────────────────────
@@ -13,15 +14,94 @@ import type { EntityId, VersionedEntity } from '../identity.js';
 /** Business capability a member may hold within an org. */
 export type Capability = 'host' | 'venue' | 'promoter';
 
-/** Master role within an org. RBAC permission sets map from these. */
-export type OrganizationRole = 'owner' | 'admin' | 'manager' | 'member';
+/**
+ * Master role within an org. RBAC permission sets map from these.
+ *
+ * Ladder, highest first (what the Pune door teams call them in brackets):
+ *  - `owner`           the business owner (one per organization)
+ *  - `admin`           ops lead: runs the whole operation, finance included
+ *  - `manager`         venue manager: runs events and the venue's door team
+ *  - `door_supervisor` watches the door, overrides, mints door codes, binds devices
+ *  - `gate_staff`      the person at the gate who scans AND sells (one person does both)
+ *  - `member`          legacy read-only role, kept so existing memberships still resolve
+ */
+export type OrganizationRole =
+  'owner' | 'admin' | 'manager' | 'door_supervisor' | 'gate_staff' | 'member';
 
 export const ORGANIZATION_ROLES: readonly OrganizationRole[] = [
   'owner',
   'admin',
   'manager',
+  'door_supervisor',
+  'gate_staff',
   'member',
 ];
+
+/** Higher outranks lower. Authority over people only ever flows downward. */
+export const ROLE_RANK: Readonly<Record<OrganizationRole, number>> = {
+  owner: 50,
+  admin: 40,
+  manager: 30,
+  door_supervisor: 20,
+  gate_staff: 10,
+  member: 0,
+};
+
+/** Display names for emails and logs. The ids above stay stable on the wire. */
+export const ROLE_LABELS: Readonly<Record<OrganizationRole, string>> = {
+  owner: 'Owner',
+  admin: 'Ops lead',
+  manager: 'Venue manager',
+  door_supervisor: 'Door supervisor',
+  gate_staff: 'Gate staff',
+  member: 'Member',
+};
+
+/**
+ * Roles `actorRole` may hand out: strictly below its own rank, never `owner`
+ * (the owner is set at creation and transferred deliberately). Nobody grants
+ * their own level, so a manager can never mint another manager.
+ */
+export function assignableRoles(actorRole: OrganizationRole): OrganizationRole[] {
+  if (!canManagePeople(actorRole)) return [];
+  return ORGANIZATION_ROLES.filter(
+    (role) => role !== 'owner' && ROLE_RANK[role] < ROLE_RANK[actorRole],
+  );
+}
+
+/**
+ * Managing people (inviting, changing roles, removing, revoking, resending) is
+ * a venue-manager-and-above duty. A door supervisor outranks gate staff, but
+ * watching the door is not the same as running the team, so the rule is
+ * explicit here rather than left to the route's permission check alone.
+ */
+export function canManagePeople(actorRole: OrganizationRole): boolean {
+  return ROLE_RANK[actorRole] >= ROLE_RANK.manager;
+}
+
+/** May `actorRole` change, remove or revoke someone who holds `targetRole`? */
+export function canManageRole(actorRole: OrganizationRole, targetRole: OrganizationRole): boolean {
+  return canManagePeople(actorRole) && ROLE_RANK[actorRole] > ROLE_RANK[targetRole];
+}
+
+export function assertCanGrantRole(actorRole: OrganizationRole, role: OrganizationRole): void {
+  if (!assignableRoles(actorRole).includes(role)) {
+    throw new ForbiddenError(
+      `A ${ROLE_LABELS[actorRole]} cannot assign the ${ROLE_LABELS[role]} role`,
+    );
+  }
+}
+
+export function assertCanManageRole(
+  actorRole: OrganizationRole,
+  targetRole: OrganizationRole,
+): void {
+  if (!canManageRole(actorRole, targetRole)) {
+    throw new ForbiddenError(
+      `A ${ROLE_LABELS[actorRole]} cannot manage a ${ROLE_LABELS[targetRole]}`,
+    );
+  }
+}
 
 export interface OrganizationMember {
   userId: EntityId;
@@ -99,6 +179,27 @@ export interface OrganizationSettings {
   timezone?: string;
   /** ISO 4217 default currency for pricing; V1 proven default 'INR'. */
   defaultCurrency?: string;
+  /** Additive public Partner profile fields used by the dashboard and partner discovery. */
+  partnerProfile?: {
+    displayName?: string;
+    bio?: string;
+    photoUrl?: string | null;
+    coverUrl?: string | null;
+    city?: string;
+    genres?: string[];
+    instagram?: string;
+    website?: string;
+  };
+  /** Privacy controls for the public partner profile. */
+  partnerPrivacy?: { profileVisible?: boolean; showGuestList?: boolean };
+  /** In-app notification preferences. Email and WhatsApp are not exposed here. */
+  partnerNotifications?: {
+    eventUpdates?: boolean;
+    orderUpdates?: boolean;
+    requests?: boolean;
+    partnerships?: boolean;
+    payouts?: boolean;
+  };
 }
 
 export interface CreateOrganizationInput {
@@ -425,4 +526,24 @@ export function acceptInvitation(
     now: at,
   });
   return { organization, invitation: closed };
+}
+
+/** Must run against the current account in the membership-write transaction. */
+export function acceptInvitationForRecipient(
+  org: Organization,
+  invitation: OrganizationInvitation,
+  userId: EntityId,
+  account: (Pick<PlatformUser, 'id' | 'email'> & { emailVerified: unknown }) | null,
+  now: Date,
+): { organization: Organization; invitation: OrganizationInvitation } {
+  if (
+    !account ||
+    account.id !== userId ||
+    account.emailVerified !== true ||
+    typeof account.email !== 'string' ||
+    normalizeEmail(account.email) !== normalizeEmail(invitation.email)
+  ) {
+    throw new ForbiddenError('Invitation requires the intended verified recipient');
+  }
+  return acceptInvitation(org, invitation, userId, now);
 }

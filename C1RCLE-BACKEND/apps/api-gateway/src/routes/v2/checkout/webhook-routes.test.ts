@@ -4,8 +4,13 @@ import { MemoryPaymentProvider } from '@c1rcle/core/domain';
 import { describe, expect, it } from 'vitest';
 
 import { createV2Services } from '../../../lib/v2-services.js';
-import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
+import { seedApprovedPartnerOrganization } from '../../../test-utils/approved-partner-organization.js';
+import {
+  buildPartnerTestServer,
+  futureTestEventStartAt,
+} from '../../../test-utils/partner-test-server.js';
 import { publishEventForTest } from '../../../test-utils/publish-event.js';
+import { seedVerifiedCheckoutUsers } from '../../../test-utils/verified-test-users.js';
 import partnerEventCatalogRoutes from '../partner/event-catalog.js';
 import partnerEventRoutes from '../partner/events.js';
 import partnerOrganizationRoutes from '../partner/organizations.js';
@@ -59,13 +64,13 @@ const write = (org: string) => ({
 });
 
 async function seedHold(server: Server): Promise<{ holdId: string; grandTotalPaise: number }> {
-  const created = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: { 'x-organization-id': 'org_seed', 'idempotency-key': `seed-${++keySeq}` },
-    payload: { name: 'Skyline', slug: `skyline-${keySeq}` },
+  seedVerifiedCheckoutUsers(['user_1']);
+  ++keySeq;
+  const created = await seedApprovedPartnerOrganization({
+    name: 'Skyline',
+    slug: `skyline-${keySeq}`,
   });
-  const org: string = created.json().id;
+  const org: string = created.id;
   const venue = await server.inject({
     method: 'POST',
     url: `/organizations/${org}/venues`,
@@ -77,7 +82,7 @@ async function seedHold(server: Server): Promise<{ holdId: string; grandTotalPai
     method: 'POST',
     url: `/organizations/${org}/events`,
     headers: write(org),
-    payload: { title: 'Sky Night', venueId, startAt: '2026-09-01T18:00:00Z' },
+    payload: { title: 'Sky Night', venueId, startAt: futureTestEventStartAt() },
   });
   const eventId: string = event.json().id;
   await publishEventForTest(eventId);
@@ -117,23 +122,22 @@ async function seedHoldWithPartnership(
   server: Server,
   venueShareRate: number,
 ): Promise<{ holdId: string; grandTotalPaise: number; venueOwnerOrgId: string }> {
+  seedVerifiedCheckoutUsers(['user_1']);
   // Host org
-  const hostCreated = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: { 'x-organization-id': 'org_partner_host', 'idempotency-key': `seed-${++keySeq}` },
-    payload: { name: 'Skyline', slug: `skyline-p-${keySeq}` },
+  ++keySeq;
+  const hostCreated = await seedApprovedPartnerOrganization({
+    name: 'Skyline',
+    slug: `skyline-p-${keySeq}`,
   });
-  const hostOrg: string = hostCreated.json().id;
+  const hostOrg: string = hostCreated.id;
 
   // Venue-owner org
-  const venueOwnerCreated = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: { 'x-organization-id': 'org_partner_venue', 'idempotency-key': `seed-${++keySeq}` },
-    payload: { name: 'Venue Co', slug: `venue-co-${keySeq}` },
+  ++keySeq;
+  const venueOwnerCreated = await seedApprovedPartnerOrganization({
+    name: 'Venue Co',
+    slug: `venue-co-${keySeq}`,
   });
-  const venueOwnerOrg: string = venueOwnerCreated.json().id;
+  const venueOwnerOrg: string = venueOwnerCreated.id;
 
   // Venue owned by the venue-owner org
   const venueCreated = await server.inject({
@@ -166,7 +170,7 @@ async function seedHoldWithPartnership(
     method: 'POST',
     url: `/organizations/${hostOrg}/events`,
     headers: { ...write(hostOrg), 'idempotency-key': `seed-${++keySeq}` },
-    payload: { title: 'Sky Night', venueId, startAt: '2026-09-01T18:00:00Z' },
+    payload: { title: 'Sky Night', venueId, startAt: futureTestEventStartAt() },
   });
   const eventId: string = event.json().id;
   await publishEventForTest(eventId);
@@ -364,7 +368,9 @@ describe('POST /webhooks/payments/razorpay', () => {
     });
     expect(recheck.statusCode).toBe(200);
     expect(recheck.json().order.id).toBe(redirectResponse.json().order.id);
-    expect(recheck.json().order.version).toBe(1);
+    expect(recheck.json().order.version).toBe(2);
+    expect(recheck.json().order.fulfillmentState).toBe('complete');
+    expect(recheck.json().order.receiptFacts).toMatchObject({ providerPaymentId: paymentId });
     await server.close();
   });
 

@@ -1,9 +1,5 @@
 # CI/CD
 
-> **Handoff note:** this describes the original two-repository pipeline. The
-> workflow files are not included in this handoff. Use it as a reference for
-> the checks and deploy gates you want to recreate in your own CI.
-
 Three workflows, one required status check, and a deploy that CI gates,
 triggers, and verifies.
 
@@ -182,7 +178,7 @@ them means every new gate needs a settings change.
 | Secret | Needed? | Effect |
 | --- | --- | --- |
 | `RENDER_API_KEY` | **required** | Lets CI trigger the gated deploy and roll back a failed one |
-| `RENDER_STAGING_SERVICE_ID` | **required** | Render service id for `staging` deploys (`circle-v2-backend`) |
+| `RENDER_STAGING_SERVICE_ID` | **required** | Render service id for `staging` deploys (`c1rcle-api`) |
 | `RENDER_SERVICE_ID` | future | Render service id for `main`, once a `main`-tracking service exists |
 | `FRONTEND_REPO_TOKEN` | optional | Only if `C1RCLE-FRONTEND` is private; falls back to `GITHUB_TOKEN` |
 

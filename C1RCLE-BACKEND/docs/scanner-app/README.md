@@ -3,7 +3,7 @@ agent-metadata:
   doc: scanner-app/README
   kind: index
   department: door-operations
-  purpose: Repo map, flow map, credential model, structural-deviation audit of another contributor.s build, diagram inventory, agent-readability conventions, verification gates.
+  purpose: Repo map, flow map, credential model, structural-deviation audit of a teammate's build, diagram inventory, agent-readability conventions, verification gates.
   diagrams: [D1-repo-structure, D2-flow-map, D3-credential-model]
   agent-readability: Mermaid (flowchart/sequence/state/class) + tables; every doc H1->H2 skeleton; metadata block above.
 -->
@@ -11,7 +11,7 @@ agent-metadata:
 # C1RCLE V2 — Scanner App · Door Operations Documentation (Index)
 
 > **Living documentation** for the door-scanning system: the backend
-> surface (`apps/api-gateway/src/routes/v2/door/*`, built earlier,
+> surface (`apps/api-gateway/src/routes/v2/door/*`, built by a teammate,
 > branch `feat/scanner-app-backend`) and the frontend that will consume it
 > (an Expo workspace `C1RCLE-FRONTEND/apps/scanner-app` exists as of 2026-10-02;
 > its wiring status lives in the frontend repo, not here).
@@ -212,7 +212,7 @@ Every topic doc in this folder follows the same H1→H2 skeleton (agent-greppabl
 
 ---
 
-## 6. Structural-deviation audit — another contributor.s build vs. what a clean structure would look like
+## 6. Structural-deviation audit — a teammate's build vs. what a clean structure would look like
 
 This section exists specifically to answer "is the current structure as
 required" without guessing — every item below is a fact read directly from

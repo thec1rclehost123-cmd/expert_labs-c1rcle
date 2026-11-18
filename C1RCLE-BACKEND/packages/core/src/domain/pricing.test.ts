@@ -71,6 +71,12 @@ describe('applyPercent', () => {
     expect(applyPercent(1050, 5)).toBe(53);
   });
 
+  it('uses the exact decimal percentage at basis-point precision', () => {
+    expect(applyPercent(10_000, 7.25)).toBe(725);
+    expect(applyPercent(20, 2.5)).toBe(1);
+    expect(applyPercent(10_000, 0.29)).toBe(29);
+  });
+
   it('never returns a fraction', () => {
     for (const amount of [1, 7, 33, 99, 12_345, 999_999]) {
       for (const percent of [2.5, 5, 18]) {
@@ -81,6 +87,56 @@ describe('applyPercent', () => {
 });
 
 describe('calculatePricing', () => {
+  it('keeps cover separate from admission and discounts only the admission component', () => {
+    const result = calculatePricing({
+      lines: [{ tier: tier({ priceInPaise: 50_000, coverAmountPaise: 150_000 }), quantity: 1 }],
+      promo: promo({ discountValue: 20 }),
+    });
+
+    expect(result.lines[0]).toMatchObject({
+      unitPricePaise: 200_000,
+      admissionUnitPricePaise: 50_000,
+      coverUnitPricePaise: 150_000,
+      admissionSubtotalPaise: 50_000,
+      coverSubtotalPaise: 150_000,
+      discountedAdmissionSubtotalPaise: 40_000,
+      subtotalPaise: 200_000,
+    });
+    expect(result).toMatchObject({
+      admissionSubtotalPaise: 50_000,
+      coverSubtotalPaise: 150_000,
+      discountPaise: 10_000,
+      discountedAdmissionSubtotalPaise: 40_000,
+      discountedSubtotalPaise: 190_000,
+    });
+    expect(partnerGrossPaise(result)).toBe(40_000);
+  });
+
+  it('prices one cover balance for each separately issued attendee', () => {
+    const result = calculatePricing({
+      lines: [
+        {
+          tier: tier({
+            priceInPaise: 50_000,
+            coverAmountPaise: 1_500,
+            guestCount: 3,
+            admissionMode: 'per_person',
+          }),
+          quantity: 2,
+        },
+      ],
+    });
+
+    expect(result.lines[0]).toMatchObject({
+      unitPricePaise: 54_500,
+      coverUnitPricePaise: 1_500,
+      coverEntitlementsPerUnit: 3,
+      admissionSubtotalPaise: 100_000,
+      coverSubtotalPaise: 9_000,
+      subtotalPaise: 109_000,
+    });
+  });
+
   it('computes the v1 formula end to end', () => {
     const result = calculatePricing({ lines: [{ tier: tier(), quantity: 2 }] });
 

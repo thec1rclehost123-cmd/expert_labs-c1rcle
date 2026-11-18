@@ -1,3 +1,7 @@
+import { InvalidOperationError, VersionConflictError } from '../../domain/errors.js';
+import { committedTierQuantity } from '../../domain/models/tier-inventory.js';
+
+import { compareAndSet } from './compare-and-set.js';
 import { paginateQuery } from './pagination.js';
 
 import type { EntityId } from '../../domain/identity.js';
@@ -7,6 +11,7 @@ import type {
   TablePackage,
   PromoterAssignment,
 } from '../../domain/models/event-catalog.js';
+import type { TicketAddon } from '../../domain/models/ticket-addon.js';
 import type {
   EventCatalogRepository,
   Page,
@@ -16,6 +21,7 @@ import type {
 import type { DocumentData, Firestore, Query } from 'firebase-admin/firestore';
 
 const TIERS = 'v2_event_catalog_tiers';
+const TICKET_ADDONS = 'v2_event_ticket_addons';
 const PROMOS = 'v2_event_catalog_promos';
 const TABLES = 'v2_event_catalog_tables';
 const ASSIGNMENTS = 'v2_event_catalog_promoter_assignments';
@@ -32,12 +38,42 @@ function toAssignment(data: DocumentData): PromoterAssignment {
     ...(data as unknown as PromoterAssignment),
     endedAt: (data.endedAt ?? null) as string | null,
     suspendedAt: (data.suspendedAt ?? null) as string | null,
+    suspendedFromStatus:
+      (data.suspendedFromStatus as PromoterAssignment['suspendedFromStatus'] | undefined) ?? null,
+    invitedAt: (data.invitedAt as string | null | undefined) ?? null,
+    invitedBy: (data.invitedBy as string | null | undefined) ?? null,
+    respondedAt: (data.respondedAt as string | null | undefined) ?? null,
+    respondedBy: (data.respondedBy as string | null | undefined) ?? null,
+    acceptedAt: (data.acceptedAt as string | null | undefined) ?? null,
+    rejectedAt: (data.rejectedAt as string | null | undefined) ?? null,
+    revokedAt: (data.revokedAt as string | null | undefined) ?? null,
+    revokedBy: (data.revokedBy as string | null | undefined) ?? null,
+    revocationReason: (data.revocationReason as string | null | undefined) ?? null,
+    startsAt: (data.startsAt as string | null | undefined) ?? null,
+    expiresAt: (data.expiresAt as string | null | undefined) ?? null,
+    eligibleTierIds: (data.eligibleTierIds as string[] | null | undefined) ?? null,
   };
 }
 
 /** Firestore adapter for `EventCatalogRepository` (B12) — tiers/promos/tables/promoter-assignments. */
 export class FirestoreEventCatalogRepository implements EventCatalogRepository {
   constructor(private readonly db: Firestore) {}
+
+  // ── Ticket add-ons ────────────────────────────────────────────────────────
+  async getTicketAddonById(addonId: EntityId): Promise<TicketAddon | null> {
+    const snap = await this.db.collection(TICKET_ADDONS).doc(addonId).get();
+    return snap.exists ? (snap.data() as unknown as TicketAddon) : null;
+  }
+  async listTicketAddons(eventId: EntityId): Promise<TicketAddon[]> {
+    const snap = await this.db.collection(TICKET_ADDONS).where('eventId', '==', eventId).get();
+    return snap.docs.map((doc) => doc.data() as unknown as TicketAddon);
+  }
+  async saveTicketAddon(addon: TicketAddon, _tx?: TxContext | null): Promise<void> {
+    await this.db
+      .collection(TICKET_ADDONS)
+      .doc(addon.id)
+      .set({ ...addon });
+  }
 
   // ── Ticket tiers ──────────────────────────────────────────────────────────
   async getTierById(tierId: EntityId): Promise<TicketTier | null> {
@@ -82,6 +118,59 @@ export class FirestoreEventCatalogRepository implements EventCatalogRepository {
       delete data.commissionEligible;
     }
     await this.db.collection(TIERS).doc(tier.id).set(data);
+  }
+  async updateTier(tier: TicketTier, options?: { now: Date }): Promise<void> {
+    const data = { ...tier } as Record<string, unknown>;
+    if (tier.accessType === 'RSVP') {
+      delete data.priceInPaise;
+      delete data.pricingPhases;
+      delete data.doorPriceInPaise;
+      delete data.commissionEligible;
+    }
+    const ref = this.db.collection(TIERS).doc(tier.id);
+    const sequenceRef = this.db.collection('v2_hold_sequences').doc(tier.eventId);
+    await this.db.runTransaction(async (tx) => {
+      const [currentSnap, sequenceSnap, orders, holds] = await Promise.all([
+        tx.get(ref),
+        tx.get(sequenceRef),
+        tx.get(this.db.collection('v2_orders').where('eventId', '==', tier.eventId)),
+        tx.get(this.db.collection('v2_cart_reservations').where('eventId', '==', tier.eventId)),
+      ]);
+      const current = currentSnap.data();
+      if (!current || Number(current.version ?? 0) !== tier.version - 1) {
+        throw new VersionConflictError(tier.version - 1, Number(current?.version ?? 0));
+      }
+      if (tier.quantity !== current.quantity) {
+        const committed = committedTierQuantity(
+          tier.id,
+          orders.docs.map(
+            (doc) =>
+              doc.data() as { status: string; lines: { tierId: string; quantity: number }[] },
+          ),
+          holds.docs.map(
+            (doc) =>
+              doc.data() as {
+                status: string;
+                expiresAt: string;
+                lines: { tierId: string; quantity: number }[];
+              },
+          ),
+          options?.now ?? new Date(),
+        );
+        if (tier.quantity < committed)
+          throw new InvalidOperationError(
+            'Inventory cannot be reduced below sold and actively held tickets',
+          );
+      }
+      // Hold creation, RSVP acquisition and configuration edits share this
+      // serialization point; a concurrent commitment forces a fresh read.
+      tx.set(sequenceRef, {
+        ...sequenceSnap.data(),
+        eventId: tier.eventId,
+        last: Number(sequenceSnap.data()?.last ?? 0),
+      });
+      tx.set(ref, data);
+    });
   }
 
   // ── Promo codes ───────────────────────────────────────────────────────────
@@ -145,15 +234,29 @@ export class FirestoreEventCatalogRepository implements EventCatalogRepository {
     const snap = await this.db.collection(ASSIGNMENTS).where('promoterId', '==', promoterId).get();
     return snap.docs.map((doc) => toAssignment(doc.data()));
   }
+  async listExpiredAssignments(now: Date, limit: number): Promise<PromoterAssignment[]> {
+    const snap = await this.db
+      .collection(ASSIGNMENTS)
+      .where('status', 'in', ['invited', 'accepted', 'active'])
+      .where('expiresAt', '<=', now.toISOString())
+      .orderBy('expiresAt', 'asc')
+      .limit(Math.max(1, Math.min(limit, 100)))
+      .get();
+    return snap.docs
+      .map((doc) => toAssignment(doc.data()))
+      .filter(
+        (assignment) =>
+          assignment.expiresAt !== null && Number.isFinite(Date.parse(assignment.expiresAt)),
+      );
+  }
   async listAllAssignments(query: PaginationQuery): Promise<Page<PromoterAssignment>> {
     const base = this.db.collection(ASSIGNMENTS);
     return paginateQuery(base, query, toAssignment);
   }
   async saveAssignment(assignment: PromoterAssignment, _tx?: TxContext | null): Promise<void> {
-    await this.db
-      .collection(ASSIGNMENTS)
-      .doc(assignment.id)
-      .set({ ...assignment });
+    await compareAndSet(this.db, this.db.collection(ASSIGNMENTS), assignment, (value) => ({
+      ...value,
+    }));
   }
 }
 

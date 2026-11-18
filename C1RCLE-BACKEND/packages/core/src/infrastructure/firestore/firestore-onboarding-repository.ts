@@ -64,6 +64,29 @@ export class FirestoreOnboardingRepository implements OnboardingRepository {
     return doc ? toRequest(doc.data()) : null;
   }
 
+  async findForUserAndType(
+    userId: EntityId,
+    requestedType: OnboardingRequest['requestedType'],
+  ): Promise<OnboardingRequest | null> {
+    const open = await this.collection
+      .where('userId', '==', userId)
+      .where('requestedType', '==', requestedType)
+      .where('status', 'in', OPEN_STATUSES)
+      .limit(1)
+      .get();
+    const openDoc = open.docs[0];
+    if (openDoc) return toRequest(openDoc.data());
+
+    const latest = await this.collection
+      .where('userId', '==', userId)
+      .where('requestedType', '==', requestedType)
+      .orderBy('createdAt', 'desc')
+      .limit(1)
+      .get();
+    const latestDoc = latest.docs[0];
+    return latestDoc ? toRequest(latestDoc.data()) : null;
+  }
+
   async listForUser(userId: EntityId, query: PaginationQuery): Promise<Page<OnboardingRequest>> {
     const base = this.collection.where('userId', '==', userId).orderBy('createdAt', 'desc');
     return paginateQuery(base, query, toRequest);
@@ -216,6 +239,9 @@ function toRequest(data: DocumentData): OnboardingRequest {
     reviewedAt: (data.reviewedAt ?? null) as string | null,
     reviewNote: (data.reviewNote ?? null) as string | null,
     provisionedOrganizationId: (data.provisionedOrganizationId ?? null) as string | null,
+    promoterAgreementAcceptances: Array.isArray(data.promoterAgreementAcceptances)
+      ? data.promoterAgreementAcceptances
+      : [],
     version: data.version as number,
     createdAt: data.createdAt as string,
     updatedAt: data.updatedAt as string,
@@ -277,7 +303,7 @@ export class FirestoreAdminAuditRepository implements AdminAuditRepository {
     // overwrite the original record of what an operator did.
     await this.collection
       .doc(record.id)
-      .create({ ...record })
+      .create(Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined)))
       .catch((error: unknown) => {
         if (isAlreadyExists(error)) return;
         throw error;

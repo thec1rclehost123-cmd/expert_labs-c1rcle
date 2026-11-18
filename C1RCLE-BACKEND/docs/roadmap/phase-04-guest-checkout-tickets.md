@@ -249,7 +249,7 @@ Verified against git, not memory:
 memory + Firestore repos for Order/Entitlement/CartReservation/PromoRedemption,
 `packages/contracts` checkout/phase4 schemas.
 
-**Rebuild plan** — the original frontend sprint plan (not included in this handoff) §P1-A:
+**Rebuild plan** — `C1RCLE-FRONTEND/docs/superpowers/SPRINT-2026-08-31.md` §P1-A:
 PR1 public/discovery → PR2 checkout/payments/webhook → PR3 orders/tickets/wallet.
 Each route thin, each its own test, register in `route-manifest.ts`,
 `assertReconciles` on every pricing calc. Move `razorpay-adapter.ts` to

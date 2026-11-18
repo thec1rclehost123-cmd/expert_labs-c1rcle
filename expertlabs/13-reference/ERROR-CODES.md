@@ -27,3 +27,9 @@ The edge adds its own codes (`edge_request_too_large`, `edge_rate_limited`, `edg
 
 ## Consequences for integrators
 The machine-readable taxonomy is coarse: nuance lives in `message` and `details`. Specific cases to key off: `409` with `details.outcome = "refunded"` (payment auto-refunded), `403` with `details.passwordChangeRequired`, `409` idempotency conflicts versus version conflicts (distinguish by `details`), `429` with `Retry-After`. The frontend `describeApiError`/`describeAdminError` helpers show `fieldErrors` for status below 500 only; many console pages ignore the gateway message entirely.
+
+## Changes since this file was generated
+
+Verified 2026-11-18 against backend `staging` @ `3802889`. `ApiErrorCode` in `packages/contracts/src/contracts/shared.ts` has **13** values: `validation`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `event_not_on_sale`, `rate_limited`, `network`, `timeout`, `aborted`, `parse`, `unknown`, `server`. The file above documented 12.
+
+Additions in behaviour (same envelope): `403 forbidden` with `details.passwordChangeRequired` while a first-login temporary password is owed; `403 forbidden` with `details.temporaryPasswordExpired` once the 2-day temporary password has lapsed (login and every request); edge-level `429` with code `edge_rate_limited` and `413` `edge_request_too_large` produced by nginx before the gateway (distinct from the gateway's `rate_limited`).

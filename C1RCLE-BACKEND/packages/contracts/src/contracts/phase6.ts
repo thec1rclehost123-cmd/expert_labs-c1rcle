@@ -29,6 +29,7 @@ export type LedgerEntryDto = z.infer<typeof ledgerEntryDtoSchema>;
 export const ledgerEntryListResponseSchema = paginatedSchema(ledgerEntryDtoSchema);
 
 export const balanceSummaryResponseSchema = z.object({
+  payoutsEnabled: z.boolean().optional(),
   availablePaise: z.number().int(),
   pendingPaise: z.number().int().nonnegative(),
   reservedPaise: z.number().int().nonnegative(),
@@ -40,7 +41,11 @@ export const balanceSummaryResponseSchema = z.object({
     cancellationPaise: z.number().int().nonnegative(),
     chargebackPaise: z.number().int().nonnegative(),
     reconciliationPaise: z.number().int().nonnegative(),
+    refundPaise: z.number().int().nonnegative().optional(),
+    disputePaise: z.number().int().nonnegative().optional(),
+    providerUncertaintyPaise: z.number().int().nonnegative().optional(),
   }),
+  settlementUnavailableReason: z.string().nullable().optional(),
   readModel: z.enum(['legacy_ledger_v1', 'financial_journal_v2']),
 });
 export type BalanceSummaryResponse = z.infer<typeof balanceSummaryResponseSchema>;
@@ -75,6 +80,14 @@ export const financeOrderDtoSchema = z.object({
   buyerName: z.string(),
   /** Sum of `lines[].quantity` — what "3 tickets" means on the row. */
   ticketCount: z.number().int().nonnegative(),
+  /** Safe tier and quantity summary for partner order activity. */
+  ticketLines: z
+    .array(
+      z
+        .object({ tierName: z.string().min(1).max(200), quantity: z.number().int().positive() })
+        .strict(),
+    )
+    .optional(),
   currency: z.string().length(3),
   grandTotalPaise: z.number().int().nonnegative(),
   /** GST included in the grand total; defaults for older gateways. */
@@ -204,6 +217,7 @@ export const raiseDisputeRequestSchema = z
   .object({
     orderId: opaqueIdSchema,
     ledgerEntryId: opaqueIdSchema.optional(),
+    journalId: opaqueIdSchema.optional(),
     reason: z.string().min(1).max(2000),
     amountPaise: z.number().int().positive(),
   })
@@ -225,6 +239,7 @@ export const disputeResponseSchema = z.object({
   organizationId: opaqueIdSchema,
   orderId: opaqueIdSchema,
   ledgerEntryId: opaqueIdSchema.nullable(),
+  journalId: opaqueIdSchema.nullable().optional(),
   raisedBy: opaqueIdSchema,
   reason: z.string(),
   amountPaise: z.number().int().positive(),
@@ -256,8 +271,10 @@ export type AdminResolveDisputeInput = z.infer<typeof adminResolveDisputeSchema>
 export const requestRefundSchema = z
   .object({
     orderId: opaqueIdSchema,
-    amountPaise: z.number().int().positive(),
+    amountPaise: z.number().int().positive().optional(),
+    refundCause: z.enum(['guest_request', 'organizer_cancel', 'material_change']).optional(),
     reason: z.string().min(1).max(2000),
+    targetEntitlementIds: z.array(opaqueIdSchema).min(1).max(100).optional(),
     ticketLines: z
       .array(
         z.object({
@@ -279,6 +296,15 @@ export const rejectRefundRequestSchema = z
   .strict();
 export type RejectRefundRequestInput = z.infer<typeof rejectRefundRequestSchema>;
 
+/** Candidate id is only a hint; the server fetches and validates provider evidence. */
+export const reconcileRefundRequestSchema = z
+  .object({
+    providerRefundId: z.string().regex(/^rfnd_[A-Za-z0-9_]{1,59}$/),
+    reason: z.string().trim().min(1).max(2000),
+  })
+  .strict();
+export type ReconcileRefundRequestInput = z.infer<typeof reconcileRefundRequestSchema>;
+
 export const adminRefundApprovalDtoSchema = z.object({
   adminId: opaqueIdSchema,
   approvedAt: z.iso.datetime(),
@@ -296,9 +322,24 @@ export type AdminRefundRequestStatus = z.infer<typeof adminRefundRequestStatusSc
 
 export const adminRefundRequestDtoSchema = z.object({
   id: opaqueIdSchema,
+  remedyForRefundRequestId: opaqueIdSchema.optional(),
+  sourceEventVersion: z.number().int().positive().optional(),
   orderId: opaqueIdSchema,
   organizationId: opaqueIdSchema,
   amountPaise: z.number().int().positive(),
+  refundCause: z
+    .enum(['guest_request', 'organizer_cancel', 'material_change', 'fulfillment_failure'])
+    .optional(),
+  refundComponents: z
+    .object({
+      admissionPaise: z.number().int().nonnegative(),
+      platformFeePaise: z.number().int().nonnegative(),
+      paymentFeePaise: z.number().int().nonnegative(),
+      feeTaxPaise: z.number().int().nonnegative(),
+      otherPaidPaise: z.number().int().nonnegative(),
+    })
+    .optional(),
+  purchasePolicyVersion: z.string().min(1).optional(),
   requestedBy: opaqueIdSchema,
   reason: z.string(),
   scope: z.enum(['amount_only', 'ticket_lines']),
@@ -445,3 +486,13 @@ export type LeaderboardStatResponse = z.infer<typeof leaderboardStatResponseSche
 export const leaderboardTopResponseSchema = z.object({
   items: z.array(leaderboardStatResponseSchema),
 });
+
+export const guestRefundReviewRequestSchema = z
+  .object({ reason: z.string().trim().min(1).max(2000) })
+  .strict();
+export const guestRefundReviewDtoSchema = z.object({
+  id: opaqueIdSchema,
+  status: z.enum(['open', 'in_progress', 'waiting_on_customer', 'escalated', 'resolved', 'closed']),
+  requestedAt: z.iso.datetime(),
+});
+export type GuestRefundReviewDto = z.infer<typeof guestRefundReviewDtoSchema>;

@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest';
 
 import {
   eventDtoSchema,
+  createEventSchema,
+  updateEventSchema,
+  createSlotRequestSchema,
+  socialNotificationDtoSchema,
   guestProfileDtoSchema,
   idempotencyKeySchema,
   noContentSchema,
@@ -45,11 +49,34 @@ const VALID_USER = {
 };
 
 describe('client schemas — canonical fixtures', () => {
+  it('accepts material event-change notices in the guest notification inbox', () => {
+    expect(
+      socialNotificationDtoSchema.parse({
+        id: 'user__event.material_change__EMC-version-2',
+        type: 'event.material_change',
+        title: 'Event details changed',
+        body: 'Review the current details in your ticket wallet.',
+        link: '/tickets',
+        subjectId: 'EMC-version-2',
+        createdAt: '2026-10-28T15:00:00.000Z',
+        readAt: null,
+      }).type,
+    ).toBe('event.material_change');
+  });
+
   it('parses a user and a session', () => {
     expect(userSchema.parse(VALID_USER)).toMatchObject({ role: 'partner' });
     expect(sessionSchema.parse({ user: VALID_USER, expiresAt: 1_800_000_000_000 })).toMatchObject({
       expiresAt: 1_800_000_000_000,
     });
+  });
+
+  it('preserves email verification state and rejects non-boolean claims', () => {
+    for (const emailVerified of [true, false]) {
+      expect(userSchema.parse({ ...VALID_USER, emailVerified }).emailVerified).toBe(emailVerified);
+    }
+    expect(userSchema.safeParse({ ...VALID_USER, emailVerified: 'true' }).success).toBe(false);
+    expect(userSchema.parse(VALID_USER).emailVerified).toBeUndefined();
   });
 
   it('rejects corrupt fixtures', () => {
@@ -149,7 +176,43 @@ describe('client schemas — canonical fixtures', () => {
     expect(eventDtoSchema.safeParse({ status: 'live' }).success).toBe(false);
   });
 
-  it('parses a guest profile upsert and dto, rejecting short tastes', () => {
+  it('allows only HTTPS event posters on public hosts for create, update, and Host requests', () => {
+    const publicPoster = 'https://storage.googleapis.com/c1rcle-test/posters/event.webp';
+    const localPoster = 'http://localhost:3001/partner-v3/venue/poster.jpg';
+    const validEvent = {
+      venueId: 'ven_1',
+      title: 'Sky Night',
+      startAt: '2026-09-01T18:00:00.000Z',
+    };
+
+    expect(createEventSchema.safeParse({ ...validEvent, imageUrl: publicPoster }).success).toBe(
+      true,
+    );
+    expect(createEventSchema.safeParse({ ...validEvent, imageUrl: localPoster }).success).toBe(
+      false,
+    );
+    expect(
+      createEventSchema.safeParse({
+        ...validEvent,
+        imageUrl: 'https://192.168.1.12/poster.jpg',
+      }).success,
+    ).toBe(false);
+    expect(updateEventSchema.safeParse({ imageUrl: localPoster }).success).toBe(false);
+    expect(
+      createSlotRequestSchema.safeParse({
+        startTime: '2026-09-01T18:00:00.000Z',
+        endTime: '2026-09-01T22:00:00.000Z',
+        eventDraft: {
+          event: { ...validEvent, imageUrl: localPoster },
+          tiers: [],
+          promotions: [],
+          promoters: [],
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('parses a guest profile upsert and dto with the accepted one-interest minimum', () => {
     const body = {
       displayName: 'Aayush',
       dateOfBirth: '2000-01-01',
@@ -168,8 +231,16 @@ describe('client schemas — canonical fixtures', () => {
       }).userId,
     ).toBe('user_1');
     expect(upsertGuestProfileSchema.safeParse({ ...body, tastes: ['Rooftops'] }).success).toBe(
-      false,
+      true,
     );
+    expect(upsertGuestProfileSchema.safeParse({ ...body, tastes: [] }).success).toBe(false);
+    expect(upsertGuestProfileSchema.safeParse({ ...body, tastes: [' '] }).success).toBe(false);
+    expect(
+      upsertGuestProfileSchema.safeParse({
+        ...body,
+        tastes: Array.from({ length: 21 }, () => 'Rooftops'),
+      }).success,
+    ).toBe(false);
     expect(upsertGuestProfileSchema.safeParse({ ...body, extra: 1 }).success).toBe(false);
   });
 });

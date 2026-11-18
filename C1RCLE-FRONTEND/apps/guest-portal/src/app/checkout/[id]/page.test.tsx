@@ -1,9 +1,10 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiClientError } from '@c1rcle/api-client';
 
 import { CheckoutView } from '@/features/booking/components/CheckoutView';
+import { PrivateCheckoutBootstrap } from '@/features/booking/components/PrivateCheckoutBootstrap';
 import { bookingEventFixtures } from '@/features/booking/fixtures/booking.fixture';
 
 import CheckoutPage from './page';
@@ -20,6 +21,7 @@ vi.mock('next/navigation', async (importOriginal) => {
     notFound: () => {
       throw new Error('NEXT_NOT_FOUND');
     },
+    usePathname: () => '/checkout/neon-nights',
     useRouter: () => ({ push: mockPush }),
     useSearchParams: () => new URLSearchParams(),
   };
@@ -53,8 +55,13 @@ vi.mock('next/image', () => ({
     alt,
     preload: _preload,
     fill: _fill,
+    unoptimized: _unoptimized,
     ...props
-  }: React.ComponentProps<'img'> & { preload?: boolean; fill?: boolean }) => (
+  }: React.ComponentProps<'img'> & {
+    preload?: boolean;
+    fill?: boolean;
+    unoptimized?: boolean;
+  }) => (
     // eslint-disable-next-line @next/next/no-img-element
     <img alt={alt} {...props} />
   ),
@@ -66,7 +73,7 @@ describe('CheckoutView', () => {
     expect(bookingEventFixtures.every((event) => event.ticketTiers.length > 0)).toBe(true);
   });
 
-  it('supports the three-step checkout process', () => {
+  it('requires sign-in before reviewing a ticket selection', () => {
     const event = bookingEventFixtures[0];
     expect(event).toBeDefined();
     if (!event) return;
@@ -77,50 +84,36 @@ describe('CheckoutView', () => {
     const increaseBtn = screen.getByRole('button', { name: 'Increase Gallery Pass count' });
     expect(increaseBtn).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Continue to details →' }));
-    fireEvent.change(screen.getByLabelText('Full Name'), { target: { value: 'Guest User' } });
-    fireEvent.change(screen.getByLabelText('Email Address'), {
-      target: { value: 'user@test.com' },
-    });
-    const reviewButton = screen.getByRole('button', { name: 'Proceed to payment →' });
+    const reviewButton = screen.getByRole('button', { name: 'Review order →' });
     expect(reviewButton).toBeEnabled();
     fireEvent.click(reviewButton);
-
-    expect(screen.getByRole('link', { name: 'Complete Payment →' })).toHaveAttribute(
-      'href',
-      '/confirmation/preview-neon-nights',
-    );
+    expect(screen.getByRole('heading', { name: 'Sign in to continue' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue with Google' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue with Email' })).toBeInTheDocument();
   });
 
-  it('does not invent a fee or payable total before a server quote', () => {
+  it('does not show order pricing before sign-in', () => {
     const event = bookingEventFixtures[1];
     expect(event).toBeDefined();
     if (!event) return;
 
     render(<CheckoutView event={event} initialTierId="gallery-pass" />);
-    expect(screen.getByText('Fees')).toBeInTheDocument();
-    expect(screen.queryByText('Fees (estimate)')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Review order →' }));
+    expect(screen.getByRole('heading', { name: 'Sign in to continue' })).toBeInTheDocument();
+    expect(screen.queryByText('Fees and taxes')).not.toBeInTheDocument();
     expect(screen.queryByText('₹40')).not.toBeInTheDocument();
   });
 
-  it('keeps the paid preview path on its confirmation link', () => {
+  it('does not create a paid checkout before sign-in', () => {
     const event = bookingEventFixtures[0];
     expect(event).toBeDefined();
     if (!event) return;
 
     render(<CheckoutView event={event} initialTierId="gallery-pass" />);
-    fireEvent.click(screen.getByRole('button', { name: 'Continue to details →' }));
-    fireEvent.change(screen.getByLabelText('Full Name'), { target: { value: 'Guest User' } });
-    fireEvent.change(screen.getByLabelText('Email Address'), {
-      target: { value: 'user@test.com' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Proceed to payment →' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review order →' }));
 
+    expect(screen.getByRole('heading', { name: 'Sign in to continue' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Confirm RSVP/ })).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Complete Payment →' })).toHaveAttribute(
-      'href',
-      '/confirmation/preview-neon-nights',
-    );
     expect(mockPost).not.toHaveBeenCalled();
   });
 });
@@ -144,12 +137,7 @@ const FREE_EVENT: BookingEventFixture = {
 
 function reachRsvpStep() {
   render(<CheckoutView event={FREE_EVENT} />);
-  fireEvent.click(screen.getByRole('button', { name: 'Continue to details →' }));
-  fireEvent.change(screen.getByLabelText('Full Name'), { target: { value: 'Guest User' } });
-  fireEvent.change(screen.getByLabelText('Email Address'), {
-    target: { value: 'user@test.com' },
-  });
-  fireEvent.click(screen.getByRole('button', { name: 'Proceed to payment →' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Review order →' }));
 }
 
 describe('CheckoutView RSVP', () => {
@@ -158,59 +146,10 @@ describe('CheckoutView RSVP', () => {
     mockPush.mockClear();
   });
 
-  it('posts a real RSVP for free events and navigates to the confirmation', async () => {
-    mockPost.mockResolvedValue({ order: { id: 'RSVP-abc123' } });
+  it('requires sign-in before posting an RSVP', () => {
     reachRsvpStep();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm RSVP →' }));
-
-    await waitFor(() => {
-      expect(mockPost).toHaveBeenCalledWith({
-        path: '/api/rsvp',
-        body: { eventId: 'evt_rsvp_night', tierId: 'tier_rsvp_1' },
-        headers: {},
-        schema: expect.anything() as unknown,
-      });
-      expect(mockPush).toHaveBeenCalledWith('/confirmation/RSVP-abc123');
-    });
-  });
-
-  it('forwards the guest.c1rcle.csrf cookie as x-csrf-token header', async () => {
-    document.cookie = 'guest.c1rcle.csrf=test-csrf-token-123; path=/';
-    mockPost.mockResolvedValue({ order: { id: 'RSVP-csrf-test' } });
-    reachRsvpStep();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm RSVP →' }));
-
-    await waitFor(() => {
-      expect(mockPost).toHaveBeenCalledWith({
-        path: '/api/rsvp',
-        body: { eventId: 'evt_rsvp_night', tierId: 'tier_rsvp_1' },
-        headers: { 'x-csrf-token': 'test-csrf-token-123' },
-        schema: expect.anything() as unknown,
-      });
-    });
-    document.cookie = 'guest.c1rcle.csrf=; path=/; max-age=0';
-  });
-
-  it('shows the already-on-the-list state on a 409 duplicate', async () => {
-    mockPost.mockRejectedValue(
-      new ApiClientError({
-        code: 'conflict',
-        message: 'dup',
-        status: 409,
-        requestId: 'test-request' as never,
-        fieldErrors: {},
-      }),
-    );
-    reachRsvpStep();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm RSVP →' }));
-
-    await waitFor(() => {
-      expect(screen.getByText(/already on the list/)).toBeInTheDocument();
-    });
-    expect(mockPush).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: 'Sign in to continue' })).toBeInTheDocument();
+    expect(mockPost).not.toHaveBeenCalled();
   });
 });
 
@@ -226,6 +165,8 @@ const REAL_EVENT: EventDto = {
   startAt: '2026-09-18T19:30:00.000Z',
   endAt: null,
   status: 'published',
+  visibilityMode: 'public',
+  addressDisclosure: 'public',
   isPublic: true,
   tags: ['Music'],
   startingPricePaise: 99900,
@@ -284,11 +225,13 @@ describe('CheckoutPage', () => {
     mockCheckoutFeed();
     render(await CheckoutPage({ params: Promise.resolve({ id: 'real-night' }) }));
 
-    expect(screen.getByText('No tickets selected')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Continue to details →' })).toBeDisabled();
+    expect(
+      screen.getByText('Tickets are not available for this event right now.'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Review order →' })).toBeDisabled();
   });
 
-  it('falls back to the price-derived tier when the tiers read fails', async () => {
+  it('shows an explicit unavailable state when the authoritative tier read fails', async () => {
     mockGet.mockImplementation(({ path }: { path: string }) => {
       if (path === '/api/v2/public/events/real-night') {
         return Promise.resolve(REAL_EVENT);
@@ -300,7 +243,10 @@ describe('CheckoutPage', () => {
     });
     render(await CheckoutPage({ params: Promise.resolve({ id: 'real-night' }) }));
 
-    expect(screen.getByRole('heading', { name: 'General Admission' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { name: 'Checkout temporarily unavailable' }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'General Admission' })).not.toBeInTheDocument();
   });
 
   it('renders real tier ids from the public tiers listing', async () => {
@@ -329,21 +275,25 @@ describe('CheckoutPage', () => {
     });
     render(await CheckoutPage({ params: Promise.resolve({ id: 'real-night' }) }));
 
-    expect(screen.getByRole('heading', { name: 'RSVP Entry' })).toBeInTheDocument();
+    expect(screen.getByText('RSVP Entry')).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'General Admission' })).not.toBeInTheDocument();
   });
 
-  it('keeps fixture slugs on their exact legacy behavior', async () => {
-    render(await CheckoutPage({ params: Promise.resolve({ id: 'neon-nights' }) }));
-
-    expect(screen.getByRole('heading', { name: 'Select tickets' })).toBeInTheDocument();
-    expect(mockGet).not.toHaveBeenCalled();
+  it('uses a private grant bootstrap for ids with protected or unavailable public detail', async () => {
+    mockGet.mockRejectedValue(
+      new ApiClientError({ code: 'not_found', message: 'missing', status: 404 } as never),
+    );
+    const page = await CheckoutPage({ params: Promise.resolve({ id: 'neon-nights' }) });
+    expect(page.type).toBe(PrivateCheckoutBootstrap);
+    expect(page.props).toMatchObject({ eventId: 'neon-nights' });
+    expect(mockGet).toHaveBeenCalled();
   });
 
-  it('not-founds unknown slugs without fixtures', async () => {
+  it('does not misreport a gateway failure as a missing event', async () => {
     mockGet.mockRejectedValue(new Error('gateway down'));
-    await expect(
-      CheckoutPage({ params: Promise.resolve({ id: 'no-such-event' }) }),
-    ).rejects.toThrow('NEXT_NOT_FOUND');
+    render(await CheckoutPage({ params: Promise.resolve({ id: 'real-night' }) }));
+    expect(
+      screen.getByRole('heading', { name: 'Checkout temporarily unavailable' }),
+    ).toBeInTheDocument();
   });
 });

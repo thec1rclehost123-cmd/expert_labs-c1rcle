@@ -5,14 +5,16 @@
  * route handlers are thin wrappers around it, and caller org identity is
  * forwarded server-side only — the browser never sees a gateway URL.
  *
- * GAP notes (honest, never invented data — see the original frontend gap notes, not included in this handoff):
+ * GAP notes (honest, never invented data — see `docs/superpowers/
+ * FRONTEND-GATEWAY-BACKEND-MAP.md` §5.2):
  *  - Ticket tiers / promos / tables / artists / promoters are catalog reads
  *    that are not part of this slice; the affected UI sections render only when
  *    the wire actually provided something (empty lists are dropped).
  *  - `accepted` (wire) is mapped to `approved` (UI) so the surface keeps its
  *    established status vocabulary.
  */
-import { eventEndAtFromDraft, eventStartAtFromDraft } from '@/lib/events/event-time';
+import { getClientEnv } from '@c1rcle/config';
+import { PRODUCT_TIME_ZONE } from '@c1rcle/contracts';
 
 import { forwardToGateway, mintIdempotencyKey, parseJson } from './auth-proxy';
 
@@ -26,6 +28,7 @@ import type {
 import type {
   EventDto,
   Paginated,
+  PartnershipDto,
   SlotRequestDetailDto,
   SlotRequestDto,
   VenueDto,
@@ -75,6 +78,9 @@ function withIdempotency(ctx: GatewayContext): GatewayContext {
 /** Gateway calls must resolve quickly — a fossilised gateway is surfaced as a
  * fast `GatewayError` instead of hanging the BFF until the browser aborts. */
 const GATEWAY_TIMEOUT_MS = 10_000;
+// Accepting an event request can publish its event, tiers, promotions, and
+// assignments. Give writes the same response window as the browser API client.
+const GATEWAY_ACTION_TIMEOUT_MS = 60_000;
 
 async function gatewayGet<T>(
   path: string,
@@ -117,7 +123,7 @@ async function gatewayPost<T>(
       body,
       cookie: ctx.cookie,
       headers: gatewayHeaders(organizationId, ctx),
-      signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+      signal: AbortSignal.timeout(GATEWAY_ACTION_TIMEOUT_MS),
     });
   } catch {
     throw new GatewayError(504, {
@@ -162,7 +168,7 @@ function partnerInitials(name: string): string {
   return words.map((word) => word[0]?.toUpperCase() ?? '').join('') || '?';
 }
 
-/** Renders an ISO timestamp as a short weekday/date label, UTC — deterministic. */
+/** Renders an ISO timestamp as a short weekday/date label in IST. */
 function formatDate(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return '—';
@@ -170,11 +176,11 @@ function formatDate(iso: string): string {
     weekday: 'short',
     month: 'short',
     day: 'numeric',
-    timeZone: 'UTC',
+    timeZone: PRODUCT_TIME_ZONE,
   });
 }
 
-/** Renders a start/end ISO pair as a human time range, UTC. */
+/** Renders a start/end ISO pair in the fixed product timezone. */
 function formatTime(startAt: string, endAt: string | null): string {
   const start = new Date(startAt);
   const end = endAt ? new Date(endAt) : null;
@@ -182,11 +188,19 @@ function formatTime(startAt: string, endAt: string | null): string {
   const options: Intl.DateTimeFormatOptions = {
     hour: 'numeric',
     minute: '2-digit',
-    timeZone: 'UTC',
+    timeZone: PRODUCT_TIME_ZONE,
   };
   const startLabel = start.toLocaleTimeString('en-IN', options);
   if (!end || Number.isNaN(end.getTime())) return startLabel;
   return `${startLabel} – ${end.toLocaleTimeString('en-IN', options)}`;
+}
+
+function formatSlotTime(
+  startAt: string,
+  endAt: string | null,
+  _timezone: string | null | undefined,
+): string {
+  return formatTime(startAt, endAt);
 }
 
 function toUiEvent(
@@ -209,6 +223,7 @@ function toUiEvent(
     name: event.title,
     description:
       (event.summary || event.description || '').trim() || 'No description provided yet.',
+    imageUrl: event.imageUrl,
     date: formatDate(event.startAt),
     time: formatTime(event.startAt, event.endAt ?? null),
     venue: venueName,
@@ -230,12 +245,85 @@ function toUiRequest(
 ): SlotRequest {
   return {
     id: dto.id,
+    ...(dto.eventId ? { eventId: dto.eventId } : {}),
+    ...(dto.eventDraft ? { hasEventDraft: true } : {}),
+    ...(direction === 'outgoing' && dto.eventDraft ? { eventDraft: dto.eventDraft } : {}),
+    ...(event ? { linkedEventStatus: event.status } : {}),
     status: mapStatus(dto.status),
     direction,
     partnerName,
     partnerRoleLabel,
     partnerInitials: partnerInitials(partnerName),
-    event: toUiEvent(event, dto.message, venueName, titleFallback),
+    ...(dto.venueId ? { venueId: dto.venueId } : {}),
+    ...(dto.slotId ? { slotId: dto.slotId } : {}),
+    ...(dto.slotStartTime ? { slotStartTime: dto.slotStartTime } : {}),
+    ...(dto.slotEndTime ? { slotEndTime: dto.slotEndTime } : {}),
+    ...(dto.rejectionReason ? { rejectionReason: dto.rejectionReason } : {}),
+    timezone: PRODUCT_TIME_ZONE,
+    event: event
+      ? toUiEvent(event, dto.message, venueName, titleFallback)
+      : dto.eventDraft
+        ? {
+            name: dto.eventDraft.event.title,
+            description: (
+              dto.eventDraft.event.description ??
+              dto.eventDraft.event.summary ??
+              ''
+            ).trim(),
+            imageUrl: dto.eventDraft.event.imageUrl,
+            date: new Intl.DateTimeFormat('en-IN', {
+              weekday: 'short',
+              month: 'short',
+              day: 'numeric',
+              year: 'numeric',
+              timeZone: PRODUCT_TIME_ZONE,
+            }).format(new Date(dto.eventDraft.event.startAt)),
+            time: `${formatSlotTime(dto.eventDraft.event.startAt, dto.eventDraft.event.endAt ?? null, PRODUCT_TIME_ZONE)} IST`,
+            venue: venueName,
+            ticketTier: `${String(dto.eventDraft.tiers.length)} ticket tiers`,
+            ...(dto.message ? { note: dto.message } : {}),
+            artists: dto.eventDraft.event.tags,
+            promoters: dto.eventDraft.promoters.length
+              ? [
+                  `${String(dto.eventDraft.promoters.length)} Promoter${dto.eventDraft.promoters.length === 1 ? '' : 's'} selected`,
+                ]
+              : [],
+            tiers: dto.eventDraft.tiers.map(({ command }) => ({
+              name: command.name,
+              price:
+                command.accessType === 'RSVP' || command.priceInPaise === undefined
+                  ? 'Free RSVP'
+                  : new Intl.NumberFormat('en-IN', {
+                      style: 'currency',
+                      currency: 'INR',
+                      maximumFractionDigits: 2,
+                    }).format(command.priceInPaise / 100),
+              quantity: String(command.quantity),
+            })),
+            pricing: dto.eventDraft.tiers.flatMap(({ command }) =>
+              (command.pricingPhases ?? []).map(
+                (phase) =>
+                  `${command.name}: ${phase.name} · ${new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' }).format(phase.priceInPaise / 100)}`,
+              ),
+            ),
+            tables: `${String(dto.eventDraft.tiers.filter(({ command }) => command.accessType === 'TABLE').length)} table tiers`,
+            codes: `${String(dto.eventDraft.promotions.length)} promo codes`,
+          }
+        : dto.slotStartTime
+          ? {
+              name: 'Venue slot request',
+              description: 'Request for a published Venue availability slot.',
+              date: new Intl.DateTimeFormat('en-IN', {
+                weekday: 'short',
+                month: 'short',
+                day: 'numeric',
+                timeZone: PRODUCT_TIME_ZONE,
+              }).format(new Date(dto.slotStartTime)),
+              time: `${formatSlotTime(dto.slotStartTime, dto.slotEndTime ?? null, dto.timezone)} IST`,
+              venue: venueName,
+              ...(dto.message ? { note: dto.message } : {}),
+            }
+          : toUiEvent(null, dto.message, venueName, titleFallback),
   };
 }
 
@@ -250,12 +338,17 @@ async function loadIncoming(
   organizationId: string,
   ctx: GatewayContext,
 ): Promise<SlotRequestsData> {
-  const entries = await fetchIncomingEntries(organizationId, ctx);
+  const { entries, venues } = await fetchIncomingEntries(organizationId, ctx);
+  const venue = venues.find((item) => item.status === 'active') ?? venues[0];
+  const venueShareUrl = venue
+    ? `${getClientEnv().NEXT_PUBLIC_GUEST_PORTAL_URL.replace(/\/$/, '')}/venue/${encodeURIComponent(venue.slug)}`
+    : undefined;
   return {
     dataStatus: 'live',
     accent: 'orange',
     direction: 'incoming',
     requests: entries.map((entry) => entry.request),
+    ...(venueShareUrl ? { venueShareUrl } : {}),
   };
 }
 
@@ -305,7 +398,7 @@ async function mapWithConcurrency<T, R>(
 async function fetchIncomingEntries(
   organizationId: string,
   ctx: GatewayContext,
-): Promise<SlotRequestEntry[]> {
+): Promise<{ readonly entries: SlotRequestEntry[]; readonly venues: readonly VenueDto[] }> {
   const venues = await gatewayGet<Paginated<VenueDto>>(
     `/api/v2/organizations/${encodeURIComponent(organizationId)}/venues?limit=100`,
     organizationId,
@@ -360,7 +453,7 @@ async function fetchIncomingEntries(
   });
 
   entries.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-  return entries;
+  return { entries, venues: venues.items };
 }
 
 async function fetchOutgoingEntries(
@@ -373,19 +466,30 @@ async function fetchOutgoingEntries(
     ctx,
   );
 
-  // Two bulk reads cover all enrichment: the org's venues (name lookup) and the
-  // org's own events (title/art lookup) — no per-request gateway round-trips.
+  // Two bulk reads cover event enrichment and a venue lookup. The Host's
+  // organization-scoped venue list may be empty because the Host does not own
+  // the venue; active partnerships are the authoritative relationship and
+  // carry the public-safe venue name.
   // Both are best-effort: a failed bulk read degrades enrichment (fallback
   // names/titles) instead of failing the whole list, matching the old
   // per-request `ignoreMissing` tolerance.
   const [venuesById, eventsById] = await Promise.all([
-    gatewayGet<Paginated<VenueDto>>(
-      `/api/v2/organizations/${encodeURIComponent(organizationId)}/venues?limit=100`,
+    gatewayGet<Paginated<PartnershipDto>>(
+      `/api/v2/organizations/${encodeURIComponent(organizationId)}/partnerships?limit=100`,
       organizationId,
       ctx,
     )
-      .then((data) => new Map(data.items.map((venue) => [venue.id, venue])))
-      .catch(() => new Map<string, VenueDto>()),
+      .then(
+        (data) =>
+          new Map(
+            data.items.flatMap((partnership) =>
+              partnership.status === 'active' && partnership.venueName
+                ? [[partnership.venueId, partnership.venueName] as const]
+                : [],
+            ),
+          ),
+      )
+      .catch(() => new Map<string, string>()),
     gatewayGet<Paginated<EventDto>>(
       `/api/v2/organizations/${encodeURIComponent(organizationId)}/events?limit=100`,
       organizationId,
@@ -398,8 +502,8 @@ async function fetchOutgoingEntries(
   const entries = page.items.map((dto) => {
     const event = dto.eventId ? (eventsById.get(dto.eventId) ?? null) : null;
     const venueName = dto.venueId
-      ? (venuesById.get(dto.venueId)?.name ?? dto.venueId)
-      : dto.venueId;
+      ? (venuesById.get(dto.venueId) ?? 'Venue name unavailable')
+      : 'Venue name unavailable';
     return {
       createdAt: dto.createdAt,
       request: toUiRequest(
@@ -506,7 +610,7 @@ export async function loadSlotRequestNotifications(
 ): Promise<PartnerNotificationDto[]> {
   const entries =
     direction === 'incoming'
-      ? await fetchIncomingEntries(organizationId, ctx)
+      ? (await fetchIncomingEntries(organizationId, ctx)).entries
       : await fetchOutgoingEntries(organizationId, ctx);
   return entries
     .map(toNotification)
@@ -532,11 +636,12 @@ export async function rejectSlotRequest(
   slotRequestId: string,
   organizationId: string,
   ctx: GatewayContext,
+  reason: string,
 ): Promise<SlotRequestDto> {
   return gatewayPost<SlotRequestDto>(
     `/api/v2/venues/slot-requests/${encodeURIComponent(slotRequestId)}/reject`,
     organizationId,
-    {},
+    { reason },
     withIdempotency(ctx),
   );
 }
@@ -560,6 +665,8 @@ export async function cancelSlotRequest(
 export interface HostSlotRequestSubmitInput {
   readonly organizationId: string;
   readonly venueId: string;
+  readonly slotId: string;
+  readonly idempotencyKey: string;
   readonly name: string;
   /** YYYY-MM-DD. */
   readonly date: string;
@@ -571,60 +678,29 @@ export interface HostSlotRequestSubmitInput {
   readonly artists: readonly string[];
   /** Public poster URL resolved on the client (null = gradient artwork). */
   readonly posterPublicUrl?: string | null;
-  /** B2: minted ONCE per submit intent by the caller and reused across retries
-   * of the same submit; both gateway writes derive their per-write
-   * `Idempotency-Key` from it so a retry can never double-create one record. */
-  readonly idempotencyKey: string;
 }
 
 export interface HostSlotRequestSubmitResult {
-  readonly eventId: string;
   readonly slotRequestId: string;
 }
 
 /**
- * Creates the host's draft event, then submits a slot request to the target
- * venue — both against the gateway from the server. The caller supplies ONE
- * `idempotencyKey` for the whole submit intent (B2); it is expanded to a
- * per-write key, so both records are protected by the same dedup boundary and
- * a client retry with the original key cannot double-create either.
+ * Creates only the slot request. A Host event is created in a separate flow
+ * after the Venue has accepted and reserved this slot.
  */
 export async function submitHostSlotRequest(
   input: HostSlotRequestSubmitInput,
   ctx: GatewayContext,
 ): Promise<HostSlotRequestSubmitResult> {
-  const startAt = eventStartAtFromDraft(input);
-  if (!startAt)
-    throw new GatewayError(400, {
-      code: 'validation',
-      message: 'Enter a valid event date and start time.',
-      status: 400,
-    });
-  const { organizationId, idempotencyKey } = input;
-
-  const event = await gatewayPost<EventDto>(
-    `/api/v2/organizations/${encodeURIComponent(organizationId)}/events`,
-    organizationId,
-    {
-      venueId: input.venueId,
-      title: input.name.trim(),
-      imageUrl: input.posterPublicUrl ?? null,
-      startAt,
-      endAt: eventEndAtFromDraft(input),
-      tags: [...new Set([...input.genres, ...input.artists])].slice(0, 50),
-    },
-    { ...ctx, headers: { ...ctx.headers, 'Idempotency-Key': `${idempotencyKey}-event` } },
-  );
-
+  const { organizationId } = input;
   const slotRequest = await gatewayPost<SlotRequestDto>(
     `/api/v2/venues/${encodeURIComponent(input.venueId)}/slot-requests`,
     organizationId,
     {
-      eventId: event.id,
+      slotId: input.slotId,
       message: `Host request for "${input.name.trim()}" on ${input.dateLabel}`,
     },
-    { ...ctx, headers: { ...ctx.headers, 'Idempotency-Key': `${idempotencyKey}-slot-request` } },
+    { ...ctx, headers: { ...ctx.headers, 'Idempotency-Key': input.idempotencyKey } },
   );
-
-  return { eventId: event.id, slotRequestId: slotRequest.id };
+  return { slotRequestId: slotRequest.id };
 }

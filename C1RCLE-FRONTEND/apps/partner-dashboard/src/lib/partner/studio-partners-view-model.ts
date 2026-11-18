@@ -42,9 +42,7 @@ function toneOf(id: string): PartnerCardTone {
   return CARD_TONES[hash % CARD_TONES.length] ?? 'slate';
 }
 
-function shortId(id: string): string {
-  return id.length <= 12 ? id : `${id.slice(0, 8)}…`;
-}
+const PARTNER_NAME_UNAVAILABLE = 'Partner name unavailable';
 
 const ROLE_LABEL: Readonly<Record<PartnerKind, string>> = {
   host: 'Host',
@@ -95,6 +93,10 @@ function partnershipRequestRow(
       kind,
       direction: outgoing ? 'outgoing' : 'incoming',
       note: item.message ?? '',
+      avatarUrl: kind === 'host' ? (item.hostPhotoUrl ?? null) : (item.venuePhotoUrl ?? null),
+      coverUrl: kind === 'host' ? (item.hostCoverUrl ?? null) : (item.venueCoverUrl ?? null),
+      location: kind === 'host' ? '—' : (item.venueCity ?? '—'),
+      canWithdraw: item.initiatedBy === viewer,
       target: { graph: 'partnership', id: item.id },
     },
   };
@@ -119,6 +121,12 @@ function promoterRequestRow(
       kind,
       direction: outgoing ? 'outgoing' : 'incoming',
       note: item.message ?? '',
+      avatarUrl:
+        viewer === 'promoter' ? (item.targetPhotoUrl ?? null) : (item.promoterPhotoUrl ?? null),
+      coverUrl:
+        viewer === 'promoter' ? (item.targetCoverUrl ?? null) : (item.promoterCoverUrl ?? null),
+      location: viewer === 'promoter' ? (item.targetCity ?? '—') : '—',
+      canWithdraw: viewer === 'promoter' && item.initiatedBy === 'promoter',
       target: { graph: 'promoter-connection', id: item.id },
     },
   };
@@ -163,23 +171,26 @@ export function toVenuePartnersData(input: {
     connected: partnerships
       .filter((item) => item.status === 'active')
       .map((item): PartnerRelationship => {
-        const name = item.hostName ?? shortId(item.hostOrganizationId);
+        const name = item.hostName ?? PARTNER_NAME_UNAVAILABLE;
         return {
           ...relationshipBase(item.id, 'host', name, null, false),
+          avatarUrl: item.hostPhotoUrl ?? null,
+          coverUrl: item.hostCoverUrl ?? null,
+          bio: item.hostBio ?? '',
           status: 'Partnered',
         };
       }),
     discover: input.discoveredHosts.map((item): PartnerRelationship => ({
       ...relationshipBase(item.id, 'host', item.name, item.city, item.verified),
+      ...(item.photoUrl ? { avatarUrl: item.photoUrl } : {}),
+      ...(item.coverUrl ? { coverUrl: item.coverUrl } : {}),
+      ...(item.bio ? { bio: item.bio } : {}),
+      ...(item.genres ? { genres: item.genres } : {}),
+      ...(item.stats ? { stats: item.stats } : {}),
     })),
     requests: splitPending(
       partnerships.map((item) =>
-        partnershipRequestRow(
-          item,
-          'venue',
-          'host',
-          item.hostName ?? shortId(item.hostOrganizationId),
-        ),
+        partnershipRequestRow(item, 'venue', 'host', item.hostName ?? PARTNER_NAME_UNAVAILABLE),
       ),
     ),
   };
@@ -191,14 +202,22 @@ export function toVenuePartnersData(input: {
     connected: venueConnections
       .filter((item) => item.status === 'active')
       .map((item): PartnerRelationship => {
-        const name = item.promoterName ?? shortId(item.promoterId);
+        const name = item.promoterName ?? PARTNER_NAME_UNAVAILABLE;
         return {
           ...relationshipBase(item.id, 'promoter', name, item.targetCity, false),
+          avatarUrl: item.promoterPhotoUrl ?? null,
+          coverUrl: item.promoterCoverUrl ?? null,
+          bio: item.promoterBio ?? '',
           status: 'Partnered',
         };
       }),
     discover: input.discoveredPromoters.map((item): PartnerRelationship => ({
       ...relationshipBase(item.id, 'promoter', item.name, item.city, item.verified),
+      ...(item.photoUrl ? { avatarUrl: item.photoUrl } : {}),
+      ...(item.coverUrl ? { coverUrl: item.coverUrl } : {}),
+      ...(item.bio ? { bio: item.bio } : {}),
+      ...(item.genres ? { genres: item.genres } : {}),
+      ...(item.stats ? { stats: item.stats } : {}),
     })),
     requests: splitPending(
       promoterConnections.map((item) =>
@@ -206,7 +225,7 @@ export function toVenuePartnersData(input: {
           item,
           'target',
           'promoter',
-          item.promoterName ?? shortId(item.promoterId),
+          item.promoterName ?? PARTNER_NAME_UNAVAILABLE,
         ),
       ),
     ),
@@ -221,6 +240,7 @@ export function toHostPartnersData(input: {
   readonly promoterConnections: readonly PromoterConnectionDto[];
   readonly discoveredVenues: readonly DiscoverPartnerDto[];
   readonly discoveredPromoters: readonly DiscoverPartnerDto[];
+  readonly assignablePromoterIds?: ReadonlySet<string> | null;
 }): HostPartnersData {
   const { partnerships, promoterConnections } = input;
 
@@ -228,23 +248,27 @@ export function toHostPartnersData(input: {
     connected: partnerships
       .filter((item) => item.status === 'active')
       .map((item): PartnerRelationship => {
-        const name = item.venueName ?? shortId(item.venueOrganizationId);
+        const name = item.venueName ?? PARTNER_NAME_UNAVAILABLE;
         return {
-          ...relationshipBase(item.id, 'venue', name, null, false),
+          ...relationshipBase(item.id, 'venue', name, item.venueCity, false),
+          avatarUrl: item.venuePhotoUrl ?? null,
+          coverUrl: item.venueCoverUrl ?? null,
+          bio: item.venueBio ?? '',
+          genres: item.venueGenres ?? [],
           status: 'Partnered',
         };
       }),
     discover: input.discoveredVenues.map((item): PartnerRelationship => ({
       ...relationshipBase(item.id, 'venue', item.name, item.city, item.verified),
+      ...(item.photoUrl ? { avatarUrl: item.photoUrl } : {}),
+      ...(item.coverUrl ? { coverUrl: item.coverUrl } : {}),
+      ...(item.bio ? { bio: item.bio } : {}),
+      ...(item.genres ? { genres: item.genres } : {}),
+      ...(item.stats ? { stats: item.stats } : {}),
     })),
     requests: splitPending(
       partnerships.map((item) =>
-        partnershipRequestRow(
-          item,
-          'host',
-          'venue',
-          item.venueName ?? shortId(item.venueOrganizationId),
-        ),
+        partnershipRequestRow(item, 'host', 'venue', item.venueName ?? PARTNER_NAME_UNAVAILABLE),
       ),
     ),
   };
@@ -253,14 +277,29 @@ export function toHostPartnersData(input: {
     connected: promoterConnections
       .filter((item) => item.status === 'active')
       .map((item): PartnerRelationship => {
-        const name = item.promoterName ?? shortId(item.promoterId);
+        const name = item.promoterName ?? PARTNER_NAME_UNAVAILABLE;
         return {
           ...relationshipBase(item.id, 'promoter', name, item.targetCity, false),
+          avatarUrl: item.promoterPhotoUrl ?? null,
+          coverUrl: item.promoterCoverUrl ?? null,
+          bio: item.promoterBio ?? '',
           status: 'Partnered',
+          ...(input.assignablePromoterIds
+            ? {
+                eventAssignmentAvailability: input.assignablePromoterIds.has(item.promoterId)
+                  ? 'available'
+                  : 'unavailable',
+              }
+            : {}),
         };
       }),
     discover: input.discoveredPromoters.map((item): PartnerRelationship => ({
       ...relationshipBase(item.id, 'promoter', item.name, item.city, item.verified),
+      ...(item.photoUrl ? { avatarUrl: item.photoUrl } : {}),
+      ...(item.coverUrl ? { coverUrl: item.coverUrl } : {}),
+      ...(item.bio ? { bio: item.bio } : {}),
+      ...(item.genres ? { genres: item.genres } : {}),
+      ...(item.stats ? { stats: item.stats } : {}),
     })),
     requests: splitPending(
       promoterConnections.map((item) =>
@@ -268,7 +307,7 @@ export function toHostPartnersData(input: {
           item,
           'target',
           'promoter',
-          item.promoterName ?? shortId(item.promoterId),
+          item.promoterName ?? PARTNER_NAME_UNAVAILABLE,
         ),
       ),
     ),
@@ -291,7 +330,7 @@ export function toPromoterPartnersData(input: {
     state: PromoterPartnerRecord['state'],
   ): PromoterPartnerRecord => {
     const kind = item.targetType;
-    const name = item.targetName ?? shortId(item.targetId);
+    const name = item.targetName ?? PARTNER_NAME_UNAVAILABLE;
     return {
       id: item.id,
       name,
@@ -299,11 +338,14 @@ export function toPromoterPartnersData(input: {
       kind,
       role: ROLE_LABEL[kind],
       location: item.targetCity ?? '—',
-      genres: [],
       stats: [],
       upcomingEvents: [],
       verified: false,
       cardTone: toneOf(item.id),
+      avatarUrl: item.targetPhotoUrl ?? null,
+      coverUrl: item.targetCoverUrl ?? null,
+      bio: item.targetBio ?? '',
+      genres: item.targetGenres ?? [],
       state,
       actionLabel: state === 'active' ? 'Connected' : 'Send Request',
     };
@@ -319,8 +361,10 @@ export function toPromoterPartnersData(input: {
     kind: item.kind === 'host' ? 'host' : 'venue',
     role: ROLE_LABEL[item.kind === 'host' ? 'host' : 'venue'],
     location: item.city ?? '—',
-    genres: [],
-    stats: [],
+    ...(item.photoUrl ? { avatarUrl: item.photoUrl } : {}),
+    ...(item.coverUrl ? { coverUrl: item.coverUrl } : {}),
+    genres: item.genres ?? [],
+    stats: item.stats ?? [],
     upcomingEvents: [],
     verified: item.verified,
     cardTone: toneOf(item.id),
@@ -336,7 +380,7 @@ export function toPromoterPartnersData(input: {
           item,
           'promoter',
           item.targetType,
-          item.targetName ?? shortId(item.targetId),
+          item.targetName ?? PARTNER_NAME_UNAVAILABLE,
         ).request,
     );
   const pending = mine
@@ -348,7 +392,7 @@ export function toPromoterPartnersData(input: {
           item,
           'promoter',
           item.targetType,
-          item.targetName ?? shortId(item.targetId),
+          item.targetName ?? PARTNER_NAME_UNAVAILABLE,
         ).request,
     );
   const declined = mine
@@ -360,7 +404,7 @@ export function toPromoterPartnersData(input: {
           item,
           'promoter',
           item.targetType,
-          item.targetName ?? shortId(item.targetId),
+          item.targetName ?? PARTNER_NAME_UNAVAILABLE,
         ).request,
     );
 

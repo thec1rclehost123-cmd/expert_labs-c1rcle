@@ -1,4 +1,9 @@
+'use client';
+
 import Image from 'next/image';
+import { useState } from 'react';
+
+import { shouldBypassEventImageOptimizer } from '@/lib/events/image-optimization';
 
 import styles from './events.module.css';
 
@@ -24,25 +29,33 @@ export function EventPoster({
   readonly className?: string | undefined;
   readonly sizes?: string | undefined;
 }) {
+  const [unavailableImage, setUnavailableImage] = useState<string | null>(null);
+  const showImage = artwork.type === 'image' && unavailableImage !== artwork.value;
+  const gradient =
+    artwork.type === 'gradient'
+      ? (gradientClasses[artwork.value] ?? styles['posterGradientDefault'])
+      : styles['posterGradientDefault'];
+
   return (
     <div className={[styles['eventPoster'], className].filter(Boolean).join(' ')}>
-      {artwork.type === 'image' ? (
+      <div
+        data-testid="event-poster-fallback"
+        className={[styles['eventPosterGradient'], gradient].join(' ')}
+        aria-hidden="true"
+      />
+      {showImage ? (
         <Image
           src={artwork.value}
           alt={artwork.alt ?? ''}
           fill
           loading="eager"
           sizes={sizes ?? '240px'}
+          onError={() => {
+            setUnavailableImage(artwork.value);
+          }}
+          unoptimized={shouldBypassEventImageOptimizer(artwork.value)}
         />
-      ) : (
-        <div
-          className={[
-            styles['eventPosterGradient'],
-            gradientClasses[artwork.value] ?? styles['posterGradientDefault'],
-          ].join(' ')}
-          aria-hidden="true"
-        />
-      )}
+      ) : null}
     </div>
   );
 }

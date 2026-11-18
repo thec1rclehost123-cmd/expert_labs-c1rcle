@@ -54,7 +54,7 @@ if [ "${1:-}" = "--render-dry-run" ]; then
     fi
     docker run --rm \
         --entrypoint nginx \
-        --add-host circle-v2-backend-staging.internal:127.0.0.1 \
+        --add-host c1rcle-api-staging.internal:127.0.0.1 \
         --volume "$temp_dir/c1rcle-api.conf:/etc/nginx/conf.d/c1rcle-api.conf:ro" \
         "$image_name" \
         -t -c /etc/nginx/nginx.conf

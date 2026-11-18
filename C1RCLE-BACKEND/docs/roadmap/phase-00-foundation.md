@@ -279,7 +279,7 @@ work is Phases 1–8.
 
 - 2026-08-13 (same day, follow-up) — **Reconciled with a parallel session's
   independent B08–B12 work.** After the above was committed, a push revealed
-  `origin/main` had moved: a different contributor (an earlier contributor) had independently
+  `origin/main` had moved: a different contributor (a teammate) had independently
   built the same B08–B12 scope and pushed directly, with real architectural
   differences (SQLite instead of Firestore, plus RBAC/rate-limit/cache
   plugins and 133 tests this session had deferred). Full account in
@@ -300,8 +300,8 @@ work is Phases 1–8.
     `cached` decorators are registered but not wired into the partner routes
     — needs a careful per-route permission/cache-class mapping that wasn't
     rushed under time pressure. Do this properly in Phase 1, not by copying
-    another contributor.s `Permission`/`CacheClass` enums verbatim without checking they
-    cover every route this repo actually has (they were sized to another contributor.s own
+    a teammate's `Permission`/`CacheClass` enums verbatim without checking they
+    cover every route this repo actually has (they were sized to a teammate's own
     route set, which is a subset of this repo's — e.g. no venue
     calendar/slot-request-accept/reject entries).
   - **Deliberately not ported:** the SQLite adapter

@@ -1,47 +1,17 @@
-import Image from 'next/image';
 import Link from 'next/link';
 
-import {
-  AddIcon,
-  BankIcon,
-  BottleServiceIcon,
-  ForwardIcon,
-  RefundIcon,
-  TicketIcon,
-  UsersIcon,
-} from '@c1rcle/icons';
+import { AddIcon, ForwardIcon, TicketIcon, UsersIcon } from '@c1rcle/icons';
+
+import { isProductCalendarDay } from '@/lib/events/event-time';
 
 import { FixtureBadge } from '../FixtureBadge';
 
 import styles from './overview.module.css';
 import { OverviewCalendarCard } from './OverviewCalendarCard';
+import { OverviewEventPoster } from './OverviewEventPoster';
 import { OverviewTrendCard } from './OverviewTrendCard';
 
-import type {
-  OverviewAccent,
-  OverviewActivity,
-  OverviewData,
-  OverviewLinks,
-} from '@/data/partner-data-source';
-import type { ComponentType } from 'react';
-
-const activityIcons: Readonly<
-  Record<
-    OverviewActivity['kind'],
-    ComponentType<{ size?: number; 'aria-hidden'?: boolean | 'true' | 'false' }>
-  >
-> = {
-  ticket: TicketIcon,
-  payout: BankIcon,
-  refund: RefundIcon,
-  table: BottleServiceIcon,
-};
-
-const activityToneClasses = {
-  positive: { icon: styles['activityIcon-positive'], amount: styles['amount-positive'] },
-  neutral: { icon: styles['activityIcon-neutral'], amount: styles['amount-neutral'] },
-  negative: { icon: styles['activityIcon-negative'], amount: styles['amount-negative'] },
-} as const;
+import type { OverviewAccent, OverviewData, OverviewLinks } from '@/data/partner-data-source';
 
 const upcomingBackgroundClasses = [
   styles['upcomingEvent-1'],
@@ -80,6 +50,8 @@ const networkStatusClasses = {
   success: styles['networkStatus-success'],
   neutral: styles['networkStatus-neutral'],
 } as const;
+
+const NETWORK_PREVIEW_LIMIT = 4;
 
 const classNames = (...names: readonly (string | undefined | false)[]) =>
   names.filter(Boolean).join(' ');
@@ -126,6 +98,8 @@ export function OverviewScreen({
   readonly studio?: 'venue' | 'host';
   readonly organizationId?: string | null;
 }) {
+  const nextEventIsToday = isProductCalendarDay(data.nextEvent.startAt);
+
   return (
     <div
       className={[styles['overview'], accent === 'lavender' ? styles['accentLavender'] : '']
@@ -152,15 +126,13 @@ export function OverviewScreen({
       <div className={styles['primaryGrid']}>
         <div className={styles['primaryStack']}>
           <article className={styles['hero']} aria-labelledby="next-event-title">
-            {data.nextEvent.imageSrc ? (
-              <Image
-                src={data.nextEvent.imageSrc}
-                alt={data.nextEvent.imageAlt ?? ''}
-                fill
-                priority
-                sizes="(max-width: 900px) 100vw, 52vw"
-              />
-            ) : null}
+            <OverviewEventPoster
+              src={data.nextEvent.imageSrc}
+              alt={data.nextEvent.imageAlt ?? ''}
+              className={styles['heroPoster'] ?? ''}
+              fallbackClassName={styles['heroPosterFallback'] ?? ''}
+              sizes="(max-width: 900px) 100vw, 52vw"
+            />
             <div className={styles['heroOverlay']} aria-hidden="true" />
             <div className={styles['heroContent']}>
               <div className={styles['heroTopline']}>
@@ -177,21 +149,42 @@ export function OverviewScreen({
               <div className={styles['heroDetails']}>
                 <p>{data.nextEvent.venue}</p>
                 <h2 id="next-event-title">{data.nextEvent.name}</h2>
-                <div className={styles['capacityLabels']}>
-                  {/* `null` capacity means the venue never declared one. Showing
-                      "0 tickets" would be a different claim, and the percentage
-                      has no denominator, so the sell-through is simply omitted. */}
-                  {data.nextEvent.capacity === null ? (
-                    <span>{data.nextEvent.sold.toLocaleString('en-IN')} tickets sold</span>
-                  ) : (
-                    <>
-                      <span>
-                        {data.nextEvent.sold.toLocaleString('en-IN')} of{' '}
-                        {data.nextEvent.capacity.toLocaleString('en-IN')} tickets sold
-                      </span>
-                      <strong>{soldPercentOf(data.nextEvent)}% full</strong>
-                    </>
-                  )}
+                <div className={styles['heroSalesRow']}>
+                  <div className={styles['capacityLabels']}>
+                    {/* `null` capacity means the venue never declared one. Showing
+                        "0 tickets" would be a different claim, and the percentage
+                        has no denominator, so the sell-through is simply omitted. */}
+                    {data.nextEvent.capacity === null ? (
+                      <span>{data.nextEvent.sold.toLocaleString('en-IN')} tickets sold</span>
+                    ) : (
+                      <>
+                        <span>
+                          {data.nextEvent.sold.toLocaleString('en-IN')} of{' '}
+                          {data.nextEvent.capacity.toLocaleString('en-IN')} tickets sold
+                        </span>
+                        <strong>{soldPercentOf(data.nextEvent)}% full</strong>
+                      </>
+                    )}
+                  </div>
+                  {data.nextEvent.id ? (
+                    <Link
+                      className={styles['heroAction']}
+                      href={
+                        nextEventIsToday
+                          ? `/partner/${studio ?? 'venue'}/events/${encodeURIComponent(data.nextEvent.id)}/door`
+                          : `/partner/${studio ?? 'venue'}/events/${encodeURIComponent(data.nextEvent.id)}/guests`
+                      }
+                    >
+                      {nextEventIsToday ? (
+                        <>Door mode</>
+                      ) : (
+                        <>
+                          <UsersIcon size={18} aria-hidden="true" />
+                          View guest list
+                        </>
+                      )}
+                    </Link>
+                  ) : null}
                 </div>
                 {data.nextEvent.capacity === null ? null : (
                   <progress
@@ -201,10 +194,6 @@ export function OverviewScreen({
                     max={100}
                   />
                 )}
-                <Link className={styles['heroAction']} href={`${data.nextEvent.href}/guests`}>
-                  <UsersIcon size={18} aria-hidden="true" />
-                  View guest list
-                </Link>
               </div>
             </div>
           </article>
@@ -213,33 +202,41 @@ export function OverviewScreen({
 
         <section
           className={classNames(styles['card'], styles['activityCard'])}
-          aria-labelledby="recent-activity-title"
+          aria-labelledby="recent-orders-title"
         >
           <SectionHeader
-            id="recent-activity-title"
-            title="Recent activity"
-            description="Orders, payouts & refunds"
+            id="recent-orders-title"
+            title="Recent orders"
+            description="Latest Guest orders across your events"
             href={links.finance}
             action="View all"
           />
           <div className={styles['activityList']}>
-            {data.recentActivity.map((activity) => {
-              const Icon = activityIcons[activity.kind];
+            {data.recentOrders === null ? (
+              <p className={styles['overviewEmpty']}>
+                Order details are not available to this workspace role.
+              </p>
+            ) : null}
+            {data.recentOrders?.length === 0 ? (
+              <p className={styles['overviewEmpty']}>No orders have been recorded yet.</p>
+            ) : null}
+            {data.recentOrders?.map((order) => {
               return (
-                <div className={styles['activityRow']} key={activity.id}>
+                <div className={styles['activityRow']} data-order-card="true" key={order.id}>
                   <span
-                    className={classNames(
-                      styles['activityIcon'],
-                      activityToneClasses[activity.tone].icon,
-                    )}
+                    className={classNames(styles['activityIcon'], styles['activityIcon-positive'])}
                   >
-                    <Icon size={17} aria-hidden="true" />
+                    <TicketIcon size={17} aria-hidden="true" />
                   </span>
                   <div>
-                    <strong>{activity.name}</strong>
-                    <span>{activity.meta}</span>
+                    <strong>{order.buyerName}</strong>
+                    <span className={styles['activityMeta']}>
+                      {order.ticketSummary} · {order.timeAgo}
+                    </span>
                   </div>
-                  <b className={activityToneClasses[activity.tone].amount}>{activity.amount}</b>
+                  <b className={styles[`amount-${order.amountTone}`]} data-tone={order.amountTone}>
+                    {order.amountLabel}
+                  </b>
                 </div>
               );
             })}
@@ -274,23 +271,28 @@ export function OverviewScreen({
                   href={event.href}
                   key={event.id}
                 >
+                  <OverviewEventPoster
+                    src={event.imageSrc}
+                    alt=""
+                    className={styles['upcomingPoster'] ?? ''}
+                    fallbackClassName={styles['upcomingPosterFallback'] ?? ''}
+                    sizes="(max-width: 700px) 100vw, 360px"
+                  />
                   <div>
                     <strong>{event.name}</strong>
                     <span>
                       {event.venue} · {event.dateLabel}
                     </span>
                   </div>
-                  {/* No declared capacity → no percentage, rather than a
-                      divide-by-zero dressed up as "0% sold". */}
-                  <b className={eventStatusClasses[event.status]}>
-                    {event.capacity === null ? (
-                      <small>sold</small>
-                    ) : (
+                  {/* Without a declared capacity, sell-through is unknown, so
+                      don't imply that the event is sold or show a percentage. */}
+                  {event.capacity !== null ? (
+                    <b className={eventStatusClasses[event.status]}>
                       <>
-                        {percent}%<small>sold</small>
+                        {percent}% <small>sold</small>
                       </>
-                    )}
-                  </b>
+                    </b>
+                  ) : null}
                 </Link>
               );
             })}
@@ -309,7 +311,10 @@ export function OverviewScreen({
             action="See all"
           />
           <div className={styles['networkList']}>
-            {data.network.map((member) => (
+            {data.network.length === 0 ? (
+              <p className={styles['overviewEmpty']}>No partner relationships yet.</p>
+            ) : null}
+            {data.network.slice(0, NETWORK_PREVIEW_LIMIT).map((member) => (
               <div className={styles['networkRow']} key={member.id}>
                 <span
                   className={classNames(

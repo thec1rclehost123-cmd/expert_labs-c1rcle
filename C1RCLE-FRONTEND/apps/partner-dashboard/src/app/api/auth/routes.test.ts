@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { forwardToGateway } from '@/lib/bff/auth-proxy';
 
 import { POST as changePassword } from './change-password/route';
+import { POST as forgotPassword } from './forgot-password/route';
 import { POST as login } from './login/route';
 import { POST as logout } from './logout/route';
 import { POST as refresh } from './refresh/route';
@@ -76,6 +77,10 @@ describe('POST /api/auth/signup', () => {
     );
 
     expect(res.status).toBe(201);
+    expect(mockForward).toHaveBeenCalledWith('/api/v2/auth/partner/signup', {
+      method: 'POST',
+      body: { email: 'a@b.com', password: 'password123', displayName: 'A' },
+    });
     await expect(res.json()).resolves.toMatchObject({ accessToken: 'tok_abc' });
     const setCookie = res.headers.get('set-cookie') ?? '';
     expect(setCookie).toContain('partner.c1rcle.csrf=');
@@ -326,5 +331,63 @@ describe('GET /api/auth/session', () => {
 
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toMatchObject({ user: { id: 'usr_1' } });
+    expect(res.headers.get('cache-control')).toBe('private, no-store');
+    expect(res.headers.get('set-cookie')).toContain('partner.c1rcle.csrf=');
+  });
+
+  it('does not rotate an existing app-scoped CSRF cookie during session hydration', async () => {
+    mockForward.mockResolvedValue(
+      gatewayResponse({ user: AUTH_BODY.user, expiresAt: AUTH_BODY.expiresAt }),
+    );
+
+    const res = await session(
+      new NextRequest(`${APP_ORIGIN}/api/auth/session`, {
+        headers: {
+          origin: APP_ORIGIN,
+          cookie: 'partner.c1rcle.csrf=existing-token',
+        },
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('mints the app-scoped CSRF cookie when only the legacy shared cookie exists', async () => {
+    mockForward.mockResolvedValue(
+      gatewayResponse({ user: AUTH_BODY.user, expiresAt: AUTH_BODY.expiresAt }),
+    );
+
+    const res = await session(
+      new NextRequest(`${APP_ORIGIN}/api/auth/session`, {
+        headers: {
+          origin: APP_ORIGIN,
+          cookie: 'c1rcle.csrf=legacy-token; better-auth.session_token=sess_abc',
+        },
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('set-cookie')).toContain('partner.c1rcle.csrf=');
+  });
+});
+
+describe('Partner recovery destination', () => {
+  it('binds the callback origin to this BFF, ignoring caller body destinations', async () => {
+    mockForward.mockResolvedValueOnce(gatewayResponse({ status: true }));
+    const body = { email: 'synthetic@example.invalid', redirectTo: 'https://attacker.example' };
+    const response = await forgotPassword(
+      new NextRequest(`${APP_ORIGIN}/api/auth/forgot-password`, {
+        method: 'POST',
+        headers: { origin: APP_ORIGIN, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(mockForward).toHaveBeenCalledWith('/api/v2/auth/forgot-password', {
+      method: 'POST',
+      body,
+      headers: { origin: APP_ORIGIN },
+    });
   });
 });

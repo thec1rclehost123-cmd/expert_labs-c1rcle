@@ -23,6 +23,12 @@ export interface PaymentOrderResponse {
   status: string;
 }
 
+/** Provider-sourced order identity used to reconcile uncertain creation. */
+export interface ProviderOrder extends PaymentOrderResponse {
+  receipt: string;
+  metadata: Record<string, string>;
+}
+
 export interface PaymentVerificationRequest {
   paymentId: string;
   orderId: string;
@@ -43,6 +49,10 @@ export interface PaymentVerificationResponse {
   orderId?: string | null;
   /** ISO-4217 code the provider captured in. */
   currency?: string;
+  /** Provider's captured processing fee in paise, when returned by the provider. */
+  feePaise?: number;
+  /** Tax on the provider fee in paise, when returned by the provider. */
+  taxOnFeePaise?: number;
 }
 
 /**
@@ -86,12 +96,22 @@ export interface RefundResponse {
   amountPaise: number;
 }
 
+/** A refund fact fetched from the provider, never supplied by an operator. */
+export interface ProviderRefund extends RefundResponse {
+  paymentId: string;
+  currency: string;
+  receipt: string | null;
+}
+
 export interface PaymentProvider {
   /**
    * Creates a payment order with the provider (e.g., Razorpay order).
-   * Must be idempotent via idempotencyKey.
+   * idempotencyKey is a stable receipt, NOT a provider POST idempotency guarantee.
+   * Callers must durably claim creation before invoking this method.
    */
   createOrder(request: PaymentOrderRequest): Promise<PaymentOrderResponse>;
+  /** Read-only recovery; unsupported adapters fail closed rather than create again. */
+  findOrdersByReceipt?(receipt: string): Promise<ProviderOrder[]>;
 
   /**
    * Verifies a payment signature (webhook or redirect).
@@ -108,6 +128,9 @@ export interface PaymentProvider {
    * Initiates a refund.
    */
   refundPayment(request: RefundRequest): Promise<RefundResponse>;
+
+  /** Read-only lookup used to reconcile an uncertain refund. */
+  getRefund(paymentId: string, refundId: string): Promise<ProviderRefund>;
 
   /**
    * Gets payment details.
@@ -131,8 +154,9 @@ export interface PaymentProvider {
  * network call is simulated, never the security check.
  */
 export class MemoryPaymentProvider implements PaymentProvider {
-  private readonly orders = new Map<string, PaymentOrderResponse>();
+  private readonly orders = new Map<string, ProviderOrder>();
   private readonly payments = new Map<string, PaymentVerificationResponse>();
+  private readonly refunds = new Map<string, ProviderRefund>();
 
   /**
    * @param webhookSecret signs/verifies webhook bodies (kept for call-site
@@ -153,14 +177,22 @@ export class MemoryPaymentProvider implements PaymentProvider {
     const id = `order_mem_${request.idempotencyKey}`;
     const existing = this.orders.get(id);
     if (existing) return existing;
-    const order: PaymentOrderResponse = {
+    const order: ProviderOrder = {
       id,
       amountPaise: request.amountPaise,
       currency: request.currency,
       status: 'created',
+      receipt: request.idempotencyKey,
+      metadata: { ...request.metadata },
     };
     this.orders.set(id, order);
     return order;
+  }
+
+  async findOrdersByReceipt(receipt: string): Promise<ProviderOrder[]> {
+    return [...this.orders.values()]
+      .filter((order) => order.receipt === receipt)
+      .map((order) => ({ ...order, metadata: { ...order.metadata } }));
   }
 
   async verifyPayment(request: PaymentVerificationRequest): Promise<PaymentVerificationResponse> {
@@ -189,6 +221,8 @@ export class MemoryPaymentProvider implements PaymentProvider {
       captured: true,
       orderId: existing?.orderId ?? null,
       currency: existing?.currency ?? 'INR',
+      feePaise: existing?.feePaise ?? 0,
+      taxOnFeePaise: existing?.taxOnFeePaise ?? 0,
     };
     this.payments.set(paymentId, captured);
     return captured;
@@ -196,11 +230,24 @@ export class MemoryPaymentProvider implements PaymentProvider {
 
   async refundPayment(request: RefundRequest): Promise<RefundResponse> {
     const payment = this.payments.get(request.paymentId);
-    return {
+    const refund: ProviderRefund = {
       id: `rfnd_mem_${request.idempotencyKey}`,
       status: 'processed',
       amountPaise: request.amountPaise ?? payment?.amountPaise ?? 0,
+      paymentId: request.paymentId,
+      currency: payment?.currency ?? 'INR',
+      receipt: request.idempotencyKey,
     };
+    this.refunds.set(refund.id, refund);
+    return { id: refund.id, status: refund.status, amountPaise: refund.amountPaise };
+  }
+
+  async getRefund(paymentId: string, refundId: string): Promise<ProviderRefund> {
+    const refund = this.refunds.get(refundId);
+    if (!refund || refund.paymentId !== paymentId) {
+      throw new InvalidOperationError('Provider refund not found');
+    }
+    return { ...refund };
   }
 
   async getPayment(paymentId: string): Promise<PaymentVerificationResponse | null> {
@@ -220,6 +267,7 @@ export class MemoryPaymentProvider implements PaymentProvider {
     amountPaise: number,
     orderId: string | null = null,
     currency = 'INR',
+    fees: { feePaise: number; taxOnFeePaise: number } = { feePaise: 0, taxOnFeePaise: 0 },
   ): void {
     this.payments.set(paymentId, {
       verified: true,
@@ -228,6 +276,8 @@ export class MemoryPaymentProvider implements PaymentProvider {
       captured: true,
       orderId,
       currency,
+      feePaise: fees.feePaise,
+      taxOnFeePaise: fees.taxOnFeePaise,
     });
   }
 }

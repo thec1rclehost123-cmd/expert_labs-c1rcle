@@ -15,6 +15,8 @@ export const userSchema = z.object({
   displayName: z.string().min(1),
   role: roleSchema,
   avatarUrl: z.url().nullable(),
+  /** Older gateways may omit this field. Only explicit true means verified. */
+  emailVerified: z.boolean().optional(),
   /**
    * True when the account is still on its staff-invitation temporary
    * password. The client must route to the password-change screen; the
@@ -55,7 +57,8 @@ export type LoginRequest = z.infer<typeof loginRequestSchema>;
 /** `POST /auth/{signup,login,refresh}` response — task.md §0 frontend bridge shape. */
 export const authBridgeResponseSchema = z.object({
   user: userSchema,
-  accessToken: z.string().min(1),
+  /** Same-origin app BFFs may keep the Gateway token server-side. */
+  accessToken: z.string().min(1).optional(),
   expiresAt: z.number().int().positive(),
 });
 export type AuthBridgeResponse = z.infer<typeof authBridgeResponseSchema>;

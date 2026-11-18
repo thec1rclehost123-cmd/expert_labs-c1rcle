@@ -41,8 +41,11 @@ import {
 } from 'react';
 
 import { isApiClientError } from '@c1rcle/api-client';
+import { refresh as refreshAuthSession, useSessionStore } from '@c1rcle/auth';
 import { getClientEnv } from '@c1rcle/config';
+import { onboardingProfileSchema } from '@c1rcle/contracts';
 
+import { PromoterAgreementPanel } from '@/components/promoter/PromoterAgreementPanel';
 import { useDashboardAuth } from '@/components/providers/DashboardAuthProvider';
 import { confirmPhoneOtp, getTestingBypassEnabled, sendPhoneOtp } from '@/lib/firebase/phone-auth';
 import { resolveKnownCity, searchCities, type CityEntry } from '@/lib/onboarding/cities';
@@ -53,6 +56,7 @@ import {
   submit as submitOnboardingApplication,
   uploadDocument,
   verifyDocument,
+  verifyPhone,
 } from '@/lib/onboarding/onboarding-repository';
 import { sendOtp, verifyOtp } from '@/lib/onboarding/otp';
 import {
@@ -87,8 +91,12 @@ import {
 } from '@/lib/onboarding/validation';
 import { routeAfterAuth } from '@/lib/org/route-after-auth';
 
-import type { OnboardingDocumentLabel, OnboardingProfileDto } from '@c1rcle/contracts';
-import type { User as SessionUser } from '@c1rcle/types';
+import type {
+  OnboardingDocumentLabel,
+  OnboardingProfileDto,
+  OnboardingRequestDto,
+  User as SessionUser,
+} from '@c1rcle/contracts';
 import type { ConfirmationResult } from 'firebase/auth';
 
 type OnboardingPlan = 'basic' | 'silver' | 'diamond';
@@ -108,6 +116,15 @@ function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback;
 }
 
+/** The onboarding API intentionally gates reads until phone verification is complete. */
+function isPhoneVerificationRequired(err: unknown): boolean {
+  return (
+    isApiClientError(err) &&
+    err.status === 403 &&
+    err.message === 'Verify your phone before using Partner onboarding.'
+  );
+}
+
 // ── Step type ─────────────────────────────────────────────────────────────────
 type OnboardingStep =
   | 'signup'
@@ -123,6 +140,8 @@ type OnboardingStep =
 
 type PartnerType = 'venue' | 'host' | 'promoter';
 type EntityType = 'individual' | 'business';
+const isPartnerType = (value: string | null): value is PartnerType =>
+  value === 'venue' || value === 'host' || value === 'promoter';
 
 // Dynamic sequence based on entity type (KYC steps vary). `signup` runs
 // before `email_verify` — the real `/onboarding/otp/send` route requires an
@@ -191,12 +210,14 @@ export function OnboardingPage() {
   const testPhone = testingBypass ? (clientEnv.NEXT_PUBLIC_FIREBASE_TEST_PHONE ?? '') : '';
 
   const [step, setStep] = useState<OnboardingStep>('role');
-  const [partnerType, setPartnerType] = useState<PartnerType>(
-    (searchParams.get('type') as PartnerType | null) ?? 'venue',
-  );
+  const routeTypeParam = searchParams.get('type');
+  const routeType = isPartnerType(routeTypeParam) ? routeTypeParam : null;
+  const [partnerType, setPartnerType] = useState<PartnerType>(routeType ?? 'venue');
+  const [roleChosen, setRoleChosen] = useState(routeType !== null);
   const [entityType, setEntityType] = useState<EntityType>('individual');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [initialLoadFailed, setInitialLoadFailed] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
 
   // Success screen status — driven by the real application status from getMine(),
@@ -204,8 +225,15 @@ export function OnboardingPage() {
   const [approvalStatus, setApprovalStatus] = useState<
     'pending' | 'approved' | 'changes_requested' | 'rejected'
   >('pending');
-  const [reviewNote] = useState('');
+  const [reviewNote, setReviewNote] = useState('');
+  const [applicationDocuments, setApplicationDocuments] = useState<
+    OnboardingRequestDto['documents']
+  >([]);
+  const [kycDetails, setKycDetails] = useState<OnboardingProfileDto['kyc']>({});
   const [submittedRequestId, setSubmittedRequestId] = useState<string | null>(null);
+  const [savedApplicationStatus, setSavedApplicationStatus] = useState<
+    OnboardingRequestDto['status'] | null
+  >(null);
   // B2: one Idempotency-Key per user intent — minted on the first click and
   // reused across retries of that same click so a retry after a partial
   // server-side write can never mint a fresh key and double-create (or
@@ -215,7 +243,7 @@ export function OnboardingPage() {
 
   // KYC step state — documents are uploaded/confirmed server-side as each
   // KycFileZone completes; kycStepData is local UI bookkeeping only now.
-  const [, setKycSubmitting] = useState(false);
+  const [kycSubmitting, setKycSubmitting] = useState(false);
   const [kycError, setKycError] = useState('');
 
   // Existing user detection state
@@ -253,7 +281,7 @@ export function OnboardingPage() {
     businessType: string;
     registrationNumber: string;
   }>({
-    email: '',
+    email: searchParams.get('email') ?? '',
     password: '',
     name: '',
     contactPerson: '',
@@ -353,43 +381,10 @@ export function OnboardingPage() {
     };
   }, [entityType, formData, otpPhone]);
 
-  // ── Save onboarding progress so the user can resume mid-form ─────────
-  // `currentStep` is UI-only now — the real backend has no step field, it
-  // just stores profile fields; resume position is re-derived from those
-  // fields + document/status state via `getMine()`, not from a stored step.
-  // `plan`/`role`/`association`/`associatedHostId`/`upcomingEventsText`/
-  // `pastEventsText` have no home in `saveOnboardingProgressSchema` (it's
-  // `.strict()`) so they stay purely local UI state, never sent to the server.
-  const saveProgress = useCallback(
-    async (_currentStep: OnboardingStep) => {
-      if (!submittedRequestId) return;
-      try {
-        await saveOnboardingProgress(submittedRequestId, profilePayload());
-      } catch {
-        /* silent — non-critical, matches the prior best-effort autosave */
-      }
-    },
-    [submittedRequestId, profilePayload],
-  );
-
   // Dynamic sequence depends on entity type chosen at step 4
   const stepSequence = getStepSequence(entityType);
 
   const initialised = useRef(false);
-
-  // Pre-fill from URL params (existing behaviour kept)
-  useEffect(() => {
-    const type = searchParams.get('type') as PartnerType;
-    const email = searchParams.get('email');
-    const hostId = searchParams.get('hostId');
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition, react-hooks/set-state-in-effect
-    if (type) setPartnerType(type);
-    if (email) {
-      setOtpEmail(email);
-      setFormData((prev) => ({ ...prev, email }));
-    }
-    if (hostId) setFormData((prev) => ({ ...prev, associatedHostId: hostId }));
-  }, [searchParams]);
 
   // ── Resume onboarding state from the real backend on load ────────────────
   // There is no server-side `onboardingStep` field — the step to resume at is
@@ -406,26 +401,22 @@ export function OnboardingPage() {
     const checkInitialState = async () => {
       initialChecked.current = true;
       if (authUser) {
+        if (authUser.emailVerified !== true) {
+          setFormData((prev) => ({ ...prev, email: authUser.email }));
+          setOtpEmail(authUser.email);
+          initialised.current = true;
+          setStep('email_verify');
+          return;
+        }
         if (isApproved) {
           void routeAfterAuth(router);
           return;
         }
         try {
-          const application = await getMine();
+          const application = await getMine(routeType ?? undefined);
           if (application) {
             setSubmittedRequestId(application.id);
-
-            if (application.status !== 'draft') {
-              // submitted / changes_requested / approved / rejected — the
-              // success screen renders the real status, no further wizard
-              // steps to resume into.
-              setApprovalStatus(
-                application.status === 'submitted' ? 'pending' : application.status,
-              );
-              setStep('success');
-              initialised.current = true;
-              return;
-            }
+            setSavedApplicationStatus(application.status);
 
             // Draft application — resume mid-wizard from its saved profile.
             // The backend has no stored "step"; missingDocuments tells us
@@ -453,6 +444,24 @@ export function OnboardingPage() {
               setOtpPhone(p.phone);
             }
 
+            setPartnerType(application.requestedType);
+            setRoleChosen(true);
+            setReviewNote(application.reviewNote ?? '');
+            setApplicationDocuments(application.documents);
+            setKycDetails(application.profile.kyc ?? {});
+
+            if (application.status !== 'draft') {
+              // submitted / changes_requested / approved / rejected — the
+              // success screen renders the real status, no further wizard
+              // steps to resume into.
+              setApprovalStatus(
+                application.status === 'submitted' ? 'pending' : application.status,
+              );
+              setStep('success');
+              initialised.current = true;
+              return;
+            }
+
             const seq = getStepSequence(isBusiness ? 'business' : 'individual');
             const resumeStep =
               application.missingDocuments.length > 0
@@ -463,32 +472,41 @@ export function OnboardingPage() {
             return;
           }
 
-          // Authenticated but no application on record yet — this account is
-          // already good (they have a live session), so continue the wizard
-          // from the first authed step instead of discarding it. Mirrors the
-          // equivalent branch in `handleExistingUserLogin`.
+          // No saved application: preserve an explicit role link, otherwise
+          // require the applicant to choose a role before continuing.
           setFormData((prev) => ({ ...prev, email: authUser.email }));
           setOtpEmail(authUser.email);
           initialised.current = true;
-          setStep('phone_verify');
+          setStep(routeType ? 'entity_type' : 'role');
           return;
-        } catch {
-          /* fall through — restart the wizard from `role` */
+        } catch (err) {
+          if (isPhoneVerificationRequired(err)) {
+            setFormData((prev) => ({ ...prev, email: authUser.email }));
+            setOtpEmail(authUser.email);
+            setError('Verify your phone number to continue.');
+            initialised.current = true;
+            setStep('phone_verify');
+            return;
+          }
+          setInitialLoadFailed(true);
+          return;
         }
       }
       setStep('role');
     };
 
     void checkInitialState();
-  }, [authLoading, authUser, signOut, isApproved, router]);
+  }, [authLoading, authUser, signOut, isApproved, router, routeType]);
 
   // Approval polling — real application status via getMine()
   useEffect(() => {
     if (step !== 'success' || !submittedRequestId) return;
     const checkApproval = async () => {
       try {
-        const application = await getMine();
+        const application = await getMine(partnerType);
         if (!application) return;
+        setSavedApplicationStatus(application.status);
+        setReviewNote(application.reviewNote ?? '');
         setApprovalStatus(
           application.status === 'submitted' || application.status === 'draft'
             ? 'pending'
@@ -503,7 +521,7 @@ export function OnboardingPage() {
     return () => {
       clearInterval(interval);
     };
-  }, [step, submittedRequestId]);
+  }, [step, submittedRequestId, partnerType]);
 
   const handleInputChange = (
     e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>,
@@ -591,11 +609,21 @@ export function OnboardingPage() {
     setLoading(true);
     try {
       await authSignUp(otpEmail, formData.password, formData.name.trim());
-      await sendOtp(otpEmail);
-      setOtpEmailSent(true);
+      // Account creation is durable and cannot be rolled back when email
+      // delivery fails. Move to the verification step first so retrying the
+      // action sends another code instead of attempting a duplicate signup.
+      setOtpEmailSent(false);
       setFormData((prev) => ({ ...prev, email: otpEmail }));
-      startCooldown(setEmailCooldown, emailCooldownRef);
       setStep('email_verify');
+      try {
+        await sendOtp(otpEmail);
+        setOtpEmailSent(true);
+        startCooldown(setEmailCooldown, emailCooldownRef);
+      } catch {
+        setError(
+          'Your account was created, but we could not send the email code. Try Send Code again.',
+        );
+      }
     } catch (err) {
       if (isApiClientError(err) && err.status === 409) {
         setEmailExists(true);
@@ -617,12 +645,37 @@ export function OnboardingPage() {
     }
     setLoading(true);
     try {
-      await authSignIn(otpEmail, loginPassword);
+      const signedInUser = await authSignIn(otpEmail, loginPassword);
+      if (signedInUser.emailVerified !== true) {
+        setOtpEmail(signedInUser.email);
+        setFormData((prev) => ({ ...prev, email: signedInUser.email }));
+        setOtpEmailSent(false);
+        setOtpEmailCode('');
+        initialised.current = true;
+        setStep('email_verify');
+        return;
+      }
 
-      const application = await getMine();
+      let application: OnboardingRequestDto | null;
+      try {
+        application = await getMine(partnerType);
+      } catch (err) {
+        // The onboarding route intentionally blocks an account whose phone
+        // proof is incomplete. Email is already verified above, so recover at
+        // the phone step instead of showing a generic route error.
+        if (isApiClientError(err) && err.status === 403 && /verify your phone/i.test(err.message)) {
+          setOtpEmail(signedInUser.email);
+          setFormData((prev) => ({ ...prev, email: signedInUser.email }));
+          initialised.current = true;
+          setStep('phone_verify');
+          return;
+        }
+        throw err;
+      }
 
       if (application && application.status !== 'draft') {
         setSubmittedRequestId(application.id);
+        setSavedApplicationStatus(application.status);
         setApprovalStatus(application.status === 'submitted' ? 'pending' : application.status);
         initialised.current = true;
         setStep('success');
@@ -632,6 +685,7 @@ export function OnboardingPage() {
 
       if (application) {
         setSubmittedRequestId(application.id);
+        setSavedApplicationStatus(application.status);
         const p = application.profile;
         const isBusiness = p.entityType === 'business';
         setEntityType(isBusiness ? 'business' : 'individual');
@@ -708,6 +762,10 @@ export function OnboardingPage() {
     setLoading(true);
     try {
       await verifyOtp(otpEmail, otpEmailCode);
+      const refreshed = await refreshAuthSession();
+      if (!refreshed || useSessionStore.getState().session?.user.emailVerified !== true) {
+        throw new Error('Email verification could not be confirmed. Please sign in again.');
+      }
       setStep('phone_verify');
     } catch (err) {
       setError(errorMessage(err, 'Invalid or expired code.'));
@@ -796,15 +854,11 @@ export function OnboardingPage() {
       // it returns still has to be checked server-side against the applicant's
       // own entered number via the real onboarding verification endpoint.
       const idToken = await confirmPhoneOtp(phoneConfirmation, otpPhoneCode);
-      const result = await verifyDocument({
-        documentType: 'phone',
-        documentNumber: dialablePhone,
-        proofToken: idToken,
-      });
+      const result = await verifyPhone({ phoneNumber: dialablePhone, idToken });
       if (!result.passed) {
         throw new Error(result.reason ?? 'Phone verification failed.');
       }
-      setStep('entity_type');
+      setStep(roleChosen ? 'entity_type' : 'role');
     } catch (err) {
       setError(errorMessage(err, 'Invalid or expired code.'));
     } finally {
@@ -832,15 +886,19 @@ export function OnboardingPage() {
       // Open the application now that we have a real session — this is the
       // one call that persists the full profile server-side; the request id
       // it returns backs every subsequent saveProgress/upload/submit call.
-      const application = await startOnboarding(
-        {
-          requestedType: partnerType,
-          plan: DEFAULT_PLAN,
-          profile: profilePayload(),
-        },
-        (startOnboardingKeyRef.current ??= crypto.randomUUID()),
-      );
+      const application = submittedRequestId
+        ? await saveOnboardingProgress(submittedRequestId, profilePayload())
+        : await startOnboarding(
+            {
+              requestedType: partnerType,
+              plan: DEFAULT_PLAN,
+              profile: profilePayload(),
+            },
+            (startOnboardingKeyRef.current ??= crypto.randomUUID()),
+          );
       setSubmittedRequestId(application.id);
+      setSavedApplicationStatus(application.status);
+      setApplicationDocuments(application.documents);
       setFieldErrors({});
 
       // Advance to the first KYC step in the sequence
@@ -883,6 +941,7 @@ export function OnboardingPage() {
           (submitOnboardingKeyRef.current ??= crypto.randomUUID()),
         );
         setSubmittedRequestId(application.id);
+        setSavedApplicationStatus(application.status);
         setApprovalStatus('pending');
         setStep('success');
       } catch (err) {
@@ -906,26 +965,80 @@ export function OnboardingPage() {
   // Documents are already uploaded/confirmed server-side by KycFileZone as
   // each field is filled in — this only advances the wizard.
   const handleKycStep = useCallback(
-    (stepId: string, _data: Record<string, unknown>) => {
-      const idx = stepSequence.indexOf(stepId as OnboardingStep);
-      const isLastStep = idx === stepSequence.length - 2; // second-to-last (before "success")
-      if (isLastStep) {
-        void submitApplication(stepId, _data);
-      } else {
-        if (idx !== -1 && idx < stepSequence.length - 1) {
+    async (stepId: string, data: Record<string, unknown>) => {
+      if (kycSubmitting || !submittedRequestId) return;
+      setKycSubmitting(true);
+      setKycError('');
+      try {
+        const identity = { idType: data['idType'], idNumber: data['idNumber'] };
+        const kyc =
+          stepId === 'kyc_business'
+            ? { business: { pan: data['pan'], gst: data['gst'], address: data['address'] } }
+            : stepId === 'kyc_signatory'
+              ? {
+                  signatory: {
+                    ...identity,
+                    fullName: data['fullName'],
+                    designation: data['designation'],
+                    email: data['email'],
+                    phone: data['phone'],
+                    declared: data['declared'],
+                  },
+                }
+              : { identity };
+        const patch = onboardingProfileSchema.partial().parse({ kyc });
+        const saved = await saveOnboardingProgress(submittedRequestId, patch);
+        setKycDetails(saved.profile.kyc ?? {});
+        setApplicationDocuments(saved.documents);
+        const idx = stepSequence.indexOf(stepId as OnboardingStep);
+        if (idx === stepSequence.length - 2) await submitApplication(stepId, data);
+        else {
           const next = stepSequence[idx + 1];
-          if (next) {
-            setStep(next);
-            void saveProgress(next);
-          }
+          if (next) setStep(next);
         }
+      } catch {
+        setKycError('Your verification details could not be saved. Check them and try again.');
+      } finally {
+        setKycSubmitting(false);
       }
     },
-    [stepSequence, submitApplication, saveProgress],
+    [kycSubmitting, submittedRequestId, stepSequence, submitApplication],
   );
 
   const currentStepIndex = stepSequence.indexOf(step);
   const requestedType = partnerType;
+  const savedStatusLabel = savedApplicationStatus
+    ? {
+        draft: 'Draft',
+        submitted: 'Submitted',
+        changes_requested: 'Changes requested',
+        approved: 'Approved',
+        rejected: 'Rejected',
+      }[savedApplicationStatus]
+    : null;
+  const documentPath = (label: string) =>
+    applicationDocuments.find((doc) => doc.label === label && doc.status !== 'rejected')
+      ?.storagePath;
+
+  if (initialLoadFailed)
+    return (
+      <main className="mx-auto max-w-xl px-6 py-24 space-y-6">
+        <h1 className="text-display-sm text-[var(--text-primary)]">
+          Your application could not be loaded
+        </h1>
+        <p className="text-body text-[var(--text-secondary)]">
+          Your saved progress is unchanged. Try loading it again before continuing.
+        </p>
+        <button
+          className="rounded-xl bg-[var(--accent-primary)] px-6 py-3 text-white"
+          onClick={() => {
+            window.location.reload();
+          }}
+        >
+          Try again
+        </button>
+      </main>
+    );
 
   return (
     <div className="min-h-screen bg-[var(--surface-base)]">
@@ -998,6 +1111,12 @@ export function OnboardingPage() {
       )}
 
       <main className="max-w-xl mx-auto px-6 pb-24">
+        {savedStatusLabel && (
+          <p role="status" className="mb-6 text-label text-[var(--text-tertiary)]">
+            Saved {partnerType} application · {savedStatusLabel}
+          </p>
+        )}
+        {partnerType === 'promoter' && submittedRequestId && <PromoterAgreementPanel />}
         <AnimatePresence mode="wait">
           {/* ── Sign Up ── */}
           {step === 'signup' && (
@@ -1350,34 +1469,38 @@ export function OnboardingPage() {
                   icon={Building2}
                   title="Venue Partner"
                   description="Direct management for nightlife venues, clubs, and lounge spaces."
-                  active={partnerType === 'venue'}
+                  active={roleChosen && partnerType === 'venue'}
                   onClick={() => {
                     setPartnerType('venue');
+                    setRoleChosen(true);
                   }}
                 />
                 <RoleCard
                   icon={Users}
                   title="Event Host"
                   description="For organizers, DJs, and collectives hosting independent events."
-                  active={partnerType === 'host'}
+                  active={roleChosen && partnerType === 'host'}
                   onClick={() => {
                     setPartnerType('host');
+                    setRoleChosen(true);
                   }}
                 />
                 <RoleCard
                   icon={Zap}
                   title="Promoter"
                   description="Access tools for ticket distribution and guestlist management."
-                  active={partnerType === 'promoter'}
+                  active={roleChosen && partnerType === 'promoter'}
                   onClick={() => {
                     setPartnerType('promoter');
+                    setRoleChosen(true);
                   }}
                 />
               </div>
               <ActionButton
+                disabled={!roleChosen}
                 onClick={() => {
                   setError('');
-                  setStep('signup');
+                  setStep(authUser?.emailVerified === true ? 'entity_type' : 'signup');
                 }}
               >
                 Continue <ChevronRight className="h-5 w-5" />
@@ -1713,11 +1836,16 @@ export function OnboardingPage() {
               {kycError && <ErrorBanner error={kycError} />}
               <KycIdentityForm
                 requestId={submittedRequestId}
-                initialData={{}}
-                onSubmit={(data) => {
-                  handleKycStep('kyc_identity', data);
+                initialData={{
+                  ...kycDetails?.identity,
+                  docFrontUrl: documentPath('id_front'),
+                  docBackUrl: documentPath('id_back'),
+                  selfieUrl: documentPath('selfie'),
                 }}
-                submitting={false}
+                onSubmit={(data) => {
+                  void handleKycStep('kyc_identity', data);
+                }}
+                submitting={kycSubmitting}
                 submitLabel="Continue"
               />
             </motion.div>
@@ -1742,14 +1870,16 @@ export function OnboardingPage() {
               <KycBusinessForm
                 requestId={submittedRequestId}
                 initialData={{
+                  ...kycDetails?.business,
                   legalName: formData.name,
                   businessType: formData.businessType,
                   cin: formData.registrationNumber,
+                  regDocUrl: documentPath('registration_certificate'),
                 }}
                 onSubmit={(data) => {
-                  handleKycStep('kyc_business', data);
+                  void handleKycStep('kyc_business', data);
                 }}
-                submitting={false}
+                submitting={kycSubmitting}
                 submitLabel="Continue"
               />
             </motion.div>
@@ -1773,11 +1903,19 @@ export function OnboardingPage() {
               {kycError && <ErrorBanner error={kycError} />}
               <KycSignatoryForm
                 requestId={submittedRequestId}
-                initialData={{}}
-                onSubmit={(data) => {
-                  handleKycStep('kyc_signatory', data);
+                initialData={{
+                  fullName: formData.contactPerson,
+                  email: formData.email,
+                  phone: formData.phone,
+                  ...kycDetails?.signatory,
+                  docFrontUrl: documentPath('sig_id_front'),
+                  docBackUrl: documentPath('sig_id_back'),
+                  selfieUrl: documentPath('sig_selfie'),
                 }}
-                submitting={false}
+                onSubmit={(data) => {
+                  void handleKycStep('kyc_signatory', data);
+                }}
+                submitting={kycSubmitting}
                 submitLabel="Continue"
               />
             </motion.div>
@@ -3064,7 +3202,7 @@ function KycSignatoryForm({
     (initialData['docBackUrl'] as string) || null,
   );
   const [selfie, setSelfie] = useState<string | null>((initialData['selfieUrl'] as string) || null);
-  const [declared, setDeclared] = useState(false);
+  const [declared, setDeclared] = useState(Boolean(initialData['declared']));
   const [errors, setErrors] = useState<Record<string, string>>({});
 
   // Business applicants must supply sig_id_front, sig_id_back and sig_selfie

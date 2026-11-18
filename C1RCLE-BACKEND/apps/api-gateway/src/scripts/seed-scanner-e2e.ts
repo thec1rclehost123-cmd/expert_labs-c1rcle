@@ -26,10 +26,10 @@ import { createV2Services } from '../lib/v2-services.js';
  * nothing in this repo could stand a scanner shift up from nothing.
  *
  * Writes real records to whatever `FIRESTORE_PROJECT_ID` `.env.local` points
- * at via `services.repos()` directly — the same pattern
- * `seed-platform-admin.ts` uses. A Better Auth user is created through the
- * real HTTP signup route (not hand-written into Firestore) because password
- * hashing is Better Auth's
+ * at (currently `c1rcle-v2`) via `services.repos()` directly — the same
+ * pattern `seed-platform-admin.ts` and `migrate-and-seed-v1-sample.ts` use.
+ * A Better Auth user is created through the real HTTP signup route (not
+ * hand-written into Firestore) because password hashing is Better Auth's
  * concern, not something to reimplement here.
  *
  * Usage: `pnpm --filter api-gateway exec tsx src/scripts/seed-scanner-e2e.ts`
@@ -39,7 +39,7 @@ import { createV2Services } from '../lib/v2-services.js';
  */
 
 const GATEWAY_URL = 'http://localhost:8080';
-const OWNER_EMAIL = process.env.SEED_E2E_OWNER_EMAIL ?? 'seed_e2e_owner@c1rcle.test';
+const OWNER_EMAIL = 'seed_e2e_owner@c1rcle.test';
 const OWNER_PASSWORD = process.env.SEED_E2E_OWNER_PASSWORD;
 if (OWNER_PASSWORD === undefined) {
   throw new Error('SEED_E2E_OWNER_PASSWORD must be set to run the scanner seed script.');
