@@ -7,10 +7,13 @@ import {
   opaqueIdSchema,
   paginationQuerySchema,
   paginatedSchema,
+  promoterAgreementAcceptanceRequestSchema,
+  promoterAgreementStatusDtoSchema,
   saveOnboardingProgressSchema,
   startOnboardingSchema,
   verificationResultDtoSchema,
   verifyDocumentSchema,
+  verifyPhoneSchema,
 } from '@c1rcle/contracts/client';
 import { missingDocuments } from '@c1rcle/core/domain';
 import { z } from 'zod';
@@ -43,8 +46,106 @@ const services = createV2Services();
 const requestIdParam = z.object({ requestId: opaqueIdSchema });
 const commandHeaders = z.looseObject({ 'idempotency-key': idempotencyKeySchema });
 const requestListSchema = paginatedSchema(onboardingRequestDtoSchema);
+const onboardingMeQuerySchema = z.object({
+  requestedType: z.enum(['venue', 'host', 'promoter']).optional(),
+});
 
 export default async function onboardingRoutes(fastify: FastifyInstance) {
+  fastify.addHook('preHandler', async (request, reply) => {
+    const path = (request.raw.url ?? '').split('?')[0] ?? '';
+    if (path.endsWith('/onboarding/verify-phone') || path.includes('/admin/onboarding/')) return;
+    const userId = requireUserId(request, reply);
+    if (userId === undefined) return reply;
+    const account = await services.repos().users.getById(userId);
+    if (!account?.emailVerified) {
+      return reply.status(403).send({
+        message: 'Verify your email before using Partner onboarding.',
+        code: 'contact_verification_required',
+      });
+    }
+    const profile = await services.repos().guestProfiles.getByUserId(userId);
+    if (!profile?.phoneVerifiedAt) {
+      return reply.status(403).send({
+        message: 'Verify your phone before using Partner onboarding.',
+        code: 'contact_verification_required',
+      });
+    }
+  });
+  fastify.addHook('onSend', async (_request, reply, payload) => {
+    reply.header('cache-control', 'private, no-store');
+    return payload;
+  });
+  fastify.get(
+    '/onboarding/promoter-agreement',
+    { preHandler: [fastify.rateLimit('AUTH_READ')] },
+    async (request, reply) => {
+      const userId = requireUserId(request, reply);
+      if (userId === undefined) return reply;
+      const agreement = services.onboarding.getCurrentPromoterAgreement();
+      const validated = validateV2Response(reply, request, promoterAgreementStatusDtoSchema, {
+        agreement,
+        activationAvailable: agreement !== null && agreement.status !== 'test_fixture',
+      });
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
+  fastify.post(
+    '/onboarding/applications/:requestId/promoter-agreement/accept',
+    {
+      preHandler: [
+        fastify.rateLimit('STANDARD_COMMAND'),
+        fastify.validateV2({
+          params: requestIdParam,
+          headers: commandHeaders,
+          body: promoterAgreementAcceptanceRequestSchema.omit({ requestId: true }),
+        }),
+      ],
+    },
+    async (request, reply) => {
+      const userId = requireUserId(request, reply);
+      if (userId === undefined) return reply;
+      const { requestId } = request.params as z.infer<typeof requestIdParam>;
+      const body = request.body as Omit<
+        z.infer<typeof promoterAgreementAcceptanceRequestSchema>,
+        'requestId'
+      >;
+      const headers = request.v2Headers ?? {};
+      const result = await runIdempotent({
+        idempotency: services.idempotency,
+        request,
+        actorId: userId,
+        commandName: 'onboarding.promoter-agreement.accept',
+        idempotencyKey: headers['idempotency-key'],
+        context: { path: { requestId }, body },
+        run: async () => {
+          const accepted = await services.onboarding.acceptPromoterAgreement(
+            userId,
+            requestId,
+            body.version,
+          );
+          const validated = validateV2Response(
+            reply,
+            request,
+            onboardingRequestDtoSchema,
+            toDto(accepted),
+          );
+          if (validated === undefined) throw new Error('v2 response validation failed');
+          return { statusCode: 200, body: validated };
+        },
+      }).catch((error: unknown) =>
+        isIdempotencyConflict(error)
+          ? mapDomainError(reply, request, requestId, error, {
+              conflictId: headers['idempotency-key'],
+            })
+          : mapDomainError(reply, request, requestId, error),
+      );
+      if (result === undefined) return reply;
+      return reply.status(result.statusCode).send(result.body);
+    },
+  );
+
   /** The applicant's live application, or `null` before they have started. */
   fastify.get(
     '/onboarding/me',
@@ -53,8 +154,15 @@ export default async function onboardingRoutes(fastify: FastifyInstance) {
       const userId = requireUserId(request, reply);
       if (userId === undefined) return reply;
 
+      const query = onboardingMeQuerySchema.safeParse(request.query);
+      if (!query.success) {
+        return reply
+          .status(400)
+          .send({ code: 'invalid_query', message: 'Invalid onboarding role.' });
+      }
+
       const found = await services.onboarding
-        .getMine(userId)
+        .getMine(userId, query.data.requestedType)
         .catch((error: unknown) => mapDomainError(reply, request, userId, error));
       if (found === undefined) return reply;
       if (found === null) return reply.status(200).send({ request: null });
@@ -255,6 +363,37 @@ export default async function onboardingRoutes(fastify: FastifyInstance) {
    * the second survives a caller rotating IPs.
    */
   fastify.post(
+    '/onboarding/verify-phone',
+    {
+      config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+      preHandler: [
+        fastify.rateLimit('SENSITIVE_COMMAND'),
+        fastify.validateV2({ body: verifyPhoneSchema }),
+      ],
+    },
+    // codeql[js/missing-rate-limiting] This route is rate-limited by the
+    // SENSITIVE_COMMAND preHandler above. CodeQL cannot follow the custom
+    // Fastify decorator; onboarding.test.ts verifies the 429 boundary.
+    async (request, reply) => {
+      const userId = requireUserId(request, reply);
+      if (userId === undefined) return reply;
+      const body = request.body as z.infer<typeof verifyPhoneSchema>;
+      const result = await services.onboarding
+        .verifyPhone(userId, body.phoneNumber, body.idToken)
+        .catch((error: unknown) => mapDomainError(reply, request, userId, error));
+      if (result === undefined) return reply;
+      const validated = validateV2Response(reply, request, verificationResultDtoSchema, {
+        passed: result.passed,
+        provider: result.provider,
+        reason: result.reason ?? null,
+        referenceId: result.referenceId ?? null,
+      });
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
+  fastify.post(
     '/onboarding/verify-document',
     {
       preHandler: [
@@ -354,6 +493,7 @@ export function toDto(request: OnboardingRequest) {
     plan: request.plan,
     profile: request.profile,
     documents: request.documents,
+    promoterAgreementAcceptances: request.promoterAgreementAcceptances ?? [],
     missingDocuments: missingDocuments(request),
     submittedAt: request.submittedAt,
     reviewedBy: request.reviewedBy,

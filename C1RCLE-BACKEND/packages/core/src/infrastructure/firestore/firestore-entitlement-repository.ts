@@ -1,10 +1,32 @@
-import { admitSeats } from '../../domain/models/entitlement.js';
+import { ConflictError, NotFoundError, VersionConflictError } from '../../domain/errors.js';
+import { deterministicDomainEventId, domainEvent } from '../../domain/events.js';
+import { bumpVersion } from '../../domain/identity.js';
+import { admissionLedger } from '../../domain/models/admission-ledger.js';
+import {
+  admitSeats,
+  changeEntitlementHolder,
+  currentEntitlementHolderId,
+  redeemTicketAddonEntitlement,
+  restoreEntitlementAfterUpgradeRefund,
+  supersedeEntitlementForUpgrade,
+} from '../../domain/models/entitlement.js';
+import { eventCoverAccountId, transferEventCoverHolder } from '../../domain/models/event-cover.js';
+import {
+  eventAdmissionUnavailableReason,
+  eventTransferUnavailableReason,
+} from '../../domain/models/event-policy.js';
+import { resolveTicketTransfer } from '../../domain/models/ticket-transfer.js';
 
 import { compareAndSet } from './compare-and-set.js';
+import { outboxDocument } from './firestore-outbox-store.js';
+import { scanLedgerToDoc } from './firestore-scan-ledger-repository.js';
 import { paginateQuery, paginateUnordered } from './pagination.js';
 
+import type { DomainEvent } from '../../domain/events.js';
 import type { EntityId } from '../../domain/identity.js';
 import type { Entitlement, EntitlementStatus } from '../../domain/models/entitlement.js';
+import type { Event } from '../../domain/models/event.js';
+import type { TicketTransfer, TicketTransferStatus } from '../../domain/models/ticket-transfer.js';
 import type {
   AdmissionClaim,
   ClaimAdmissionOptions,
@@ -16,6 +38,7 @@ import type {
 import type { DocumentData, Firestore } from 'firebase-admin/firestore';
 
 const COLLECTION = 'v2_entitlements';
+const TRANSFER_COLLECTION = 'v2_ticket_transfers';
 
 /**
  * Firestore adapter for `EntitlementRepository` (Phase 4).
@@ -29,10 +52,14 @@ export class FirestoreEntitlementRepository implements EntitlementRepository {
     return this.db.collection(COLLECTION);
   }
 
+  private get transferCollection() {
+    return this.db.collection(TRANSFER_COLLECTION);
+  }
+
   async getById(entitlementId: EntityId): Promise<Entitlement | null> {
     const snap = await this.collection.doc(entitlementId).get();
     const data = snap.data();
-    return data ? toEntitlement(data) : null;
+    return data ? entitlementFromDoc(data) : null;
   }
 
   async findById(entitlementId: EntityId): Promise<Entitlement | null> {
@@ -41,7 +68,7 @@ export class FirestoreEntitlementRepository implements EntitlementRepository {
 
   async getByOrderId(orderId: EntityId): Promise<Entitlement[]> {
     const snap = await this.collection.where('orderId', '==', orderId).get();
-    return snap.docs.map((doc) => toEntitlement(doc.data()));
+    return snap.docs.map((doc) => entitlementFromDoc(doc.data()));
   }
 
   // Index-free (single-field filter; newest-first sort happens in code —
@@ -49,12 +76,27 @@ export class FirestoreEntitlementRepository implements EntitlementRepository {
   // composite indexes (wallet, door, partner surfaces).
   async listByUser(userId: EntityId, query: PaginationQuery): Promise<Page<Entitlement>> {
     const base = this.collection.where('userId', '==', userId);
-    return paginateUnordered(base, query, toEntitlement);
+    return paginateUnordered(base, query, entitlementFromDoc);
+  }
+
+  async listByHolder(userId: EntityId, query: PaginationQuery): Promise<Page<Entitlement>> {
+    const [purchased, assigned] = await Promise.all([
+      this.collection.where('userId', '==', userId).get(),
+      this.collection.where('currentHolderUserId', '==', userId).get(),
+    ]);
+    const merged = new Map<string, Entitlement>();
+    for (const doc of [...purchased.docs, ...assigned.docs]) {
+      const entitlement = entitlementFromDoc(doc.data());
+      if (currentEntitlementHolderId(entitlement) === userId) {
+        merged.set(entitlement.id, entitlement);
+      }
+    }
+    return paginateMemory([...merged.values()], query);
   }
 
   async listByEvent(eventId: EntityId, query: PaginationQuery): Promise<Page<Entitlement>> {
     const base = this.collection.where('eventId', '==', eventId);
-    return paginateUnordered(base, query, toEntitlement);
+    return paginateUnordered(base, query, entitlementFromDoc);
   }
 
   async listByOrganization(
@@ -62,16 +104,83 @@ export class FirestoreEntitlementRepository implements EntitlementRepository {
     query: PaginationQuery,
   ): Promise<Page<Entitlement>> {
     const base = this.collection.where('organizationId', '==', organizationId);
-    return paginateUnordered(base, query, toEntitlement);
+    return paginateUnordered(base, query, entitlementFromDoc);
   }
 
   async listAll(query: PaginationQuery): Promise<Page<Entitlement>> {
     const base = this.collection.orderBy('createdAt', 'desc');
-    return paginateQuery(base, query, toEntitlement);
+    return paginateQuery(base, query, entitlementFromDoc);
   }
 
-  async save(entitlement: Entitlement, _tx?: TxContext | null): Promise<void> {
-    await compareAndSet(this.db, this.collection, entitlement, toDoc);
+  async save(
+    entitlement: Entitlement,
+    _tx?: TxContext | null,
+    outboxEvent?: DomainEvent,
+  ): Promise<void> {
+    if (!outboxEvent) {
+      await compareAndSet(this.db, this.collection, entitlement, entitlementToDoc);
+      return;
+    }
+    const initialIssuance = entitlement.version === 1 && outboxEvent.type === 'ticket.issued';
+    if (
+      initialIssuance &&
+      (outboxEvent.aggregateId !== entitlement.id ||
+        outboxEvent.organizationId !== entitlement.organizationId ||
+        outboxEvent.payload.entitlementId !== entitlement.id ||
+        outboxEvent.payload.orderId !== entitlement.orderId ||
+        outboxEvent.payload.eventId !== entitlement.eventId ||
+        outboxEvent.payload.purchaserUserId !== entitlement.userId ||
+        outboxEvent.payload.holderUserId !== currentEntitlementHolderId(entitlement))
+    ) {
+      throw new ConflictError('Issuance event does not match its ticket');
+    }
+    const entitlementRef = this.collection.doc(entitlement.id);
+    const outboxRef = this.db.collection('v2_outbox').doc(outboxEvent.id);
+    await this.db.runTransaction(async (tx) => {
+      const [entitlementSnap, outboxSnap] = await Promise.all([
+        tx.get(entitlementRef),
+        tx.get(outboxRef),
+      ]);
+      if (initialIssuance && !entitlementSnap.exists && entitlement.fulfillmentRequired) {
+        const orderSnap = await tx.get(this.db.collection('v2_orders').doc(entitlement.orderId));
+        const order = orderSnap.data();
+        if (
+          !order ||
+          order.status !== 'paid' ||
+          order.compensationRequired ||
+          order.eventId !== entitlement.eventId ||
+          order.organizationId !== entitlement.organizationId ||
+          order.userId !== entitlement.userId
+        )
+          throw new ConflictError('The captured order is not eligible to issue this ticket');
+      }
+      if (initialIssuance && entitlementSnap.exists) {
+        const existing = entitlementFromDoc(entitlementSnap.data() ?? {});
+        if (
+          existing.orderId !== entitlement.orderId ||
+          existing.eventId !== entitlement.eventId ||
+          existing.organizationId !== entitlement.organizationId ||
+          existing.tierId !== entitlement.tierId ||
+          existing.userId !== entitlement.userId ||
+          (existing.unitKind ?? (existing.orderId.startsWith('RSVP-') ? 'free_rsvp' : 'paid')) !==
+            (entitlement.unitKind ??
+              (entitlement.orderId.startsWith('RSVP-') ? 'free_rsvp' : 'paid')) ||
+          existing.scanCountAllowed !== entitlement.scanCountAllowed
+        ) {
+          throw new ConflictError('Ticket id is already associated with a different issuance');
+        }
+        // A delayed confirmation must preserve later custody/admission/refund
+        // state, while still repairing a missing deterministic issuance intent.
+      } else {
+        const storedVersion = Number(entitlementSnap.data()?.version ?? 0);
+        if (storedVersion !== entitlement.version - 1) {
+          throw new VersionConflictError(entitlement.version - 1, storedVersion);
+        }
+        if (initialIssuance) tx.create(entitlementRef, entitlementToDoc(entitlement));
+        else tx.set(entitlementRef, entitlementToDoc(entitlement));
+      }
+      if (!outboxSnap.exists) tx.create(outboxRef, outboxDocument(outboxEvent));
+    });
   }
 
   async saveMany(entitlements: Entitlement[], _tx?: TxContext | null): Promise<void> {
@@ -80,14 +189,123 @@ export class FirestoreEntitlementRepository implements EntitlementRepository {
       const ref = this.collection.doc(e.id);
       // For creates (version 1), just set; for updates, use compare-and-set in transaction
       if (e.version <= 1) {
-        batch.set(ref, toDoc(e));
+        batch.set(ref, entitlementToDoc(e));
       } else {
         // For version > 1, we need a transaction with compare-and-set
         // This is a simplified approach - in production you'd want a proper transaction
-        await compareAndSet(this.db, this.collection, e, toDoc);
+        await compareAndSet(this.db, this.collection, e, entitlementToDoc);
       }
     }
     await batch.commit();
+  }
+
+  async redeemTicketAddon(
+    input: {
+      entitlementId: EntityId;
+      addonEntitlementId: EntityId;
+      eventId: EntityId;
+      now?: Date;
+    },
+    outboxEvent?: DomainEvent,
+  ): Promise<Entitlement> {
+    const ref = this.collection.doc(input.entitlementId);
+    return this.db.runTransaction(async (tx) => {
+      const outboxRef = outboxEvent ? this.db.collection('v2_outbox').doc(outboxEvent.id) : null;
+      const snapshot = await tx.get(ref);
+      const outboxSnapshot = outboxRef ? await tx.get(outboxRef) : null;
+      const data = snapshot.data();
+      const current = data ? entitlementFromDoc(data) : null;
+      if (!current || current.eventId !== input.eventId) {
+        throw new NotFoundError('Ticket extra', input.addonEntitlementId);
+      }
+      const updated = redeemTicketAddonEntitlement(current, input.addonEntitlementId, input.now);
+      tx.set(ref, entitlementToDoc(updated));
+      if (outboxRef && outboxSnapshot && !outboxSnapshot.exists && outboxEvent) {
+        tx.create(outboxRef, outboxDocument(outboxEvent));
+      }
+      return updated;
+    });
+  }
+
+  async replaceForUpgrade(input: {
+    sourceEntitlementId: EntityId;
+    expectedSourceVersion: number;
+    replacement: Entitlement;
+    now?: Date;
+  }): Promise<{ source: Entitlement; replacement: Entitlement }> {
+    const sourceRef = this.collection.doc(input.sourceEntitlementId);
+    const replacementRef = this.collection.doc(input.replacement.id);
+    return this.db.runTransaction(async (tx) => {
+      const [sourceSnap, replacementSnap] = await Promise.all([
+        tx.get(sourceRef),
+        tx.get(replacementRef),
+      ]);
+      const sourceData = sourceSnap.data();
+      const replacementData = replacementSnap.data();
+      const source = sourceData ? entitlementFromDoc(sourceData) : null;
+      const replacement = replacementData ? entitlementFromDoc(replacementData) : null;
+      if (
+        source?.status === 'void' &&
+        source.upgradedToEntitlementId === input.replacement.id &&
+        replacement
+      ) {
+        return { source, replacement };
+      }
+      if (!source) throw new NotFoundError('Ticket', input.sourceEntitlementId);
+      if (source.version !== input.expectedSourceVersion) {
+        throw new VersionConflictError(input.expectedSourceVersion, source.version);
+      }
+      if (replacement) throw new ConflictError('The replacement ticket already exists');
+      if (
+        input.replacement.status !== 'valid' ||
+        (input.replacement.unitKind ?? 'paid') !== 'paid' ||
+        input.replacement.upgradeFromEntitlementId !== source.id ||
+        input.replacement.eventId !== source.eventId ||
+        input.replacement.userId !== source.userId ||
+        currentEntitlementHolderId(input.replacement) !== currentEntitlementHolderId(source) ||
+        input.replacement.tierId === source.tierId ||
+        input.replacement.scanCount !== 0 ||
+        input.replacement.refundLock ||
+        input.replacement.pendingTransferId
+      ) {
+        throw new ConflictError('The replacement ticket does not match the source ticket');
+      }
+      const retired = supersedeEntitlementForUpgrade(source, input.replacement.id, input.now);
+      tx.set(sourceRef, entitlementToDoc(retired));
+      tx.create(replacementRef, entitlementToDoc(input.replacement));
+      return { source: retired, replacement: input.replacement };
+    });
+  }
+
+  async restoreForUpgradeRefund(input: {
+    sourceEntitlementId: EntityId;
+    replacementEntitlementId: EntityId;
+    refundRequestId: EntityId;
+    now?: Date;
+  }): Promise<{ source: Entitlement; replacement: Entitlement }> {
+    const sourceRef = this.collection.doc(input.sourceEntitlementId);
+    const replacementRef = this.collection.doc(input.replacementEntitlementId);
+    return this.db.runTransaction(async (tx) => {
+      const [sourceSnap, replacementSnap] = await Promise.all([
+        tx.get(sourceRef),
+        tx.get(replacementRef),
+      ]);
+      const sourceData = sourceSnap.data();
+      const replacementData = replacementSnap.data();
+      const source = sourceData ? entitlementFromDoc(sourceData) : null;
+      const replacement = replacementData ? entitlementFromDoc(replacementData) : null;
+      if (!source) throw new NotFoundError('Ticket', input.sourceEntitlementId);
+      if (!replacement) throw new NotFoundError('Ticket', input.replacementEntitlementId);
+      const restored = restoreEntitlementAfterUpgradeRefund({
+        source,
+        replacement,
+        refundRequestId: input.refundRequestId,
+        now: input.now,
+      });
+      tx.set(sourceRef, entitlementToDoc(restored.source));
+      tx.set(replacementRef, entitlementToDoc(restored.replacement));
+      return restored;
+    });
   }
 
   /**
@@ -106,9 +324,115 @@ export class FirestoreEntitlementRepository implements EntitlementRepository {
     return this.db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       const data = snap.data();
-      const current = data ? toEntitlement(data) : null;
+      const current = data ? entitlementFromDoc(data) : null;
+      if (current && current.eventId !== eventId)
+        return {
+          admitted: false,
+          denyReason: 'wrong_event' as const,
+          denyMessage: 'Ticket is for a different event',
+          entitlement: null,
+          scansUsed: 0,
+          scansAllowed: 0,
+        };
+      if (current?.fulfillmentRequired) {
+        const orderSnap = await tx.get(this.db.collection('v2_orders').doc(current.orderId));
+        const completion = orderSnap.data();
+        if (
+          !completion ||
+          completion.fulfillmentState !== 'complete' ||
+          completion.eventId !== current.eventId ||
+          completion.organizationId !== current.organizationId
+        )
+          return {
+            admitted: false,
+            denyReason: 'void_ticket' as const,
+            denyMessage: 'Payment is still processing.',
+            entitlement: current,
+            scansUsed: current.scanCount,
+            scansAllowed: current.scanCountAllowed,
+          };
+      }
+      let admissionEvent: Event | null = null;
+      if (options?.requireEventValidation || options?.admissionAudit) {
+        const eventSnap = await tx.get(this.db.collection('v2_events').doc(eventId));
+        if (
+          current &&
+          eventSnap.exists &&
+          current.organizationId !== eventSnap.data()?.organizationId
+        )
+          return {
+            admitted: false,
+            denyReason: 'wrong_event' as const,
+            denyMessage: 'Ticket is for a different event',
+            entitlement: null,
+            scansUsed: 0,
+            scansAllowed: 0,
+          };
+        admissionEvent = eventSnap.exists ? (eventSnap.data() as Event) : null;
+        if (
+          options.expectedVenueId !== undefined &&
+          admissionEvent?.venueId !== options.expectedVenueId
+        )
+          return {
+            admitted: false,
+            denyReason: 'event_closed' as const,
+            denyMessage: 'The event venue changed. Reauthorize this device.',
+            entitlement: current,
+            scansUsed: current?.scanCount ?? 0,
+            scansAllowed: current?.scanCountAllowed ?? 0,
+          };
+        const reason = eventSnap.exists
+          ? eventAdmissionUnavailableReason(eventSnap.data() as Event, options.now ?? new Date())
+          : 'Event unavailable';
+        if (reason)
+          return {
+            admitted: false,
+            denyReason: 'event_closed' as const,
+            denyMessage: reason,
+            entitlement: current,
+            scansUsed: current?.scanCount ?? 0,
+            scansAllowed: current?.scanCountAllowed ?? 0,
+          };
+      }
       const decision = admitSeats(current, eventId, options);
-      if (decision.admitted && decision.entitlement) tx.set(ref, toDoc(decision.entitlement));
+      if (decision.admitted && decision.entitlement) {
+        tx.set(ref, entitlementToDoc(decision.entitlement));
+        if (options?.admissionAudit) {
+          const audit = options.admissionAudit;
+          if (!admissionEvent) throw new ConflictError('Admission event is unavailable');
+          const scan = admissionLedger(
+            decision.entitlement,
+            current?.scanCount ?? 0,
+            admissionEvent,
+            audit,
+            options.now ?? new Date(),
+          );
+          tx.create(this.db.collection('v2_scan_ledger').doc(scan.id), scanLedgerToDoc(scan));
+          decision.scan = scan;
+          const event = domainEvent({
+            id: deterministicDomainEventId(
+              'ticket.admitted',
+              entitlementId,
+              String(decision.entitlement.version),
+            ),
+            type: 'ticket.admitted',
+            aggregateId: entitlementId,
+            organizationId: decision.entitlement.organizationId,
+            actorId: audit.operatorUserId,
+            payload: {
+              entitlementId,
+              eventId,
+              deviceId: audit.deviceId,
+              method: audit.method,
+              reason: audit.reason ?? null,
+              admittedCount: decision.entitlement.scanCount - (current?.scanCount ?? 0),
+              scansUsed: decision.entitlement.scanCount,
+            },
+            occurredAt: (options.now ?? new Date()).getTime(),
+          });
+          tx.create(this.db.collection('v2_outbox').doc(event.id), outboxDocument(event));
+        }
+      }
       return decision;
     });
   }
@@ -121,38 +445,333 @@ export class FirestoreEntitlementRepository implements EntitlementRepository {
       .get();
     return snap.data().count;
   }
+
+  async countActivePaidUnitsByUserAndEvent(userId: EntityId, eventId: EntityId): Promise<number> {
+    const snap = await this.collection
+      .where('userId', '==', userId)
+      .where('eventId', '==', eventId)
+      .get();
+    return snap.docs.reduce((count, doc) => {
+      const entitlement = entitlementFromDoc(doc.data());
+      return entitlement.status !== 'void' && entitlement.unitKind === 'paid'
+        ? count + entitlement.scanCountAllowed
+        : count;
+    }, 0);
+  }
+
+  async createTicketTransfer(
+    transfer: TicketTransfer,
+    expectedCustodianUserId: EntityId,
+    outboxEvent?: DomainEvent,
+    policy?: { now: Date },
+  ): Promise<TicketTransfer> {
+    const entitlementRef = this.collection.doc(transfer.entitlementId);
+    const transferRef = this.transferCollection.doc(transfer.id);
+    const coverRef = this.db
+      .collection('v2_event_cover_accounts')
+      .doc(eventCoverAccountId(transfer.entitlementId));
+    const outboxRef = outboxEvent ? this.db.collection('v2_outbox').doc(outboxEvent.id) : null;
+    return this.db.runTransaction(async (tx) => {
+      const [entitlementSnap, transferSnap, outboxSnap, coverSnap] = await Promise.all([
+        tx.get(entitlementRef),
+        tx.get(transferRef),
+        outboxRef ? tx.get(outboxRef) : Promise.resolve(null),
+        tx.get(coverRef),
+      ]);
+      if (policy) {
+        const eventSnap = await tx.get(this.db.collection('v2_events').doc(transfer.eventId));
+        const reason = eventSnap.exists
+          ? eventTransferUnavailableReason(eventSnap.data() as Event, policy.now)
+          : 'Event unavailable';
+        if (reason) throw new ConflictError(reason);
+      }
+      if (transferSnap.exists) throw new ConflictError('Transfer already exists');
+      const data = entitlementSnap.data();
+      if (!data) throw new NotFoundError('Ticket', transfer.entitlementId);
+      const entitlement = entitlementFromDoc(data);
+      const currentHolder = currentEntitlementHolderId(entitlement);
+      const purchaserCustody =
+        currentHolder === null && entitlement.userId === expectedCustodianUserId;
+      if (
+        (currentHolder !== expectedCustodianUserId && !purchaserCustody) ||
+        transfer.senderUserId !== expectedCustodianUserId
+      ) {
+        throw new NotFoundError('Ticket', transfer.entitlementId);
+      }
+      if (
+        entitlement.status !== 'valid' ||
+        entitlement.scanCount > 0 ||
+        entitlement.refundLock ||
+        entitlement.pendingTransferId
+      ) {
+        throw new ConflictError('This ticket cannot be transferred now');
+      }
+      if (coverSnap.exists) {
+        const cover = coverSnap.data() ?? {};
+        if (cover.status !== 'active' || Number(cover.reservedPaise ?? 0) > 0) {
+          throw new ConflictError(
+            'This ticket cannot be transferred while event cover is reserved or frozen',
+          );
+        }
+      }
+      tx.create(transferRef, toTransferDoc(transfer));
+      tx.set(
+        entitlementRef,
+        entitlementToDoc({
+          ...bumpVersion(entitlement, new Date(transfer.createdAt)),
+          pendingTransferId: transfer.id,
+        }),
+      );
+      if (outboxRef && outboxEvent && !outboxSnap?.exists) {
+        tx.create(outboxRef, outboxDocument(outboxEvent));
+      }
+      return transfer;
+    });
+  }
+
+  async resolveTicketTransfer(input: {
+    transferId: EntityId;
+    actorUserId: EntityId;
+    recipientEmailHash?: string;
+    requireEventValidation?: boolean;
+    action: 'accept' | 'decline' | 'cancel' | 'freeze' | 'expire';
+    holderName?: string;
+    now?: Date;
+    outboxEvent?: DomainEvent;
+  }): Promise<{ transfer: TicketTransfer; entitlement: Entitlement }> {
+    const transferRef = this.transferCollection.doc(input.transferId);
+    return this.db.runTransaction(async (tx) => {
+      const transferSnap = await tx.get(transferRef);
+      const transferData = transferSnap.data();
+      if (!transferData) throw new NotFoundError('Ticket transfer', input.transferId);
+      const transfer = toTicketTransfer(transferData);
+      const entitlementRef = this.collection.doc(transfer.entitlementId);
+      const entitlementSnap = await tx.get(entitlementRef);
+      const entitlementData = entitlementSnap.data();
+      if (!entitlementData) throw new NotFoundError('Ticket', transfer.entitlementId);
+      const entitlement = entitlementFromDoc(entitlementData);
+      if (entitlement.pendingTransferId !== transfer.id) {
+        throw new ConflictError('This ticket transfer is no longer pending');
+      }
+      if (input.action === 'cancel' && input.actorUserId !== transfer.senderUserId) {
+        throw new NotFoundError('Ticket transfer', input.transferId);
+      }
+      if (
+        input.action !== 'expire' &&
+        input.action !== 'freeze' &&
+        input.action !== 'cancel' &&
+        (transfer.recipientEmailHash
+          ? input.recipientEmailHash !== transfer.recipientEmailHash
+          : input.actorUserId !== transfer.recipientUserId)
+      ) {
+        throw new NotFoundError('Ticket transfer', input.transferId);
+      }
+      const now = input.now ?? new Date();
+      if (input.requireEventValidation && input.action === 'accept') {
+        const eventSnap = await tx.get(this.db.collection('v2_events').doc(transfer.eventId));
+        const reason = eventSnap.exists
+          ? eventTransferUnavailableReason(eventSnap.data() as Event, now)
+          : 'Event unavailable';
+        if (reason) throw new ConflictError(reason);
+      }
+      const isExpired = Date.parse(transfer.expiresAt) <= now.getTime();
+      if (input.action === 'expire' && !isExpired) {
+        throw new ConflictError('This ticket transfer has not expired');
+      }
+      const status: TicketTransferStatus = isExpired
+        ? 'expired'
+        : input.action === 'accept'
+          ? 'accepted'
+          : input.action === 'decline'
+            ? 'declined'
+            : input.action === 'freeze'
+              ? 'frozen'
+              : 'cancelled';
+      const nextTransfer = resolveTicketTransfer(transfer, status, now);
+      const nextEntitlement =
+        status === 'accepted'
+          ? {
+              ...changeEntitlementHolder(entitlement, {
+                expectedCurrentHolderUserId: currentEntitlementHolderId(entitlement),
+                nextHolderUserId: input.actorUserId,
+                holderName: input.holderName ?? '',
+                now,
+              }),
+              pendingTransferId: null,
+            }
+          : {
+              ...bumpVersion(entitlement, now),
+              // A support freeze blocks further invitations until a separate
+              // reviewed recovery action releases the lock.
+              pendingTransferId: status === 'frozen' ? transfer.id : null,
+            };
+      const coverRef = this.db
+        .collection('v2_event_cover_accounts')
+        .doc(eventCoverAccountId(transfer.entitlementId));
+      const coverSnap = status === 'accepted' ? await tx.get(coverRef) : null;
+      const coverAccount = coverSnap?.exists ? coverSnap.data() : null;
+      const nextCoverAccount = coverAccount
+        ? transferEventCoverHolder(
+            coverAccount as Parameters<typeof transferEventCoverHolder>[0],
+            currentEntitlementHolderId(entitlement),
+            input.actorUserId,
+            now,
+          )
+        : null;
+      const outboxRef = input.outboxEvent
+        ? this.db.collection('v2_outbox').doc(input.outboxEvent.id)
+        : null;
+      const outboxSnap = outboxRef ? await tx.get(outboxRef) : null;
+      tx.set(transferRef, toTransferDoc(nextTransfer));
+      tx.set(entitlementRef, entitlementToDoc(nextEntitlement));
+      if (nextCoverAccount) tx.set(coverRef, { ...nextCoverAccount });
+      if (outboxRef && input.outboxEvent && !outboxSnap?.exists) {
+        tx.create(outboxRef, outboxDocument(input.outboxEvent));
+      }
+      return { transfer: nextTransfer, entitlement: nextEntitlement };
+    });
+  }
+
+  async getTicketTransfer(transferId: EntityId): Promise<TicketTransfer | null> {
+    const snap = await this.transferCollection.doc(transferId).get();
+    const data = snap.data();
+    return data ? toTicketTransfer(data) : null;
+  }
+
+  async releaseFrozenTicketTransfer(input: {
+    transferId: EntityId;
+    now?: Date;
+    outboxEvent?: DomainEvent;
+  }): Promise<{ transfer: TicketTransfer; entitlement: Entitlement }> {
+    const transferRef = this.transferCollection.doc(input.transferId);
+    return this.db.runTransaction(async (tx) => {
+      const transferSnap = await tx.get(transferRef);
+      const transferData = transferSnap.data();
+      if (!transferData) throw new NotFoundError('Ticket transfer', input.transferId);
+      const transfer = toTicketTransfer(transferData);
+      if (transfer.status !== 'frozen') {
+        throw new ConflictError('Only a frozen ticket transfer can be released');
+      }
+      const entitlementRef = this.collection.doc(transfer.entitlementId);
+      const entitlementSnap = await tx.get(entitlementRef);
+      const entitlementData = entitlementSnap.data();
+      if (!entitlementData) throw new NotFoundError('Ticket', transfer.entitlementId);
+      const entitlement = entitlementFromDoc(entitlementData);
+      if (
+        entitlement.pendingTransferId !== transfer.id ||
+        entitlement.status !== 'valid' ||
+        entitlement.scanCount > 0 ||
+        entitlement.refundLock
+      ) {
+        throw new ConflictError('The frozen ticket can no longer be released');
+      }
+      const now = input.now ?? new Date();
+      const released = { ...bumpVersion(entitlement, now), pendingTransferId: null };
+      const outboxRef = input.outboxEvent
+        ? this.db.collection('v2_outbox').doc(input.outboxEvent.id)
+        : null;
+      const outboxSnap = outboxRef ? await tx.get(outboxRef) : null;
+      tx.set(entitlementRef, entitlementToDoc(released));
+      if (outboxRef && input.outboxEvent && !outboxSnap?.exists) {
+        tx.create(outboxRef, outboxDocument(input.outboxEvent));
+      }
+      return { transfer, entitlement: released };
+    });
+  }
+
+  async listTicketTransfersByEntitlement(entitlementId: EntityId): Promise<TicketTransfer[]> {
+    const snap = await this.transferCollection.where('entitlementId', '==', entitlementId).get();
+    return snap.docs.map((doc) => toTicketTransfer(doc.data()));
+  }
+
+  async listExpiredTicketTransfers(now: Date, limit = 100): Promise<TicketTransfer[]> {
+    const snapshot = await this.transferCollection
+      .where('status', '==', 'pending')
+      .where('expiresAt', '<=', now.toISOString())
+      .orderBy('expiresAt', 'asc')
+      .limit(Math.max(1, Math.min(500, limit)))
+      .get();
+    return snapshot.docs.map((document) => toTicketTransfer(document.data()));
+  }
 }
 
-function toDoc(entitlement: Entitlement): DocumentData {
+export function entitlementToDoc(entitlement: Entitlement): DocumentData {
   return {
     id: entitlement.id,
+    ...(entitlement.fulfillmentRequired === undefined
+      ? {}
+      : { fulfillmentRequired: entitlement.fulfillmentRequired }),
     orderId: entitlement.orderId,
     eventId: entitlement.eventId,
     organizationId: entitlement.organizationId,
     tierId: entitlement.tierId,
     tierName: entitlement.tierName,
     userId: entitlement.userId,
+    unitKind:
+      entitlement.unitKind ?? (entitlement.orderId.startsWith('RSVP-') ? 'free_rsvp' : 'paid'),
+    currentHolderUserId:
+      entitlement.currentHolderUserId === undefined
+        ? entitlement.userId
+        : entitlement.currentHolderUserId,
+    credentialVersion: entitlement.credentialVersion ?? 1,
+    pendingTransferId: entitlement.pendingTransferId ?? null,
+    ...(entitlement.upgradeFromEntitlementId
+      ? { upgradeFromEntitlementId: entitlement.upgradeFromEntitlementId }
+      : {}),
+    ...(entitlement.upgradedToEntitlementId
+      ? { upgradedToEntitlementId: entitlement.upgradedToEntitlementId }
+      : {}),
+    ...(entitlement.upgradeRefundRequestId
+      ? { upgradeRefundRequestId: entitlement.upgradeRefundRequestId }
+      : {}),
+    ...(entitlement.eligibility ? { eligibility: entitlement.eligibility } : {}),
+    ...(entitlement.ticketAddons ? { ticketAddons: entitlement.ticketAddons } : {}),
     holderName: entitlement.holderName,
     status: entitlement.status,
     scanCountAllowed: entitlement.scanCountAllowed,
     scanCount: entitlement.scanCount,
     scannedAt: entitlement.scannedAt,
-    refundLock: entitlement.refundLock,
+    refundLock: entitlement.refundLock ?? null,
     version: entitlement.version,
     createdAt: entitlement.createdAt,
     updatedAt: entitlement.updatedAt,
   };
 }
 
-function toEntitlement(data: DocumentData): Entitlement {
+export function entitlementFromDoc(data: DocumentData): Entitlement {
   return {
     id: data.id as string,
+    ...(data.fulfillmentRequired === undefined
+      ? {}
+      : { fulfillmentRequired: data.fulfillmentRequired as boolean }),
     orderId: data.orderId as string,
     eventId: data.eventId as string,
     organizationId: data.organizationId as string,
     tierId: data.tierId as string,
     tierName: data.tierName as string,
-    userId: data.userId as string | null,
+    userId: (data.userId as string | null | undefined) ?? null,
+    unitKind: entitlementUnitKind(data.unitKind, data.orderId),
+    currentHolderUserId:
+      data.currentHolderUserId === undefined
+        ? ((data.userId as string | null | undefined) ?? null)
+        : (data.currentHolderUserId as string | null),
+    credentialVersion: (data.credentialVersion as number | undefined) ?? 1,
+    pendingTransferId: (data.pendingTransferId as string | null | undefined) ?? null,
+    ...(data.upgradeFromEntitlementId
+      ? { upgradeFromEntitlementId: data.upgradeFromEntitlementId as string }
+      : {}),
+    ...(data.upgradedToEntitlementId
+      ? { upgradedToEntitlementId: data.upgradedToEntitlementId as string }
+      : {}),
+    ...(data.upgradeRefundRequestId
+      ? { upgradeRefundRequestId: data.upgradeRefundRequestId as string }
+      : {}),
+    ...(data.eligibility && typeof data.eligibility === 'object'
+      ? { eligibility: data.eligibility as Entitlement['eligibility'] }
+      : {}),
+    ...(Array.isArray(data.ticketAddons)
+      ? { ticketAddons: data.ticketAddons as Entitlement['ticketAddons'] }
+      : {}),
     holderName: data.holderName as string,
     status: data.status as EntitlementStatus,
     scanCountAllowed: data.scanCountAllowed as number,
@@ -162,5 +781,49 @@ function toEntitlement(data: DocumentData): Entitlement {
     version: data.version as number,
     createdAt: data.createdAt as string,
     updatedAt: data.updatedAt as string,
+  };
+}
+
+function toTransferDoc(transfer: TicketTransfer): DocumentData {
+  return { ...transfer };
+}
+
+function toTicketTransfer(data: DocumentData): TicketTransfer {
+  return {
+    id: data.id as string,
+    entitlementId: data.entitlementId as string,
+    eventId: data.eventId as string,
+    senderUserId: data.senderUserId as string,
+    recipientUserId: (data.recipientUserId as string | null | undefined) ?? null,
+    recipientEmailHash: (data.recipientEmailHash as string | null | undefined) ?? null,
+    recipientEmail: (data.recipientEmail as string | null | undefined) ?? null,
+    status: data.status as TicketTransferStatus,
+    expiresAt: data.expiresAt as string,
+    acceptedAt: data.acceptedAt as string | null,
+    resolvedAt: data.resolvedAt as string | null,
+    version: data.version as number,
+    createdAt: data.createdAt as string,
+    updatedAt: data.updatedAt as string,
+  };
+}
+
+function entitlementUnitKind(value: unknown, orderId: unknown): Entitlement['unitKind'] {
+  if (value === 'free_rsvp' || value === 'complimentary' || value === 'paid') return value;
+  return typeof orderId === 'string' && orderId.startsWith('RSVP-') ? 'free_rsvp' : 'paid';
+}
+
+function paginateMemory<T extends { id: string; createdAt: string }>(
+  items: T[],
+  query: PaginationQuery,
+): Page<T> {
+  const sorted = items.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const start = query.cursor
+    ? Math.max(0, sorted.findIndex((item) => item.id === query.cursor) + 1)
+    : 0;
+  const page = sorted.slice(start, start + query.limit);
+  return {
+    items: page,
+    total: sorted.length,
+    nextCursor: start + query.limit < sorted.length ? (page.at(-1)?.id ?? null) : null,
   };
 }

@@ -1,11 +1,26 @@
+import { createHash } from 'node:crypto';
+
 import { InvalidOperationError } from '../errors.js';
 import { transitionStatus } from '../fsm.js';
 import { bumpVersion, newVersionedEntity } from '../identity.js';
 
+import {
+  M4_ACCOUNTING_POLICY,
+  type AccountingPolicySnapshot,
+  type DiscountFundingOwner,
+} from './financial-journal.js';
+import {
+  snapshotOriginalPurchase,
+  type OriginalPurchaseRefundSnapshot,
+} from './purchase-refund-snapshot.js';
+
+import type { OrderReceiptFacts } from './fulfilment.js';
 import type { EntityId, VersionedEntity } from '../identity.js';
+import type { BookingFeePolicy } from './booking-fee-policy.js';
 import type { CommissionTerms } from './event-catalog.js';
-import type { DiscountFundingOwner } from './financial-journal.js';
 import type { PricingBreakdown } from './pricing.js';
+import type { SaleAllocationSnapshot } from './sale-allocation.js';
+import type { TicketAddonSelection } from './ticket-addon.js';
 
 /**
  * ─── Order aggregate (Phase 4) ───────────────────────────────────────────────
@@ -71,11 +86,33 @@ const ORDER_TRANSITIONS: Readonly<Record<OrderStatus, readonly OrderStatus[]>> =
 
 /** A line as sold. Immutable once the order leaves `pending`. */
 export interface OrderLine {
+  admissionSubtotalPaise?: number;
+  discountedAdmissionSubtotalPaise?: number;
+  coverSubtotalPaise?: number;
+  addOnSubtotalPaise?: number;
   tierId: EntityId;
   tierName: string;
+  pricingPhaseId?: string | null;
   quantity: number;
   unitPricePaise: number;
+  /** Component snapshot; absent on legacy orders where the tier price was admission only. */
+  admissionUnitPricePaise?: number;
+  coverUnitPricePaise?: number;
+  coverPolicy?: { proposalId: EntityId; policyVersion: string; termsDigest: string };
+  /** Non-cover products purchased per resulting admission entitlement. */
+  ticketAddons?: TicketAddonSelection[];
   subtotalPaise: number;
+  /** Immutable group issuance policy captured by the hold; absent on legacy orders. */
+  guestCount?: number;
+  admissionMode?: 'bundle' | 'per_person';
+  /** Immutable eligibility policy and acknowledgement; absent on legacy orders. */
+  eligibility?: {
+    audienceType: string;
+    minAge: number | null;
+    maxAge: number | null;
+    attested: true;
+    attestedAt: string;
+  };
 }
 
 /**
@@ -97,12 +134,53 @@ export interface OrderAttribution {
   assignmentId: EntityId;
   assignmentVersion: number;
   termsSnapshot: CommissionTerms;
+  eligibleTierIds: EntityId[] | null;
+  commissionPolicyVersion: string;
+  commercialPolicyVersion: string;
+  attributedAt: string;
   attributionSignature: string;
   promoterCommissionPaise: number;
 }
 
+/**
+ * Immutable evidence that the event was cancelled after this order was
+ * created. The order's payment/refund status remains authoritative for money;
+ * this marker is the cross-surface authority for admission and guest wording.
+ */
+export interface OrderEventCancellation {
+  eventVersion: number;
+  eventTitle: string;
+  reason: string;
+  cancelledAt: string;
+}
+
+export interface RefundedTicketClaim {
+  refundRequestId: EntityId;
+  entitlementId: EntityId;
+  tierId: EntityId;
+  pricingPhaseId?: string | null;
+}
+
 export interface Order extends VersionedEntity {
+  /** Frozen original distribution; never recomputed from current commercial terms. */
+  saleAllocation?: SaleAllocationSnapshot;
+  /** Original hold creation time, independent of later capture/retry timing. */
+  bookedAt?: string;
+  /** Present only for new paid online purchases; legacy orders retain existing semantics. */
+  fulfillmentState?: 'pending' | 'complete';
+  compensationRequired?: {
+    reason: 'capacity_unavailable' | 'promotion_unavailable' | 'event_unavailable';
+    requestedAt: string;
+  };
+  fulfillmentCompletedAt?: string;
+  receiptFacts?: OrderReceiptFacts;
+  /** Original disclosed fee/refund policy, never recomputed from current settings. */
+  feePolicy?: BookingFeePolicy;
+  accountingPolicy?: AccountingPolicySnapshot;
+  refundSnapshot?: OriginalPurchaseRefundSnapshot;
   id: EntityId;
+  /** Stable, support-safe reference shown to guests instead of the internal id. */
+  bookingReference?: string;
   eventId: EntityId;
   organizationId: EntityId;
   /** Null for a guest checkout with no account. */
@@ -121,6 +199,11 @@ export interface Order extends VersionedEntity {
   paymentFeePaise: number;
   gstPaise: number;
   grandTotalPaise: number;
+  /** Admission and cover portions; absent on legacy orders. */
+  admissionSubtotalPaise?: number;
+  coverSubtotalPaise?: number;
+  addOnSubtotalPaise?: number;
+  discountedAdmissionSubtotalPaise?: number;
   appliedPromoCode: string | null;
 
   attribution: OrderAttribution | null;
@@ -136,6 +219,9 @@ export interface Order extends VersionedEntity {
   /** Why the order ended, when it ended unhappily. */
   failureReason: string | null;
 
+  /** Present once the owning event cancellation has affected this order. */
+  eventCancellation?: OrderEventCancellation | null;
+
   /**
    * Cumulative amount refunded so far (Phase 6 admin refunds). A partial
    * refund keeps the order at `paid`; the order only reaches the terminal
@@ -144,6 +230,8 @@ export interface Order extends VersionedEntity {
   refundedPaise: number;
   /** Refund request ids already reflected in `refundedPaise` (retry fence). */
   appliedRefundRequestIds: EntityId[];
+  /** Settled admission releases; original commercial lines remain immutable. */
+  refundedTicketClaims?: RefundedTicketClaim[];
 }
 
 export interface CreateOrderInput {
@@ -162,13 +250,27 @@ export interface CreateOrderInput {
 /** v1's cart-hold TTL. Long enough to pay, short enough not to starve the event. */
 export const DEFAULT_RESERVATION_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * A stable 80-bit reference derived from the full immutable order id. This is
+ * not a visible truncation of the id: the SHA-256 digest makes the value safe
+ * to communicate while retaining enough collision resistance for lookup.
+ */
+export function bookingReferenceForOrderId(orderId: EntityId): string {
+  const digest = createHash('sha256')
+    .update(`c1rcle-booking:${orderId}`)
+    .digest('hex')
+    .slice(0, 20);
+  return `C1-${digest.slice(0, 5)}-${digest.slice(5, 10)}-${digest.slice(10, 15)}-${digest.slice(15, 20)}`.toUpperCase();
+}
+
 export function createOrder(input: CreateOrderInput): Order {
   const now = input.now ?? new Date();
   const ttl = input.reservationTtlMs ?? DEFAULT_RESERVATION_TTL_MS;
   const pricing = input.pricing;
 
-  return {
+  const order: Order = {
     id: input.id,
+    bookingReference: bookingReferenceForOrderId(input.id),
     eventId: input.eventId,
     organizationId: input.organizationId,
     userId: input.userId ?? null,
@@ -176,6 +278,8 @@ export function createOrder(input: CreateOrderInput): Order {
     status: 'pending',
     lines: pricing.lines.map((line) => ({ ...line })),
     currency: pricing.currency,
+    accountingPolicy: Object.freeze({ ...M4_ACCOUNTING_POLICY, capturedAt: now.toISOString() }),
+    ...(pricing.feePolicy ? { feePolicy: Object.freeze({ ...pricing.feePolicy }) } : {}),
     subtotalPaise: pricing.subtotalPaise,
     discountPaise: pricing.discountPaise,
     discountFundingOwner: pricing.discountFundingOwner ?? null,
@@ -184,6 +288,11 @@ export function createOrder(input: CreateOrderInput): Order {
     paymentFeePaise: pricing.paymentFeePaise,
     gstPaise: pricing.gstPaise,
     grandTotalPaise: pricing.grandTotalPaise,
+    admissionSubtotalPaise: pricing.admissionSubtotalPaise ?? pricing.subtotalPaise,
+    coverSubtotalPaise: pricing.coverSubtotalPaise ?? 0,
+    addOnSubtotalPaise: pricing.addOnSubtotalPaise ?? 0,
+    discountedAdmissionSubtotalPaise:
+      pricing.discountedAdmissionSubtotalPaise ?? pricing.discountedSubtotalPaise,
     appliedPromoCode: pricing.appliedPromoCode,
     attribution: input.attribution ?? null,
     paymentIntentId: null,
@@ -195,6 +304,7 @@ export function createOrder(input: CreateOrderInput): Order {
     appliedRefundRequestIds: [],
     ...newVersionedEntity(now),
   };
+  return order.feePolicy ? { ...order, refundSnapshot: snapshotOriginalPurchase(order) } : order;
 }
 
 /** Total ticket units across all lines — what inventory and issuance count. */
@@ -259,6 +369,55 @@ export function markPaid(order: Order, paymentId: string, now?: Date): Order {
   };
 }
 
+/** Settles an explicitly zero-value order without inventing provider facts. */
+export function markZeroValueOrderIssued(order: Order, now?: Date): Order {
+  if (order.status === 'paid' && order.grandTotalPaise === 0 && order.paymentId === null) {
+    return order;
+  }
+  if (
+    order.status !== 'pending' ||
+    order.grandTotalPaise !== 0 ||
+    order.subtotalPaise !== 0 ||
+    order.platformFeePaise !== 0 ||
+    order.paymentFeePaise !== 0 ||
+    order.gstPaise !== 0
+  ) {
+    throw new InvalidOperationError(
+      'Only a zero-value order can be issued without provider payment',
+    );
+  }
+  const at = now ?? new Date();
+  return {
+    ...bumpVersion(order, at),
+    status: 'paid',
+    paymentId: null,
+    paymentIntentId: null,
+    paidAt: at.toISOString(),
+  };
+}
+
+/** Releases inventory for a zero-value order without creating provider refund facts. */
+export function markZeroValueOrderVoided(order: Order, now?: Date): Order {
+  if (order.status === 'refunded' && order.grandTotalPaise === 0 && order.paymentId === null) {
+    return order;
+  }
+  if (
+    order.status !== 'paid' ||
+    order.grandTotalPaise !== 0 ||
+    order.paymentId !== null ||
+    order.paymentIntentId !== null
+  ) {
+    throw new InvalidOperationError(
+      'Only a zero-value order can be voided without provider refund',
+    );
+  }
+  return {
+    ...bumpVersion(order, now ?? new Date()),
+    status: 'refunded',
+    refundedPaise: 0,
+  };
+}
+
 export function markFailed(order: Order, reason: string, now?: Date): Order {
   if (order.status === 'failed') return order;
   const at = now ?? new Date();
@@ -276,6 +435,48 @@ export function cancelOrder(order: Order, reason?: string, now?: Date): Order {
     ...bumpVersion(order, at),
     status: transitionStatus(order.status, 'cancelled', ORDER_TRANSITIONS),
     failureReason: reason ?? null,
+  };
+}
+
+/**
+ * Applies event-cancellation state exactly once while preserving financial
+ * history. Paid orders may be locked for the deterministic admin-approved
+ * refund workflow; zero-value admissions cancel and release their inventory.
+ */
+export function markOrderEventCancelled(
+  order: Order,
+  input: {
+    eventVersion: number;
+    eventTitle: string;
+    reason: string;
+    lockForRefund: boolean;
+  },
+  now?: Date,
+): Order {
+  const at = now ?? new Date();
+  const alreadyMarked =
+    order.eventCancellation?.eventVersion === input.eventVersion &&
+    order.eventCancellation.eventTitle === input.eventTitle &&
+    order.eventCancellation.reason === input.reason;
+  let status = order.status;
+  if (order.status === 'pending' || order.status === 'awaiting_payment') {
+    status = transitionStatus(order.status, 'cancelled', ORDER_TRANSITIONS);
+  } else if (order.status === 'paid' && order.grandTotalPaise === 0) {
+    // Only a zero-value admission releases directly; paid money still requires refund review.
+    status = 'cancelled';
+  } else if (order.status === 'paid' && input.lockForRefund) {
+    status = transitionStatus(order.status, 'refund_requested', ORDER_TRANSITIONS);
+  }
+  if (alreadyMarked && status === order.status) return order;
+  return {
+    ...bumpVersion(order, at),
+    status,
+    eventCancellation: {
+      eventVersion: input.eventVersion,
+      eventTitle: input.eventTitle,
+      reason: input.reason.trim(),
+      cancelledAt: at.toISOString(),
+    },
   };
 }
 
@@ -348,6 +549,7 @@ export function applyOrderRefund(
   amountPaise: number,
   now?: Date,
   refundRequestId?: EntityId,
+  settledTicketClaims: readonly Omit<RefundedTicketClaim, 'refundRequestId'>[] = [],
 ): Order {
   if (refundRequestId && order.appliedRefundRequestIds.includes(refundRequestId)) return order;
   if (order.status !== 'refund_requested') {
@@ -360,12 +562,39 @@ export function applyOrderRefund(
   if (refundedPaise > order.grandTotalPaise) {
     throw new InvalidOperationError(`Refund of ${amountPaise} exceeds order ${order.id}'s balance`);
   }
+  if (settledTicketClaims.length && !refundRequestId)
+    throw new InvalidOperationError(
+      'A settled ticket release requires its refund request identity',
+    );
+  const priorClaims = order.refundedTicketClaims ?? [];
+  const allIds = new Set(priorClaims.map((claim) => claim.entitlementId));
+  for (const claim of settledTicketClaims) {
+    if (
+      allIds.has(claim.entitlementId) ||
+      !order.lines.some((line) => line.tierId === claim.tierId)
+    )
+      throw new InvalidOperationError(
+        'Refunded admission release is duplicate or outside this order',
+      );
+    allIds.add(claim.entitlementId);
+  }
+  const nextClaims = [
+    ...priorClaims,
+    ...(refundRequestId ? settledTicketClaims.map((claim) => ({ ...claim, refundRequestId })) : []),
+  ];
+  for (const line of order.lines) {
+    const units =
+      line.quantity * (line.admissionMode === 'per_person' ? (line.guestCount ?? 1) : 1);
+    if (nextClaims.filter((claim) => claim.tierId === line.tierId).length > units)
+      throw new InvalidOperationError('Refunded admission releases exceed purchased tickets');
+  }
   const at = now ?? new Date();
   const nextStatus = refundedPaise === order.grandTotalPaise ? 'refunded' : 'paid';
   return {
     ...bumpVersion(order, at),
     status: transitionStatus(order.status, nextStatus, ORDER_TRANSITIONS),
     refundedPaise,
+    ...(nextClaims.length ? { refundedTicketClaims: nextClaims } : {}),
     appliedRefundRequestIds: refundRequestId
       ? [...order.appliedRefundRequestIds, refundRequestId]
       : order.appliedRefundRequestIds,

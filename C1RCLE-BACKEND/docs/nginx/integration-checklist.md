@@ -173,7 +173,7 @@ flowchart TD
 | Variable | Value | Notes |
 |---|---|---|
 | `NGINX_PROFILE` | `staging` | |
-| `FASTIFY_UPSTREAM` | `circle-v2-backend-staging:8080` | Private service DNS |
+| `FASTIFY_UPSTREAM` | `c1rcle-api-staging:8080` | Private service DNS |
 | `NGINX_SERVER_NAME` | `staging-api.circle1.com` | Verified hostname |
 | `NGINX_FORWARDED_PROTO` | `https` | Render terminates TLS externally |
 | `NGINX_READINESS_TOKEN` | 32+ byte random secret | Required in `X-Readiness-Token` header to reach `/readiness`, `/version` |

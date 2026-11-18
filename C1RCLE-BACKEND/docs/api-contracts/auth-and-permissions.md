@@ -4,7 +4,7 @@
 described a single `GET /api/v2/session` returning `{ user, memberships,
 permissions }` wrapped in `{ data, meta }`. The gateway does not have that
 route or that shape. See `docs/architecture/decisions.md` D-001 and D-024, and
-the original frontend auth-foundation design (not included in this handoff) §2.
+`C1RCLE-FRONTEND/docs/superpowers/specs/2026-08-27-frontend-gateway-auth-foundation-design.md` §2.
 **Authority:** `apps/api-gateway/src/routes/v2/auth/index.ts`,
 `packages/contracts/src/contracts/{auth,partner,organization}.ts`, and their tests.
 

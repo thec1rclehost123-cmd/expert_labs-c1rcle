@@ -5,15 +5,31 @@ import {
   paginationQuerySchema,
   versionHeaderSchema,
   eventDtoSchema,
+  eventOperationsDtoSchema,
+  organizationEventListResponseSchema,
+  venueOperationalEventDtoSchema,
+  venueOperationalEventListResponseSchema,
+  venueOperationalOverviewDtoSchema,
+  venueOperationalAnalyticsDtoSchema,
   promoterAssignedEventDtoSchema,
+  promoterAssignmentDtoSchema,
   updateEventSchema,
   cancelEventSchema,
   posterUploadUrlRequestSchema,
   posterUploadUrlDtoSchema,
   eventPreviewDtoSchema,
-  paginatedSchema,
   createEventSchema,
+  eventDraftRequestSchema,
+  eventDraftDtoSchema,
+  venueEventDetailResponseSchema,
+  externalEventLocationInputSchema,
+  externalVenueContactSchema,
 } from '@c1rcle/contracts/client';
+import {
+  EventNotFoundError,
+  ForbiddenError,
+  promoterAssignmentStatusAt,
+} from '@c1rcle/core/domain';
 import { z } from 'zod';
 
 import type { ActorContext } from '@c1rcle/core/application';
@@ -74,11 +90,171 @@ const createEventHeaders = z.looseObject({
 const readHeaders = z.looseObject({
   'x-organization-id': opaqueIdSchema,
 });
+const venueOperationalAnalyticsQuerySchema = z
+  .object({ from: z.iso.date(), to: z.iso.date() })
+  .refine(({ from, to }) => Date.parse(to) - Date.parse(from) <= 365 * 86_400_000, {
+    message: 'Venue analytics range cannot exceed 366 days',
+  });
 
-const eventListSchema = paginatedSchema(eventDtoSchema);
+const eventListSchema = organizationEventListResponseSchema;
 const assignedEventListSchema = z.array(promoterAssignedEventDtoSchema);
+const promoterInvitationListSchema = z.array(promoterAssignmentDtoSchema);
 
 export default async function partnerEventRoutes(fastify: FastifyInstance) {
+  // One authenticated resumable editor draft per Host organization and user.
+  fastify.get(
+    '/organizations/:organizationId/event-draft',
+    {
+      preHandler: [
+        fastify.rateLimit('AUTH_READ'),
+        fastify.validateV2({ params: orgIdParam, headers: readHeaders }),
+        fastify.requirePermission('event.create'),
+      ],
+    },
+    async (request, reply) => {
+      const { organizationId } = request.params as z.infer<typeof orgIdParam>;
+      const actor = services.actor(request);
+      if (requirePathOrg(reply, request, actor, organizationId) === undefined) return reply;
+      reply.header('cache-control', 'private, no-store');
+      const saved = await services
+        .repos()
+        .eventDrafts.getForUserOrganization(actor.userId, organizationId);
+      if (!saved) return reply.send({ draft: null });
+      const response = eventDraftDtoSchema.parse({
+        schemaVersion: saved.schemaVersion,
+        data: saved.data,
+        updatedAt: saved.updatedAt,
+      });
+      return reply.send({ draft: response });
+    },
+  );
+
+  fastify.put(
+    '/organizations/:organizationId/event-draft',
+    {
+      preHandler: [
+        fastify.rateLimit('STANDARD_COMMAND'),
+        fastify.validateV2({
+          params: orgIdParam,
+          headers: readHeaders,
+          body: eventDraftRequestSchema,
+        }),
+        fastify.requirePermission('event.create'),
+      ],
+    },
+    async (request, reply) => {
+      const { organizationId } = request.params as z.infer<typeof orgIdParam>;
+      const actor = services.actor(request);
+      if (requirePathOrg(reply, request, actor, organizationId) === undefined) return reply;
+      const body = request.body as z.infer<typeof eventDraftRequestSchema>;
+      const updatedAt = new Date().toISOString();
+      await services.repos().eventDrafts.save({
+        id: `event-draft:${organizationId}:${actor.userId}`,
+        userId: actor.userId,
+        organizationId,
+        schemaVersion: body.schemaVersion,
+        data: body.data,
+        updatedAt,
+      });
+      reply.header('cache-control', 'private, no-store');
+      return reply.send({ schemaVersion: body.schemaVersion, data: body.data, updatedAt });
+    },
+  );
+
+  fastify.delete(
+    '/organizations/:organizationId/event-draft',
+    {
+      preHandler: [
+        fastify.rateLimit('STANDARD_COMMAND'),
+        fastify.validateV2({ params: orgIdParam, headers: readHeaders }),
+        fastify.requirePermission('event.create'),
+      ],
+    },
+    async (request, reply) => {
+      const { organizationId } = request.params as z.infer<typeof orgIdParam>;
+      const actor = services.actor(request);
+      if (requirePathOrg(reply, request, actor, organizationId) === undefined) return reply;
+      await services.repos().eventDrafts.deleteForUserOrganization(actor.userId, organizationId);
+      return reply.status(204).send();
+    },
+  );
+
+  fastify.get(
+    '/events/:eventId/external-location/contact',
+    {
+      preHandler: [
+        fastify.rateLimit('AUTH_READ'),
+        fastify.validateV2({ params: eventIdParam, headers: readHeaders }),
+        fastify.requirePermission('event.read'),
+      ],
+    },
+    async (request, reply) => {
+      const { eventId } = request.params as z.infer<typeof eventIdParam>;
+      try {
+        const actor = services.actor(request);
+        if (!actor.capabilities.includes('host'))
+          throw new ForbiddenError('External venue contact is available only to the Host');
+        const event = await services.events.get(actor, eventId);
+        if (!event.externalLocation) throw new EventNotFoundError(eventId);
+        const contact = event.externalLocation.contact;
+        reply.header('cache-control', 'private, no-store');
+        return await reply.send(
+          externalVenueContactSchema.parse({
+            managerName: contact.managerName,
+            phone: contact.phone,
+            email: contact.email ?? null,
+          }),
+        );
+      } catch (error) {
+        return mapDomainError(reply, request, eventId, error);
+      }
+    },
+  );
+
+  fastify.post(
+    '/events/:eventId/external-location/resubmit',
+    {
+      preHandler: [
+        fastify.rateLimit('SENSITIVE_COMMAND'),
+        fastify.validateV2({
+          params: eventIdParam,
+          headers: createEventHeaders,
+          body: externalEventLocationInputSchema,
+        }),
+        fastify.requirePermission('event.update'),
+      ],
+    },
+    async (request, reply) => {
+      const { eventId } = request.params as z.infer<typeof eventIdParam>;
+      const actor = services.actor(request);
+      const body = request.body as z.infer<typeof externalEventLocationInputSchema>;
+      const headers = request.v2Headers ?? {};
+      const result = await runIdempotent({
+        idempotency: services.idempotency,
+        request,
+        actorId: actor.userId,
+        commandName: 'event.external_location.resubmit',
+        idempotencyKey: headers['idempotency-key'],
+        context: { path: { eventId }, body },
+        run: async () => {
+          const event = await services.events.resubmitExternalLocation(actor, eventId, {
+            name: body.name,
+            address: body.address,
+            ...(body.city ? { city: body.city } : {}),
+            ...(body.region ? { region: body.region } : {}),
+            ...(body.postalCode ? { postalCode: body.postalCode } : {}),
+            ...(body.country ? { country: body.country } : {}),
+            ...(body.mapUrl ? { mapUrl: body.mapUrl } : {}),
+            contact: body.contact,
+          });
+          return { statusCode: 200, body: eventToDto(event) };
+        },
+      }).catch((error: unknown) => mapDomainError(reply, request, eventId, error));
+      if (result === undefined) return reply;
+      return reply.status(result.statusCode).send(result.body);
+    },
+  );
+
   // Promoters see only events with an active assignment to their own org.
   // This is intentionally separate from the owner-scoped organization list.
   fastify.get(
@@ -94,6 +270,7 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const { promoterId } = request.params as { promoterId: string };
       const actor = services.actor(request);
       const events = await services.catalog
@@ -112,15 +289,233 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
             id: assignment.id,
             eventId: assignment.eventId,
             promoterId: assignment.promoterId,
-            status: assignment.status,
+            status: promoterAssignmentStatusAt(assignment, services.config().clock.now()),
             terms: assignment.terms,
             endedAt: assignment.endedAt,
+            invitedAt: assignment.invitedAt,
+            invitedBy: assignment.invitedBy,
+            respondedAt: assignment.respondedAt,
+            respondedBy: assignment.respondedBy,
+            acceptedAt: assignment.acceptedAt,
+            rejectedAt: assignment.rejectedAt,
+            revokedAt: assignment.revokedAt,
+            revokedBy: assignment.revokedBy,
+            revocationReason: assignment.revocationReason,
+            startsAt: assignment.startsAt,
+            expiresAt: assignment.expiresAt,
+            eligibleTierIds: assignment.eligibleTierIds,
             version: assignment.version,
             createdAt: assignment.createdAt,
             updatedAt: assignment.updatedAt,
           },
         })),
       );
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
+  fastify.get(
+    '/promoters/:promoterId/assignment-invitations',
+    {
+      preHandler: [
+        fastify.rateLimit('AUTH_READ'),
+        fastify.validateV2({
+          params: z.object({ promoterId: opaqueIdSchema }),
+          headers: readHeaders,
+        }),
+        fastify.requirePermission('event.read'),
+      ],
+    },
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const { promoterId } = request.params as { promoterId: string };
+      const actor = services.actor(request);
+      const invitations = await services.catalog
+        .listPromoterInvitations(actor, promoterId)
+        .catch((error: unknown) =>
+          mapDomainError(reply, request, promoterId, error, { hideForbidden: true }),
+        );
+      if (invitations === undefined) return reply;
+      const validated = validateV2Response(
+        reply,
+        request,
+        promoterInvitationListSchema,
+        invitations.map((assignment) => ({
+          id: assignment.id,
+          eventId: assignment.eventId,
+          promoterId: assignment.promoterId,
+          status: promoterAssignmentStatusAt(assignment, services.config().clock.now()),
+          terms: assignment.terms,
+          endedAt: assignment.endedAt,
+          invitedAt: assignment.invitedAt,
+          invitedBy: assignment.invitedBy,
+          respondedAt: assignment.respondedAt,
+          respondedBy: assignment.respondedBy,
+          acceptedAt: assignment.acceptedAt,
+          rejectedAt: assignment.rejectedAt,
+          revokedAt: assignment.revokedAt,
+          revokedBy: assignment.revokedBy,
+          revocationReason: assignment.revocationReason,
+          startsAt: assignment.startsAt,
+          expiresAt: assignment.expiresAt,
+          eligibleTierIds: assignment.eligibleTierIds,
+          version: assignment.version,
+          createdAt: assignment.createdAt,
+          updatedAt: assignment.updatedAt,
+        })),
+      );
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
+  fastify.get(
+    '/organizations/:organizationId/venue-overview',
+    {
+      preHandler: [
+        fastify.rateLimit('AUTH_READ'),
+        fastify.validateV2({ params: orgIdParam, headers: readHeaders }),
+        fastify.requirePermission('venue.read'),
+      ],
+    },
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const { organizationId } = request.params as z.infer<typeof orgIdParam>;
+      const actor = services.actor(request);
+      if (requirePathOrg(reply, request, actor, organizationId) === undefined) return reply;
+      const result = await services.events
+        .getVenueOperationalOverview(actor)
+        .catch((error: unknown) => mapDomainError(reply, request, organizationId, error));
+      if (result === undefined) return reply;
+      const payload = {
+        ...result,
+        upcomingEvents: result.upcomingEvents.map(venueOperationalEventToDto),
+      };
+      const validated = validateV2Response(
+        reply,
+        request,
+        venueOperationalOverviewDtoSchema,
+        payload,
+      );
+      return validated === undefined ? reply : reply.send(validated);
+    },
+  );
+
+  fastify.get(
+    '/organizations/:organizationId/venue-analytics',
+    {
+      preHandler: [
+        fastify.rateLimit('AUTH_READ'),
+        fastify.validateV2({
+          params: orgIdParam,
+          querystring: venueOperationalAnalyticsQuerySchema,
+          headers: readHeaders,
+        }),
+        fastify.requirePermission('venue.read'),
+      ],
+    },
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const { organizationId } = request.params as z.infer<typeof orgIdParam>;
+      const { from, to } = request.query as z.infer<typeof venueOperationalAnalyticsQuerySchema>;
+      const actor = services.actor(request);
+      if (requirePathOrg(reply, request, actor, organizationId) === undefined) return reply;
+      const result = await services.events
+        .getVenueOperationalAnalytics(actor, from, to)
+        .catch((error: unknown) => mapDomainError(reply, request, organizationId, error));
+      if (result === undefined) return reply;
+      const payload = { ...result, events: result.events.map(venueOperationalEventToDto) };
+      const validated = validateV2Response(
+        reply,
+        request,
+        venueOperationalAnalyticsDtoSchema,
+        payload,
+      );
+      return validated === undefined ? reply : reply.send(validated);
+    },
+  );
+
+  // Venue read model: events remain Host-owned, but the Venue can read events
+  // linked to Venue records owned by its authenticated organization.
+  fastify.get(
+    '/organizations/:organizationId/venue-events',
+    {
+      preHandler: [
+        fastify.rateLimit('AUTH_READ'),
+        fastify.validateV2({
+          params: orgIdParam,
+          querystring: paginationQuerySchema,
+          headers: readHeaders,
+        }),
+        fastify.requirePermission('venue.read'),
+      ],
+    },
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const { organizationId } = request.params as z.infer<typeof orgIdParam>;
+      const query = request.query as z.infer<typeof paginationQuerySchema>;
+      const actor = services.actor(request);
+      if (requirePathOrg(reply, request, actor, organizationId) === undefined) return reply;
+      let page: Awaited<ReturnType<typeof services.events.listForVenueOrganization>>;
+      try {
+        page = await services.events.listForVenueOrganization(actor, {
+          limit: query.limit,
+          cursor: query.cursor ?? null,
+        });
+      } catch (error) {
+        return mapDomainError(reply, request, organizationId, error);
+      }
+      const items = page.items.map(venueOperationalEventToDto);
+      const payload = {
+        items,
+        pageInfo: {
+          page: 1,
+          pageSize: query.limit,
+          total: page.total,
+          hasNextPage: page.nextCursor !== null,
+          nextCursor: page.nextCursor,
+        },
+        complete: page.complete,
+      };
+      const validated = validateV2Response(
+        reply,
+        request,
+        venueOperationalEventListResponseSchema,
+        payload,
+      );
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
+  fastify.get(
+    '/organizations/:organizationId/venue-events/:eventId',
+    {
+      preHandler: [
+        fastify.rateLimit('AUTH_READ'),
+        fastify.validateV2({
+          params: orgIdParam.extend({ eventId: opaqueIdSchema }),
+          headers: readHeaders,
+        }),
+        fastify.requirePermission('venue.read'),
+      ],
+    },
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const { organizationId, eventId } = request.params as z.infer<typeof orgIdParam> & {
+        eventId: string;
+      };
+      const actor = services.actor(request);
+      if (requirePathOrg(reply, request, actor, organizationId) === undefined) return reply;
+      const result = await services.events
+        .getForVenueOrganization(actor, eventId)
+        .catch((error: unknown) => mapDomainError(reply, request, eventId, error));
+      if (result === undefined) return reply;
+      const validated = validateV2Response(reply, request, venueEventDetailResponseSchema, {
+        event: venueOperationalEventToDto(result),
+        tiers: result.tiers,
+      });
       if (validated === undefined) return reply;
       return reply.send(validated);
     },
@@ -141,15 +536,20 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const { organizationId } = request.params as z.infer<typeof orgIdParam>;
       const query = request.query as z.infer<typeof paginationQuerySchema>;
       const actor = services.actor(request);
       if (requirePathOrg(reply, request, actor, organizationId) === undefined) return reply;
-      const page = await services.events.list(actor, {
+      const page = await services.events.listWithOperations(actor, {
         limit: query.limit,
         cursor: query.cursor ?? null,
       });
-      const items = page.items.map(eventToDto);
+      const items = page.items.map(({ event, ...operations }) => ({
+        ...eventToDto(event),
+        ...operations,
+        venueName: operations.venueName ?? event.externalLocation?.name ?? null,
+      }));
       const payload = {
         items,
         pageInfo: {
@@ -157,6 +557,7 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
           pageSize: query.limit,
           total: page.total,
           hasNextPage: page.nextCursor !== null,
+          nextCursor: page.nextCursor,
         },
       };
       const validated = validateV2Response(reply, request, eventListSchema, payload);
@@ -179,13 +580,23 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const { eventId } = request.params as z.infer<typeof eventIdParam>;
       const actor = services.actor(request);
-      const event = await services.events.get(actor, eventId).catch((error: unknown) => {
-        return mapDomainError(reply, request, eventId, error, { hideForbidden: true });
-      });
+      const event = await services.events
+        .getWithOperations(actor, eventId)
+        .catch((error: unknown) => {
+          return mapDomainError(reply, request, eventId, error, { hideForbidden: true });
+        });
       if (event === undefined) return reply;
-      const validated = validateV2Response(reply, request, eventDtoSchema, eventToDto(event));
+      const validated = validateV2Response(reply, request, eventOperationsDtoSchema, {
+        ...eventToDto(event.event),
+        capacity: event.capacity,
+        venueName: event.venueName ?? event.event.externalLocation?.name ?? null,
+        ticketsSold: event.ticketsSold,
+        salesCountComplete: event.salesCountComplete,
+        currentStartingPricePaise: event.currentStartingPricePaise,
+      });
       if (validated === undefined) return reply;
       return reply.send(validated);
     },
@@ -220,7 +631,30 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
         context: { path: {}, body },
         run: async () => {
           const event = await services.events.create(actor, {
-            venueId: body.venueId,
+            venueId: body.venueId ?? null,
+            ...(body.externalLocation
+              ? {
+                  externalLocation: {
+                    name: body.externalLocation.name,
+                    address: body.externalLocation.address,
+                    ...(body.externalLocation.city ? { city: body.externalLocation.city } : {}),
+                    ...(body.externalLocation.region
+                      ? { region: body.externalLocation.region }
+                      : {}),
+                    ...(body.externalLocation.postalCode
+                      ? { postalCode: body.externalLocation.postalCode }
+                      : {}),
+                    ...(body.externalLocation.country
+                      ? { country: body.externalLocation.country }
+                      : {}),
+                    ...(body.externalLocation.mapUrl
+                      ? { mapUrl: body.externalLocation.mapUrl }
+                      : {}),
+                    contact: body.externalLocation.contact,
+                  },
+                }
+              : {}),
+            slotRequestId: body.slotRequestId ?? null,
             title: body.title,
             summary: body.summary,
             description: body.description,
@@ -228,7 +662,12 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
             startAt: body.startAt,
             endAt: body.endAt ?? null,
             tags: body.tags,
+            refundPolicy: body.refundPolicy,
             compensation: body.compensation ?? null,
+            entryRules: body.entryRules,
+            media: body.media,
+            visibilityMode: body.visibilityMode,
+            addressDisclosure: body.addressDisclosure,
           });
           const validated = validateV2Response(reply, request, eventDtoSchema, eventToDto(event));
           if (validated === undefined) throw new Error('v2 response validation failed');
@@ -292,6 +731,7 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const { eventId } = request.params as z.infer<typeof eventIdParam>;
       const body = request.body as z.infer<typeof updateEventSchema>;
       const actor = services.actor(request);
@@ -343,6 +783,7 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
       ],
     },
     async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
       const { eventId } = request.params as z.infer<typeof eventIdParam>;
       const actor = services.actor(request);
       const preview = await services.events
@@ -434,6 +875,77 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
     );
   }
 
+  const lifecycleBody = z.discriminatedUnion('action', [
+    z
+      .object({ action: z.literal('postpone'), reason: z.string().trim().min(1).max(1000) })
+      .strict(),
+    z
+      .object({
+        action: z.literal('reschedule'),
+        startAt: z.iso.datetime(),
+        endAt: z.iso.datetime().nullable().optional(),
+        slotRequestId: z.string().min(1).optional(),
+        venueId: z.string().min(1).optional(),
+        expectedVersion: z.number().int().positive(),
+      })
+      .strict(),
+  ]);
+  fastify.post(
+    '/events/:eventId/lifecycle',
+    {
+      preHandler: [
+        fastify.rateLimit('STANDARD_COMMAND'),
+        fastify.validateV2({
+          params: eventIdParam,
+          headers: createEventHeaders,
+          body: lifecycleBody,
+        }),
+        fastify.requirePermission('event.update'),
+      ],
+    },
+    async (request, reply) => {
+      const { eventId } = request.params as z.infer<typeof eventIdParam>;
+      const body = request.body as z.infer<typeof lifecycleBody>;
+      const actor = services.actor(request);
+      const headers = request.v2Headers ?? {};
+      const result = await runIdempotent({
+        idempotency: services.idempotency,
+        request,
+        actorId: actor.userId,
+        commandName: `event.${body.action}`,
+        idempotencyKey: headers['idempotency-key'],
+        context: { path: { eventId }, body },
+        run: async () => {
+          const event =
+            body.action === 'postpone'
+              ? await services.events.postpone(actor, eventId, body.reason)
+              : await services.events.update(actor, {
+                  eventId,
+                  expectedVersion: body.expectedVersion,
+                  resumePostponed: true,
+                  changes: {
+                    startAt: body.startAt,
+                    ...(body.endAt === undefined ? {} : { endAt: body.endAt }),
+                    ...(body.slotRequestId ? { slotRequestId: body.slotRequestId } : {}),
+                    ...(body.venueId ? { venueId: body.venueId } : {}),
+                  },
+                });
+          const validated = validateV2Response(reply, request, eventDtoSchema, eventToDto(event));
+          if (validated === undefined) throw new Error('v2 response validation failed');
+          return { statusCode: 200, body: validated };
+        },
+      }).catch((error: unknown) =>
+        isIdempotencyConflict(error)
+          ? mapDomainError(reply, request, eventId, error, {
+              conflictId: headers['idempotency-key'],
+            })
+          : mapDomainError(reply, request, eventId, error),
+      );
+      if (result === undefined) return reply;
+      return reply.status(result.statusCode).send(result.body);
+    },
+  );
+
   // `cancel` needs a body (`reason`), so it's not folded into `simpleActions`.
   fastify.post(
     '/events/:eventId/cancel',
@@ -482,28 +994,100 @@ export default async function partnerEventRoutes(fastify: FastifyInstance) {
 
 /** Converts the core domain Event to the canonical wire DTO. */
 export function eventToDto(event: Event) {
+  const visibilityMode = event.visibilityMode ?? 'public';
+  const privateEvent = visibilityMode === 'code' || visibilityMode === 'invited';
   return {
     id: event.id,
     organizationId: event.organizationId,
     venueId: event.venueId,
+    ...(event.externalLocation
+      ? { externalVenueReviewStatus: event.externalLocation.review.status }
+      : {}),
+    ...(event.externalLocation
+      ? {
+          externalLocation: {
+            name: event.externalLocation.name,
+            address: event.externalLocation.address,
+            ...(event.externalLocation.city ? { city: event.externalLocation.city } : {}),
+            ...(event.externalLocation.region ? { region: event.externalLocation.region } : {}),
+            ...(event.externalLocation.postalCode
+              ? { postalCode: event.externalLocation.postalCode }
+              : {}),
+            ...(event.externalLocation.country ? { country: event.externalLocation.country } : {}),
+            ...(event.externalLocation.mapUrl ? { mapUrl: event.externalLocation.mapUrl } : {}),
+          },
+        }
+      : {}),
     slug: event.slug,
     title: event.title,
     summary: event.summary,
     description: event.description,
-    imageUrl: event.imageUrl,
+    ...(!privateEvent && event.media ? { media: event.media } : {}),
+    // Never serialize a public object URL for restricted events. Older private
+    // records may predate managed poster ACL revocation, and promoter/partner
+    // projections must not re-expose those historical URLs.
+    imageUrl: privateEvent ? null : event.imageUrl,
     startAt: event.startAt,
     endAt: event.endAt,
     status: event.status,
+    visibilityMode,
+    addressDisclosure:
+      event.addressDisclosure ??
+      (event.visibilityMode === 'code' || event.visibilityMode === 'invited' ? 'hidden' : 'public'),
     isPublic: event.isPublic,
     tags: event.tags,
     startingPricePaise: event.startingPricePaise,
     isFree: event.isFree,
     cancellationReason: event.cancellationReason,
+    ...(event.postponement ? { postponement: event.postponement } : {}),
+    ...(event.refundPolicy ? { refundPolicy: event.refundPolicy } : {}),
     compensation: event.compensation ?? null,
+    ...(event.entryRules === undefined ? {} : { entryRules: event.entryRules }),
     version: event.version,
     createdAt: event.createdAt,
     updatedAt: event.updatedAt,
   };
+}
+
+interface VenueOperationalRow {
+  event: Event;
+  ownerType: 'host' | 'venue';
+  hostName: string | null;
+  venueName: string;
+  venueCapacity: number | null;
+  ticketUnitsIssued: number;
+  rsvpUnitsIssued: number;
+  expectedGuests: number;
+  checkedInGuests: number;
+  operationalCountsComplete: boolean;
+  currentStartingPricePaise: number | null;
+}
+
+function venueOperationalEventToDto(row: VenueOperationalRow) {
+  const { event } = row;
+  const restricted = event.visibilityMode === 'code' || event.visibilityMode === 'invited';
+  return venueOperationalEventDtoSchema.parse({
+    id: event.id,
+    ownerType: row.ownerType,
+    title: event.title,
+    imageUrl: restricted ? null : event.imageUrl,
+    hostName: row.hostName,
+    venueId: event.venueId,
+    venueName: row.venueName,
+    status: event.status,
+    startAt: event.startAt,
+    endAt: event.endAt,
+    eventCapacity: event.capacity,
+    venueCapacity: row.venueCapacity,
+    ticketUnitsIssued: row.ticketUnitsIssued,
+    rsvpUnitsIssued: row.rsvpUnitsIssued,
+    expectedGuests: row.expectedGuests,
+    checkedInGuests: row.checkedInGuests,
+    operationalCountsComplete: row.operationalCountsComplete,
+    baseStartingPricePaise: event.startingPricePaise,
+    currentStartingPricePaise: row.currentStartingPricePaise,
+    isFree: event.isFree,
+  });
 }
 
 /** Maps core domain errors to the V2 error envelope; returns `undefined` after sending. */
@@ -535,9 +1119,20 @@ export function mapDomainError(
     // The generic `NotFoundError` (domain/errors.ts) carries this exact code —
     // previously missing here, so an order/ticket "not found" fell through
     // every branch below into the unmapped-error 500 (docs/architecture/
-    // a previous implementation audit already named this gotcha).
+    // IMPLEMENTATION-STATUS-2026-08-31.md §2 named this gotcha already).
     'not_found',
   ]);
+  if (known?.code === 'event_not_on_sale') {
+    reply.status(409).send(
+      buildV2ErrorResponse({
+        status: 409,
+        message: known.message ?? 'This event is not on sale',
+        code: 'event_not_on_sale',
+        requestId: request.id,
+      }),
+    );
+    return undefined;
+  }
   if (known?.code && notFoundCodes.has(known.code)) {
     reply.status(404).send(
       buildV2ErrorResponse({
@@ -674,6 +1269,17 @@ export function mapDomainError(
         status: 400,
         message: known.message ?? 'Invalid operation',
         code: 'validation',
+        requestId: request.id,
+      }),
+    );
+    return undefined;
+  }
+  if (known?.code === 'service_unavailable') {
+    reply.status(503).send(
+      buildV2ErrorResponse({
+        status: 503,
+        message: known.message ?? 'This feature is not enabled',
+        code: 'server',
         requestId: request.id,
       }),
     );

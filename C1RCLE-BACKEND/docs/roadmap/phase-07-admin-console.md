@@ -9,8 +9,11 @@ see below) · Depends on:
 Phase 2 (onboarding approvals), Phase 6 (financial actions)
 
 Living status doc for the admin-console build-out — read this before
-starting any module below. This file, `route-manifest.ts` and
-`apps/admin-console/src/lib/admin/admin-api.ts` are the ground truth.
+starting any module below, another session may have advanced it since you
+last looked. Full gap audit + phase plan:
+`C:\Users\SHRIYASH SAWANT\.claude\plans\i-ve-ran-the-command-eventual-dewdrop.md`
+(local to this machine; if unavailable, this file + route-manifest.ts +
+`apps/admin-console/src/lib/admin/admin-api.ts` are ground truth).
 
 `C1RCLE-FRONTEND/apps/admin-console` now has real screens (not an empty
 scaffold): onboarding, orders, refunds, payouts, disputes, venues, events,

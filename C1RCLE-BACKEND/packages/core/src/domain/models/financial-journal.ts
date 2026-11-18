@@ -15,6 +15,8 @@ export type DiscountFundingOwner = 'platform' | 'venue' | 'host' | 'promoter' | 
 
 export interface FinancialComponentBreakdown {
   readonly ticketFaceValuePaise: number;
+  /** Cover proceeds remain a separate liability until redeemed or refunded. */
+  readonly eventCoverLiabilityPaise?: number;
   readonly discountPaise: number;
   readonly discountFundingOwner: DiscountFundingOwner | null;
   readonly netTicketRevenuePaise: number;
@@ -27,13 +29,22 @@ export interface FinancialComponentBreakdown {
   readonly venueAllocationPaise: number;
   readonly promoterAllocationPaise: number;
   readonly refundPaise: number;
+  /** Exact original-paid component deltas for a component-aware refund. */
+  readonly refundedAdmissionPaise?: number;
+  readonly refundedPlatformFeePaise?: number;
+  readonly refundedPaymentFeePaise?: number;
+  readonly refundedFeeTaxPaise?: number;
+  readonly refundedOtherPaidPaise?: number;
   readonly chargebackPaise: number;
   readonly reservePaise: number;
   readonly payoutPaise: number;
   readonly roundingAdjustmentPaise: number;
 }
 
+export type SettlementReleaseSchedule = 'event_end_24h_75_72h_100';
+
 export interface AccountingPolicySnapshot {
+  readonly releaseSchedule?: SettlementReleaseSchedule;
   readonly version: string;
   readonly capturedAt: string;
   readonly settlementDelayDays: number;
@@ -55,6 +66,14 @@ export const DEFAULT_ACCOUNTING_POLICY: AccountingPolicySnapshot = Object.freeze
   holdsOnUnresolvedReconciliation: true,
 });
 
+/** New sale snapshots identify M4 policy; historical journal snapshots stay immutable. */
+export const M4_ACCOUNTING_POLICY: AccountingPolicySnapshot = Object.freeze({
+  ...DEFAULT_ACCOUNTING_POLICY,
+  version: 'm4-staged-settlement-v1',
+  releaseSchedule: 'event_end_24h_75_72h_100',
+  reserveBasisPoints: 0,
+});
+
 export type AccountCode =
   | 'provider_clearing'
   | 'cash_bank_clearing'
@@ -67,6 +86,8 @@ export type AccountCode =
   | 'platform_fee_revenue'
   | 'platform_commission_revenue'
   | 'ticket_collection_control'
+  | 'event_cover_liability'
+  | 'event_cover_venue_payable_held'
   | 'provider_fee_expense'
   | 'refund_clearing'
   | 'chargeback_loss_receivable'
@@ -105,7 +126,10 @@ export type PostingSourceType =
   | 'payout_reservation'
   | 'payout_completion'
   | 'payout_failure_reversal'
+  | 'event_cover_redemption'
+  | 'event_cover_redemption_reversal'
   | 'manual_adjustment'
+  | 'partner_dispute_reversal'
   | 'legacy_backfill';
 
 export interface PostingSource {
@@ -114,6 +138,10 @@ export interface PostingSource {
   readonly orderId: EntityId | null;
   readonly paymentId: string | null;
   readonly eventId: EntityId | null;
+  /** Promoter commission provenance; absent on records created before M4. */
+  readonly assignmentId?: EntityId | null;
+  readonly commissionPolicyVersion?: string | null;
+  readonly commercialPolicyVersion?: string | null;
 }
 
 export interface FinancialJournal {

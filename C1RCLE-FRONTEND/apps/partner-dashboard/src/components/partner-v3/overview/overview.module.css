@@ -6,7 +6,7 @@
   --overview-accent-rgb: 255 90 31;
   width: min(1440px, 100%);
   margin: 0 auto;
-  padding: 28px 28px 52px;
+  padding: 24px 28px 52px;
   color: #f5f5f3;
   font-family: var(--font-partner-v3), sans-serif;
 }
@@ -64,16 +64,20 @@
 .createLink {
   min-height: 42px;
   padding: 0 18px;
+  color: #fff;
 }
 .createLink:hover,
 .heroAction:hover {
   background: var(--overview-accent-bright);
   color: var(--overview-accent-ink);
 }
+.createLink:hover {
+  color: #fff;
+}
 
 .primaryGrid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(340px, 1fr);
+  grid-template-columns: minmax(0, 6fr) minmax(0, 4fr);
   gap: 20px;
   align-items: stretch;
 }
@@ -81,7 +85,7 @@
 .primaryStack {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 16px;
   min-width: 0;
 }
 
@@ -94,31 +98,35 @@
 
 .hero {
   position: relative;
-  min-height: 300px;
+  min-height: 270px;
   overflow: hidden;
   background: #151515;
 }
 
-.hero > img {
+.heroPoster {
+  z-index: 0;
   object-fit: cover;
   object-position: center 30%;
+  opacity: 0.84;
+}
+
+.heroPosterFallback {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, #28201d, #151515 58%, #20120e);
 }
 
 .heroOverlay {
   position: absolute;
   inset: 0;
-  background: linear-gradient(
-    100deg,
-    rgb(0 0 0 / 88%) 22%,
-    rgb(0 0 0 / 55%) 55%,
-    rgb(0 0 0 / 25%) 100%
-  );
+  z-index: 1;
+  background: linear-gradient(90deg, rgb(0 0 0 / 70%), rgb(0 0 0 / 38%));
 }
 
 .heroContent {
   position: relative;
   z-index: 1;
-  min-height: 300px;
+  min-height: 270px;
   display: flex;
   flex-direction: column;
   padding: 26px 28px;
@@ -169,7 +177,7 @@
 
 .heroDetails h2 {
   max-width: 610px;
-  margin: 0 0 20px;
+  margin: 0 0 12px;
   font:
     800 clamp(27px, 2.4vw, 34px)/1.05 var(--font-display),
     sans-serif;
@@ -181,7 +189,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 8px;
+  min-width: 0;
   color: #d8c4b8;
   font-size: 13px;
   font-weight: 600;
@@ -194,7 +202,7 @@
   width: 100%;
   height: 8px;
   display: block;
-  margin-bottom: 22px;
+  margin: 10px 0 0;
   overflow: hidden;
   border: 0;
   border-radius: 999px;
@@ -216,25 +224,41 @@
 }
 
 .heroAction {
-  min-height: 46px;
-  padding: 0 24px;
+  min-height: 40px;
+  flex: none;
+  padding: 0 18px;
   border-radius: 999px;
+  font-size: 13px;
+}
+
+.heroSalesRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
 }
 
 .trendCard {
   min-height: 320px;
   padding: 24px;
 }
-.trendControls {
+.trendHeader {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
+  margin-bottom: 14px;
+}
+.trendControls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin-bottom: 18px;
 }
 
 .trendTitle {
-  margin: 0 0 14px;
+  margin: 0;
   font:
     800 17px/1.2 var(--font-display),
     sans-serif;
@@ -257,7 +281,10 @@
 .trendRangeRow {
   display: flex;
   justify-content: flex-end;
-  margin: -4px 0 12px;
+  margin: 0 0 12px auto;
+}
+.trendControls > .segmentedControl[aria-label='Performance range'] {
+  margin-left: auto;
 }
 .trendRangeBottom {
   margin: 14px 0 0;
@@ -325,6 +352,18 @@
   font-size: 13px;
   font-weight: 750;
 }
+.trendMetric .trendDelta-positive {
+  background: rgb(70 212 131 / 16%);
+  color: #62e394;
+}
+.trendMetric .trendDelta-negative {
+  background: rgb(255 92 103 / 16%);
+  color: #ff727b;
+}
+.trendMetric .trendDelta-neutral {
+  background: rgb(255 255 255 / 8%);
+  color: #c2c2bd;
+}
 
 .trendCard > p {
   margin: 6px 0 6px;
@@ -349,19 +388,6 @@
   box-shadow:
     inset 0 1px 0 rgb(255 255 255 / 5%),
     0 20px 50px rgb(0 0 0 / 35%);
-}
-
-.activityCard::after {
-  position: absolute;
-  bottom: -100px;
-  left: 50%;
-  width: 340px;
-  height: 340px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgb(255 90 31 / 20%), transparent 68%);
-  content: '';
-  pointer-events: none;
-  transform: translateX(-50%);
 }
 
 .sectionHeader {
@@ -411,20 +437,20 @@
   gap: 12px;
 }
 .activityRow {
-  min-height: 62px;
+  min-height: 76px;
   display: flex;
   align-items: center;
-  gap: 13px;
-  padding: 10px 14px;
-  border: 1px solid rgb(255 255 255 / 7%);
-  border-radius: 16px;
-  background: rgb(255 255 255 / 4.5%);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 5%);
+  gap: 16px;
+  padding: 10px 18px;
+  border: 1px solid rgb(255 255 255 / 9%);
+  border-radius: 19px;
+  background: #191919;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 3%);
 }
 
 .activityIcon {
-  width: 40px;
-  height: 40px;
+  width: 54px;
+  height: 54px;
   display: grid;
   place-items: center;
   flex: none;
@@ -447,7 +473,7 @@
   min-width: 0;
   flex: 1;
   display: grid;
-  gap: 3px;
+  gap: 4px;
 }
 .activityRow strong,
 .networkRow strong {
@@ -462,6 +488,14 @@
   color: #8a8a86;
   font-size: 12px;
   font-weight: 500;
+}
+.activityMeta {
+  overflow: hidden;
+  color: #aaa9a5 !important;
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .activityRow > b {
   flex: none;
@@ -581,8 +615,22 @@
 .upcomingEvent::after {
   position: absolute;
   inset: 0;
+  z-index: 1;
   background: linear-gradient(100deg, rgb(0 0 0 / 82%) 30%, rgb(0 0 0 / 35%) 68%, rgb(0 0 0 / 15%));
   content: '';
+}
+.upcomingPoster,
+.upcomingPosterFallback {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center 35%;
+}
+.upcomingPosterFallback {
+  background: linear-gradient(158deg, #4b5563, #1f2937 52%, #0c1013);
 }
 .upcomingEvent-1 {
   background: linear-gradient(158deg, #b8860b, #6b4e0a 52%, #241a04);
@@ -603,7 +651,7 @@
 .upcomingEvent > div,
 .upcomingEvent > b {
   position: relative;
-  z-index: 1;
+  z-index: 2;
 }
 .upcomingEvent > div {
   min-width: 0;
@@ -647,6 +695,14 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.overviewEmpty {
+  margin: 0;
+  padding: 14px 0;
+  color: #969696;
+  font-size: 13px;
+  line-height: 1.5;
 }
 .networkRow {
   display: flex;
@@ -713,7 +769,7 @@
     padding: 24px;
   }
   .primaryGrid {
-    grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+    grid-template-columns: minmax(0, 6fr) minmax(0, 4fr);
   }
   .secondaryGrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -752,7 +808,7 @@
     font-size: 13px;
   }
   .heroContent {
-    min-height: 330px;
+    min-height: 300px;
     padding: 20px;
   }
   .heroTopline {
@@ -760,11 +816,10 @@
     gap: 9px;
   }
   .trendControls {
-    align-items: stretch;
-    flex-direction: column;
+    flex-wrap: wrap;
   }
-  .trendRangeRow {
-    justify-content: flex-start;
+  .trendControls > .segmentedControl[aria-label='Performance range'] {
+    margin-left: auto;
   }
   .segmentedControl {
     width: fit-content;
@@ -796,6 +851,10 @@
     flex-direction: column;
     gap: 5px;
   }
+  .heroSalesRow {
+    align-items: stretch;
+    flex-direction: column;
+  }
   .heroAction {
     width: 100%;
   }
@@ -811,7 +870,13 @@
     padding-inline: 10px;
   }
   .activityRow {
-    padding-inline: 10px;
+    gap: 11px;
+    padding-inline: 12px;
+  }
+  .activityIcon {
+    width: 44px;
+    height: 44px;
+    border-radius: 14px;
   }
   .activityRow > b {
     font-size: 12px;
@@ -823,4 +888,97 @@
   .heroAction {
     transition: none;
   }
+}
+
+.interactiveChart {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 14px;
+  margin-top: 18px;
+}
+.chartValueAxis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 8px 0 10px;
+  height: var(--overview-chart-height, 164px);
+  color: #a2a29e;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.chartPlot {
+  position: relative;
+  min-width: 0;
+}
+.chartPlot .chart {
+  margin: 0;
+}
+.chartTooltip {
+  position: absolute;
+  top: 8px;
+  transform: translateX(-50%);
+  display: grid;
+  gap: 5px;
+  pointer-events: none;
+  padding: 10px 12px;
+  border: 1px solid #ffffff24;
+  border-radius: 9px;
+  background: rgb(18 18 18 / 94%);
+  box-shadow: 0 4px 18px #0006;
+  color: #fff;
+  font-size: 12px;
+  z-index: 2;
+  white-space: nowrap;
+}
+.chartTooltip span {
+  color: #b9b9b5;
+}
+.chartTooltip strong {
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chartTimeAxis {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 34px;
+  margin-top: 8px;
+  color: #a2a29e;
+  font-size: 10px;
+}
+.chartTooltip {
+  left: 50%;
+  max-width: 90%;
+  white-space: normal;
+}
+.chartTooltip[data-align='start'] {
+  left: 0;
+  transform: none;
+}
+.chartTooltip[data-align='end'] {
+  left: auto;
+  right: 0;
+  transform: none;
+}
+
+.chartTimeAxis text {
+  fill: #a2a29e;
+  font:
+    11px var(--font-inter),
+    sans-serif;
+}
+
+.activityRow {
+  padding-block: 14px;
+  gap: 12px;
+}
+.activityRow > div {
+  row-gap: 3px;
+}
+.activityIcon {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
 }

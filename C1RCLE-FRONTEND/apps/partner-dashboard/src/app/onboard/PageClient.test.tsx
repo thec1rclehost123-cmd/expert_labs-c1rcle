@@ -17,18 +17,24 @@ const apiError = (init: {
 
 const mocks = vi.hoisted(() => ({
   auth: { user: null as any, loading: false, isApproved: false },
+  sessionUser: { emailVerified: true } as any,
+  refreshSession: vi.fn(),
   getMine: vi.fn(),
+  getPromoterAgreement: vi.fn(),
+  acceptPromoterAgreement: vi.fn(),
   saveProgress: vi.fn(),
   start: vi.fn(),
   submit: vi.fn(),
   uploadDocument: vi.fn(),
   verifyDocument: vi.fn(),
+  verifyPhone: vi.fn(),
   sendPhoneOtp: vi.fn(),
   confirmPhoneOtp: vi.fn(),
   sendOtp: vi.fn(),
   verifyOtp: vi.fn(),
   routeAfterAuth: vi.fn(),
   replace: vi.fn(),
+  searchParams: '',
 }));
 
 vi.mock('framer-motion', () => ({
@@ -45,7 +51,13 @@ vi.mock('framer-motion', () => ({
 }));
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ replace: mocks.replace, push: vi.fn() }),
-  useSearchParams: () => new URLSearchParams(),
+  useSearchParams: () => new URLSearchParams(mocks.searchParams),
+}));
+vi.mock('@c1rcle/auth', () => ({
+  refresh: mocks.refreshSession,
+  useSessionStore: Object.assign(vi.fn(), {
+    getState: () => ({ session: { user: mocks.sessionUser } }),
+  }),
 }));
 vi.mock('@/components/providers/DashboardAuthProvider', () => ({
   useDashboardAuth: () => ({
@@ -64,11 +76,14 @@ vi.mock('@/lib/firebase/phone-auth', () => ({
 }));
 vi.mock('@/lib/onboarding/onboarding-repository', () => ({
   getMine: mocks.getMine,
+  getPromoterAgreement: mocks.getPromoterAgreement,
+  acceptPromoterAgreement: mocks.acceptPromoterAgreement,
   saveProgress: mocks.saveProgress,
   start: mocks.start,
   submit: mocks.submit,
   uploadDocument: mocks.uploadDocument,
   verifyDocument: mocks.verifyDocument,
+  verifyPhone: mocks.verifyPhone,
 }));
 vi.mock('@/lib/onboarding/otp', () => ({ sendOtp: mocks.sendOtp, verifyOtp: mocks.verifyOtp }));
 vi.mock('@/lib/org/route-after-auth', () => ({ routeAfterAuth: mocks.routeAfterAuth }));
@@ -87,6 +102,7 @@ const dto = (extra: Record<string, unknown> = {}, profile: Record<string, unknow
     ...profile,
   },
   documents: [],
+  promoterAgreementAcceptances: [],
   missingDocuments: ['id_front', 'id_back', 'selfie'],
   submittedAt: null,
   version: 1,
@@ -114,7 +130,12 @@ async function upload(input: HTMLInputElement, label: string) {
 describe('Partner onboarding wizard', () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    mocks.auth.user = { id: 'user_1', email: 'a@b.co' };
+    mocks.searchParams = '';
+    mocks.getPromoterAgreement.mockResolvedValue({ agreement: null, activationAvailable: false });
+    mocks.saveProgress.mockImplementation((_id, patch) => Promise.resolve(dto({}, patch)));
+    mocks.auth.user = { id: 'user_1', email: 'a@b.co', emailVerified: true };
+    mocks.sessionUser = { id: 'user_1', email: 'a@b.co', emailVerified: true };
+    mocks.refreshSession.mockResolvedValue(true);
     mocks.auth.loading = false;
     mocks.auth.isApproved = false;
   });
@@ -127,22 +148,86 @@ describe('Partner onboarding wizard', () => {
       expect(mocks.getMine).not.toHaveBeenCalled();
     });
 
-    it('goes to phone verification when signed in with no application yet', async () => {
+    it('requires an explicit role when signed in with no application yet', async () => {
       mocks.getMine.mockResolvedValue(null);
       render(<OnboardingPage />);
+      await waitFor(() => {
+        expect(document.body.textContent).toContain('Join the Network');
+      });
+      expect(screen.getByRole('button', { name: /continue/i })).toBeDisabled();
+    });
+
+    it('preserves an explicit role route for an authenticated applicant without an application', async () => {
+      mocks.searchParams = 'type=promoter';
+      mocks.getMine.mockResolvedValue(null);
+      render(<OnboardingPage />);
+      expect(await screen.findByText('Individual or Business?')).toBeInTheDocument();
+      expect(mocks.getMine).toHaveBeenCalledWith('promoter');
+    });
+
+    it('keeps a signed-in account with unverified email at email verification without reading onboarding', async () => {
+      mocks.auth.user = { id: 'user_1', email: 'a@b.co', emailVerified: false };
+      render(<OnboardingPage />);
+      expect(await screen.findByText('Confirm Your Email')).toBeInTheDocument();
+      expect(mocks.getMine).not.toHaveBeenCalled();
+    });
+
+    it('routes the expected phone-verification gate to phone verification', async () => {
+      mocks.getMine.mockRejectedValue(
+        apiError({
+          code: 'forbidden',
+          message: 'Verify your phone before using Partner onboarding.',
+          status: 403,
+        }),
+      );
+      render(<OnboardingPage />);
       expect(await screen.findByText('Confirm Your Number')).toBeInTheDocument();
+      expect(screen.queryByText('Your application could not be loaded')).not.toBeInTheDocument();
+    });
+
+    it('keeps unrelated onboarding 403 errors visible as load failures', async () => {
+      mocks.getMine.mockRejectedValue(
+        apiError({ code: 'forbidden', message: 'Account access is restricted.', status: 403 }),
+      );
+      render(<OnboardingPage />);
+      expect(await screen.findByText('Your application could not be loaded')).toBeInTheDocument();
     });
 
     it('resumes an individual draft with missing docs at the identity KYC step', async () => {
       mocks.getMine.mockResolvedValue(dto());
       render(<OnboardingPage />);
       expect(await screen.findByText('Verify Your Identity')).toBeInTheDocument();
+      expect(screen.getByRole('status')).toHaveTextContent('Saved venue application · Draft');
     });
 
     it('resumes a business draft at the business documents step', async () => {
       mocks.getMine.mockResolvedValue(dto({}, { entityType: 'business' }));
       render(<OnboardingPage />);
       expect(await screen.findByText('Business Documents', { selector: 'h1' })).toBeInTheDocument();
+    });
+
+    it('restores the saved business signatory declaration on resume', async () => {
+      mocks.getMine.mockResolvedValue(
+        dto(
+          { missingDocuments: [] },
+          {
+            entityType: 'business',
+            kyc: {
+              signatory: {
+                fullName: 'Synthetic Signatory',
+                designation: 'director',
+                email: 'synthetic@example.invalid',
+                idType: 'passport',
+                idNumber: 'P1234567',
+                declared: true,
+              },
+            },
+          },
+        ),
+      );
+      render(<OnboardingPage />);
+      expect(await screen.findByDisplayValue('Synthetic Signatory')).toBeInTheDocument();
+      expect(screen.getByRole('checkbox')).toBeChecked();
     });
 
     it('resumes at the last KYC step when no documents are missing', async () => {
@@ -158,6 +243,91 @@ describe('Partner onboarding wizard', () => {
       mocks.getMine.mockResolvedValue(dto({ status, missingDocuments: [] }));
       render(<OnboardingPage />);
       expect(await screen.findByText(text)).toBeInTheDocument();
+      expect(screen.getByRole('status')).toHaveTextContent(
+        `Saved venue application · ${status === 'submitted' ? 'Submitted' : 'Rejected'}`,
+      );
+    });
+
+    it.each([
+      ['host', 'Brand / Collective Name'],
+      ['venue', 'Venue Name'],
+      ['promoter', 'Your Full Name'],
+    ])('restores %s changes and patches the existing application', async (requestedType, label) => {
+      mocks.getMine.mockResolvedValue(
+        dto(
+          {
+            requestedType,
+            status: 'changes_requested',
+            reviewNote: 'Please replace the blurred selfie.',
+          },
+          { contactPerson: 'Applicant Name' },
+        ),
+      );
+      mocks.saveProgress.mockResolvedValue(dto({ requestedType, status: 'changes_requested' }));
+      render(<OnboardingPage />);
+      expect(await screen.findByText('Please replace the blurred selfie.')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /Fix Profile/ }));
+      expect(screen.getByLabelText(label)).toHaveValue('Acme');
+      fireEvent.click(screen.getByRole('button', { name: /Continue to Documents/ }));
+      await waitFor(() => {
+        expect(mocks.saveProgress).toHaveBeenCalledWith(
+          'req_1',
+          expect.objectContaining({ legalName: 'Acme', contactPerson: 'Applicant Name' }),
+        );
+      });
+      expect(mocks.start).not.toHaveBeenCalled();
+    });
+
+    it('restores uploaded documents after refresh without re-uploading them', async () => {
+      mocks.getMine.mockResolvedValue(
+        dto({
+          documents: ['id_front', 'id_back', 'selfie'].map((label) => ({
+            label,
+            storagePath: `kyc/user_1/req_1/${label}`,
+            status: 'pending',
+          })),
+          missingDocuments: [],
+        }),
+      );
+      render(<OnboardingPage />);
+      await screen.findByText('Verify Your Identity');
+      expect(screen.getAllByText('Uploaded')).toHaveLength(3);
+      expect(mocks.uploadDocument).not.toHaveBeenCalled();
+    });
+
+    it('resumes privately persisted identity fields with the existing document slots', async () => {
+      mocks.getMine.mockResolvedValue(
+        dto(
+          {
+            documents: ['id_front', 'id_back', 'selfie'].map((label) => ({
+              label,
+              storagePath: `kyc/user_1/req_1/${label}`,
+              status: 'pending',
+            })),
+            missingDocuments: [],
+          },
+          { kyc: { identity: { idType: 'passport', idNumber: 'P1234567' } } },
+        ),
+      );
+      render(<OnboardingPage />);
+      expect(await screen.findByLabelText('ID Number')).toHaveValue('P1234567');
+      expect(screen.getByLabelText('ID Type')).toHaveValue('passport');
+      fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+      await waitFor(() => {
+        expect(mocks.saveProgress).toHaveBeenCalledWith('req_1', {
+          kyc: { identity: { idType: 'passport', idNumber: 'P1234567' } },
+        });
+      });
+    });
+
+    it('offers bounded retry instead of starting over when saved progress cannot be loaded', async () => {
+      mocks.getMine.mockRejectedValue(new Error('network unavailable'));
+      render(<OnboardingPage />);
+      expect(
+        await screen.findByRole('heading', { name: 'Your application could not be loaded' }),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole('heading', { name: 'Join the Network' })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
     });
 
     it('routes an approved user away from the wizard', async () => {
@@ -171,7 +341,13 @@ describe('Partner onboarding wizard', () => {
 
   describe('phone verification gating', () => {
     async function openPhoneStep() {
-      mocks.getMine.mockResolvedValue(null);
+      mocks.getMine.mockRejectedValue(
+        apiError({
+          code: 'forbidden',
+          message: 'Verify your phone before using Partner onboarding.',
+          status: 403,
+        }),
+      );
       const user = userEvent.setup();
       const view = render(<OnboardingPage />);
       await screen.findByText('Confirm Your Number');
@@ -215,7 +391,7 @@ describe('Partner onboarding wizard', () => {
       expect(mocks.confirmPhoneOtp).not.toHaveBeenCalled();
 
       mocks.confirmPhoneOtp.mockResolvedValue('id-token');
-      mocks.verifyDocument.mockResolvedValue({ passed: false, reason: 'Number mismatch' });
+      mocks.verifyPhone.mockResolvedValue({ passed: false, reason: 'Number mismatch' });
       fireEvent.change(await screen.findByPlaceholderText('000000'), {
         target: { value: '123456' },
       });
@@ -223,18 +399,17 @@ describe('Partner onboarding wizard', () => {
       expect(await screen.findByText('Number mismatch')).toBeInTheDocument();
       expect(screen.queryByText('Individual or Business?')).not.toBeInTheDocument();
 
-      mocks.verifyDocument.mockResolvedValue({ passed: true });
+      mocks.verifyPhone.mockResolvedValue({ passed: true });
       await waitFor(() => {
         expect(screen.getByRole('button', { name: /verify phone/i })).toBeEnabled();
       });
       await user.click(screen.getByRole('button', { name: /verify phone/i }));
       expect(
-        await screen.findByText('Individual or Business?', {}, { timeout: 15_000 }),
+        await screen.findByRole('heading', { name: 'Join the Network' }, { timeout: 15_000 }),
       ).toBeInTheDocument();
-      expect(mocks.verifyDocument).toHaveBeenLastCalledWith({
-        documentType: 'phone',
-        documentNumber: '+919876543210',
-        proofToken: 'id-token',
+      expect(mocks.verifyPhone).toHaveBeenLastCalledWith({
+        phoneNumber: '+919876543210',
+        idToken: 'id-token',
       });
     });
   });
@@ -305,7 +480,10 @@ describe('Partner onboarding wizard', () => {
 
       mocks.submit.mockResolvedValue(dto({ status: 'submitted', missingDocuments: [] }));
       await user.click(next);
-      expect(await screen.findByText('Application Submitted')).toBeInTheDocument();
+      // Query and assert together so a React step transition cannot detach a stale node.
+      await waitFor(() =>
+        expect(screen.getByRole('heading', { name: 'Application Submitted' })).toBeInTheDocument(),
+      );
       expect(mocks.submit).toHaveBeenCalledTimes(1);
       expect(mocks.submit).toHaveBeenCalledWith('req_1', expect.any(String));
     });
@@ -406,9 +584,13 @@ describe('Partner onboarding wizard', () => {
       }
       expect(sigNext).toBeDisabled(); // details + declaration missing
 
+      expect(screen.getByPlaceholderText('As on government ID')).toHaveValue('A');
+      await user.clear(screen.getByPlaceholderText('As on government ID'));
       await user.type(screen.getByPlaceholderText('As on government ID'), 'Jane Doe');
       const [designation, idType] = screen.getAllByRole('combobox');
       await user.selectOptions(designation as HTMLElement, 'director');
+      expect(screen.getByPlaceholderText('representative@company.com')).toHaveValue('a@b.co');
+      await user.clear(screen.getByPlaceholderText('representative@company.com'));
       await user.type(screen.getByPlaceholderText('representative@company.com'), 'j@d.co');
       await user.selectOptions(idType as HTMLElement, 'passport');
       await user.type(screen.getByPlaceholderText('Enter ID number'), 'P7654321');
@@ -418,7 +600,10 @@ describe('Partner onboarding wizard', () => {
 
       mocks.submit.mockResolvedValue(dto({ status: 'submitted', missingDocuments: [] }));
       await user.click(sigNext);
-      expect(await screen.findByText('Application Submitted')).toBeInTheDocument();
+      // Query and assert together so a React step transition cannot detach a stale node.
+      await waitFor(() =>
+        expect(screen.getByRole('heading', { name: 'Application Submitted' })).toBeInTheDocument(),
+      );
       expect(mocks.uploadDocument.mock.calls.map((c) => c[1])).toEqual([
         'registration_certificate',
         'sig_id_front',

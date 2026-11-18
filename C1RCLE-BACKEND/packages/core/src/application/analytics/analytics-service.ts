@@ -83,7 +83,11 @@ function buildRange(
   const endMs = Number.isNaN(end) ? startMs : Math.max(end, startMs);
 
   const keyOf = (instant: string): string =>
-    granularity === 'hour' ? `${dayOf(instant)}T${instant.slice(11, 13)}:00` : dayOf(instant);
+    granularity === 'hour'
+      ? `${dayOf(instant)}T${instant.slice(11, 13)}:00`
+      : granularity === 'month'
+        ? instant.slice(0, 7)
+        : dayOf(instant);
 
   const count = Math.min(Math.max(bucketCount(startMs, endMs, granularity), 1), MAX_TREND_BUCKETS);
 
@@ -171,6 +175,43 @@ export class AnalyticsService {
     return this.computeOrganizationOverview(actor.organizationId);
   }
 
+  /** Source-backed ticket and collection metrics; never inferred by the UI. */
+  async getOrganizationSalesBreakdown(actor: ActorContext): Promise<OrganizationSalesBreakdown> {
+    requireOrgAccess(actor, actor.organizationId);
+    const [orders, entitlements] = await Promise.all([
+      this.scanAll<Order>((q) =>
+        this.deps.repositories.orders.listByOrganization(actor.organizationId, q),
+      ),
+      this.scanAll<Entitlement>((q) =>
+        this.deps.repositories.entitlements.listByOrganization(actor.organizationId, q),
+      ),
+    ]);
+
+    const captured = orders.filter(
+      (order) =>
+        isCaptured(order.status) || (order.id.startsWith('RSVP-') && order.status === 'cancelled'),
+    );
+    const rsvpOrderIds = new Set(
+      captured.filter((order) => order.id.startsWith('RSVP-')).map((order) => order.id),
+    );
+    const paidOrders = captured.filter(
+      (order) => !rsvpOrderIds.has(order.id) && order.lines.some((line) => line.unitPricePaise > 0),
+    );
+    const paidOrderIds = new Set(paidOrders.map((order) => order.id));
+
+    return {
+      totalTicketsIssued: entitlements.length,
+      paidTickets: entitlements.filter((ticket) => paidOrderIds.has(ticket.orderId)).length,
+      freeRsvpTickets: entitlements.filter((ticket) => rsvpOrderIds.has(ticket.orderId)).length,
+      paidOrderCount: paidOrders.length,
+      // Gross captured includes platform fees and tax, and is intentionally
+      // before refunds. Ticket revenue is the discounted ticket subtotal,
+      // excluding guest fees/tax, also before refunds.
+      guestGrossCollectedPaise: paidOrders.reduce((sum, order) => sum + order.grandTotalPaise, 0),
+      ticketRevenuePaise: paidOrders.reduce((sum, order) => sum + order.discountedSubtotalPaise, 0),
+    };
+  }
+
   async getEventAnalytics(actor: ActorContext, eventId: EntityId): Promise<EventAnalytics> {
     const events = this.deps.repositories.events;
     const event = await events.getById(eventId);
@@ -179,8 +220,324 @@ export class AnalyticsService {
       throw new EventNotFoundError(eventId);
     }
     const analytics = await this.repo.getEventAnalytics(eventId);
-    if (analytics) return analytics;
-    return this.computeEventAnalytics(event);
+    // Keep source-derived values fresh even when an older/stale projection is
+    // present. In particular, legacy projections may encode an unconfigured
+    // venue as capacity=0 and mark every future ticket as a no-show. Views,
+    // guest-list signups, and conversion are projection-only, so retain those
+    // fields from the read model while recomputing the financial/attendance
+    // values from source aggregates.
+    const computed = await this.computeEventAnalytics(event);
+    if (!analytics) return computed;
+    return {
+      ...computed,
+      views: analytics.views,
+      guestlistSignups: analytics.guestlistSignups,
+      conversionRate: analytics.conversionRate,
+    };
+  }
+
+  /** Historical successful bookings, bucketed by product-local weekday and hour. */
+  async getEventBookingHeatmap(actor: ActorContext, eventId: EntityId) {
+    const event = await this.deps.repositories.events.getById(eventId);
+    if (!event || event.organizationId !== actor.organizationId)
+      throw new EventNotFoundError(eventId);
+
+    const buckets = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => 0));
+    const dayIndexes: Record<string, number> = {
+      Mon: 0,
+      Tue: 1,
+      Wed: 2,
+      Thu: 3,
+      Fri: 4,
+      Sat: 5,
+      Sun: 6,
+    };
+    const formatter = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      weekday: 'short',
+      hour: '2-digit',
+      hourCycle: 'h23',
+    });
+    let scanned = 0;
+    let pages = 0;
+    let cursor: string | null = null;
+    let complete = true;
+    do {
+      const page = await this.deps.repositories.orders.listByEvent(eventId, {
+        limit: Math.min(250, COMPUTE_SCAN_LIMIT - scanned),
+        cursor,
+      });
+      pages += 1;
+      scanned += page.items.length;
+      for (const order of page.items) {
+        const successful =
+          isCaptured(order.status) ||
+          (order.id.startsWith('RSVP-') && order.status === 'cancelled');
+        if (!successful) continue;
+        const timestamp = Date.parse(order.bookedAt ?? order.createdAt);
+        if (!Number.isFinite(timestamp)) continue;
+        const parts = formatter.formatToParts(new Date(timestamp));
+        const day = dayIndexes[parts.find((part) => part.type === 'weekday')?.value ?? ''];
+        const hour = Number(parts.find((part) => part.type === 'hour')?.value);
+        const dayBuckets = day === undefined ? undefined : buckets.at(day);
+        const currentHourCount = dayBuckets?.at(hour);
+        if (
+          dayBuckets &&
+          Number.isInteger(hour) &&
+          hour >= 0 &&
+          hour < 24 &&
+          currentHourCount !== undefined
+        ) {
+          dayBuckets[hour] = currentHourCount + 1;
+        }
+      }
+      cursor = page.nextCursor;
+      if (cursor !== null && (scanned >= COMPUTE_SCAN_LIMIT || pages >= COMPUTE_SCAN_LIMIT))
+        complete = false;
+    } while (cursor !== null && scanned < COMPUTE_SCAN_LIMIT && pages < COMPUTE_SCAN_LIMIT);
+
+    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const;
+    const weekdays = days.flatMap((day, index) => {
+      const hours = buckets.at(index);
+      return hours ? [{ day, hours }] : [];
+    });
+    return {
+      eventId,
+      timeZone: 'Asia/Kolkata' as const,
+      weekdays,
+      totalBookings: buckets.flat().reduce((sum, count) => sum + count, 0),
+      complete,
+    };
+  }
+
+  /**
+   * Server-derived Promoter sales for an event. Ticket value and commission
+   * use the same captured-order states as event analytics and are explicitly
+   * before refund adjustments; this is an attribution projection, not a
+   * payable-balance or causal-lift calculation.
+   */
+  async getEventPromoterAnalytics(
+    actor: ActorContext,
+    eventId: EntityId,
+  ): Promise<EventPromoterAnalytics> {
+    const event = await this.deps.repositories.events.getById(eventId);
+    if (!event || event.organizationId !== actor.organizationId) {
+      throw new EventNotFoundError(eventId);
+    }
+
+    const orders: Order[] = [];
+    const pageSize = 250;
+    let cursor: string | null = null;
+    let complete = true;
+    do {
+      const remaining = COMPUTE_SCAN_LIMIT - orders.length;
+      const page = await this.deps.repositories.orders.listByEvent(eventId, {
+        limit: Math.min(pageSize, remaining),
+        cursor,
+      });
+      orders.push(...page.items);
+      cursor = page.nextCursor;
+      if (cursor !== null && orders.length >= COMPUTE_SCAN_LIMIT) complete = false;
+    } while (cursor !== null && orders.length < COMPUTE_SCAN_LIMIT);
+
+    const captured = orders.filter((order) => isCaptured(order.status));
+    const transition = await this.deps.repositories.journalTransition.get();
+    let liabilityComplete = true;
+    let refundValueComplete = true;
+    const byPromoter = new Map<string, EventPromoterAnalyticsItem>();
+    for (const order of captured) {
+      const attribution = order.attribution;
+      if (!attribution) continue;
+      const orderJournals =
+        order.refundedPaise > 0
+          ? await this.deps.repositories.financialJournals.findByOrderId(order.id)
+          : [];
+      const refundRecognitions = orderJournals.filter(
+        (journal) =>
+          journal.source.type === 'refund' && journal.idempotencyKey.endsWith(':recognition'),
+      );
+      if (order.refundedPaise > 0 && refundRecognitions.length === 0) refundValueComplete = false;
+      const refundedTicketValuePaise = refundRecognitions.reduce(
+        (sum, journal) =>
+          sum +
+          (journal.components?.refundedAdmissionPaise ??
+            journal.lines
+              .filter(
+                (line) => line.side === 'debit' && line.account === 'ticket_collection_control',
+              )
+              .reduce((total, line) => total + line.amountPaise, 0)),
+        0,
+      );
+      const reversedCommissionPaise =
+        transition.readModel === 'financial_journal_v2'
+          ? orderJournals
+              .filter(
+                (journal) =>
+                  journal.source.type === 'refund' &&
+                  journal.idempotencyKey.endsWith(':payable-reversal'),
+              )
+              .flatMap((journal) => journal.lines)
+              .filter(
+                (line) =>
+                  line.side === 'debit' &&
+                  line.account === 'promoter_payable' &&
+                  line.organizationId === attribution.promoterId,
+              )
+              .reduce((sum, line) => sum + line.amountPaise, 0)
+          : null;
+      const current = byPromoter.get(attribution.promoterId) ?? {
+        promoterOrganizationId: attribution.promoterId,
+        attributedOrderCount: 0,
+        historicalRsvpConversionCount: 0,
+        activeRsvpCount: 0,
+        attributedTicketCount: 0,
+        attributedTicketValuePaise: 0,
+        grossAttributedTicketValuePaise: 0,
+        refundedAttributedTicketValuePaise: 0,
+        netAttributedTicketValuePaise: 0,
+        recordedCommissionPaise: 0,
+        reversedCommissionPaise: transition.readModel === 'financial_journal_v2' ? 0 : null,
+        netAttributedValuePaise: 0,
+        commissionPayableBalancePaise: 0,
+        liabilityComplete: true,
+        liabilityReadModel: 'legacy_ledger_v1' as const,
+      };
+      const ticketCount = ticketsIn(order);
+      byPromoter.set(attribution.promoterId, {
+        ...current,
+        attributedOrderCount: current.attributedOrderCount + 1,
+        historicalRsvpConversionCount:
+          current.historicalRsvpConversionCount + (order.id.startsWith('RSVP-') ? 1 : 0),
+        activeRsvpCount:
+          current.activeRsvpCount +
+          (order.id.startsWith('RSVP-') && order.status === 'paid' ? 1 : 0),
+        attributedTicketCount: current.attributedTicketCount + ticketCount,
+        attributedTicketValuePaise:
+          current.attributedTicketValuePaise + order.discountedSubtotalPaise,
+        grossAttributedTicketValuePaise:
+          current.grossAttributedTicketValuePaise + order.discountedSubtotalPaise,
+        refundedAttributedTicketValuePaise:
+          current.refundedAttributedTicketValuePaise + refundedTicketValuePaise,
+        netAttributedTicketValuePaise:
+          current.netAttributedTicketValuePaise +
+          Math.max(0, order.discountedSubtotalPaise - refundedTicketValuePaise),
+        recordedCommissionPaise:
+          current.recordedCommissionPaise + attribution.promoterCommissionPaise,
+        reversedCommissionPaise:
+          current.reversedCommissionPaise === null || reversedCommissionPaise === null
+            ? null
+            : current.reversedCommissionPaise + reversedCommissionPaise,
+        netAttributedValuePaise:
+          current.netAttributedValuePaise +
+          order.discountedSubtotalPaise -
+          attribution.promoterCommissionPaise,
+        commissionPayableBalancePaise: current.commissionPayableBalancePaise,
+        liabilityComplete: current.liabilityComplete,
+        liabilityReadModel: transition.readModel,
+      });
+    }
+
+    for (const [promoterOrganizationId, current] of byPromoter) {
+      if (transition.readModel === 'financial_journal_v2') {
+        const payableLines =
+          await this.deps.repositories.financialJournals.listPayableLinesByOrganization(
+            promoterOrganizationId,
+          );
+        const commissionPayableBalancePaise = payableLines
+          .filter((line) => line.account === 'promoter_payable' && line.source.eventId === eventId)
+          .reduce(
+            (balance, line) =>
+              balance + (line.side === 'credit' ? line.amountPaise : -line.amountPaise),
+            0,
+          );
+        byPromoter.set(promoterOrganizationId, {
+          ...current,
+          commissionPayableBalancePaise,
+          liabilityComplete: true,
+        });
+        continue;
+      }
+
+      let commissionPayableBalancePaise = 0;
+      let ledgerCursor: string | null = null;
+      let scanned = 0;
+      do {
+        const remaining = COMPUTE_SCAN_LIMIT - scanned;
+        const page = await this.deps.repositories.ledger.listByOrganization(
+          promoterOrganizationId,
+          { limit: Math.min(pageSize, remaining), cursor: ledgerCursor },
+        );
+        for (const entry of page.items) {
+          if (
+            entry.eventId === eventId &&
+            entry.entryType === 'promoter_commission' &&
+            entry.status !== 'paid_out'
+          ) {
+            commissionPayableBalancePaise += entry.amount;
+          }
+        }
+        scanned += page.items.length;
+        ledgerCursor = page.nextCursor;
+        if (ledgerCursor !== null && scanned >= COMPUTE_SCAN_LIMIT) liabilityComplete = false;
+      } while (ledgerCursor !== null && scanned < COMPUTE_SCAN_LIMIT);
+      byPromoter.set(promoterOrganizationId, {
+        ...current,
+        commissionPayableBalancePaise,
+        liabilityComplete: scanned < COMPUTE_SCAN_LIMIT || ledgerCursor === null,
+        liabilityReadModel: transition.readModel,
+      });
+    }
+
+    const items = [...byPromoter.values()].sort((left, right) =>
+      left.promoterOrganizationId.localeCompare(right.promoterOrganizationId),
+    );
+    return {
+      eventId,
+      complete: complete && liabilityComplete && refundValueComplete,
+      refundValueComplete,
+      capturedTicketCount: captured.reduce((sum, order) => sum + ticketsIn(order), 0),
+      historicalConversionCount: [...byPromoter.values()].reduce(
+        (sum, item) => sum + item.attributedOrderCount,
+        0,
+      ),
+      historicalRsvpConversionCount: [...byPromoter.values()].reduce(
+        (sum, item) => sum + item.historicalRsvpConversionCount,
+        0,
+      ),
+      activeRsvpCount: [...byPromoter.values()].reduce(
+        (sum, item) => sum + item.activeRsvpCount,
+        0,
+      ),
+      attributedTicketCount: items.reduce((sum, item) => sum + item.attributedTicketCount, 0),
+      attributedTicketValuePaise: items.reduce(
+        (sum, item) => sum + item.attributedTicketValuePaise,
+        0,
+      ),
+      grossAttributedTicketValuePaise: items.reduce(
+        (sum, item) => sum + item.grossAttributedTicketValuePaise,
+        0,
+      ),
+      refundedAttributedTicketValuePaise: items.reduce(
+        (sum, item) => sum + item.refundedAttributedTicketValuePaise,
+        0,
+      ),
+      netAttributedTicketValuePaise: items.reduce(
+        (sum, item) => sum + item.netAttributedTicketValuePaise,
+        0,
+      ),
+      recordedCommissionPaise: items.reduce((sum, item) => sum + item.recordedCommissionPaise, 0),
+      reversedCommissionPaise: items.every((item) => item.reversedCommissionPaise !== null)
+        ? items.reduce((sum, item) => sum + (item.reversedCommissionPaise ?? 0), 0)
+        : null,
+      netAttributedValuePaise: items.reduce((sum, item) => sum + item.netAttributedValuePaise, 0),
+      commissionPayableBalancePaise: items.reduce(
+        (sum, item) => sum + item.commissionPayableBalancePaise,
+        0,
+      ),
+      liabilityComplete: items.every((item) => item.liabilityComplete),
+      liabilityReadModel: transition.readModel,
+      items,
+    };
   }
 
   /**
@@ -252,17 +609,34 @@ export class AnalyticsService {
 
     const buckets = new Map<string, TrendBucket>();
     for (const key of range.keys) {
-      buckets.set(key, { key, revenuePaise: 0, tickets: 0, checkIns: 0 });
+      buckets.set(key, {
+        key,
+        revenuePaise: 0,
+        tickets: 0,
+        checkIns: 0,
+        totalTicketsIssued: 0,
+        paidTickets: 0,
+        freeRsvpTickets: 0,
+        paidOrderCount: 0,
+        guestGrossCollectedPaise: 0,
+        ticketRevenuePaise: 0,
+      });
     }
 
+    const ordersById = new Map(orderList.map((order) => [order.id, order]));
     for (const order of orderList) {
       if (!isCaptured(order.status)) continue;
-      const bucket = buckets.get(range.keyOf(order.createdAt));
+      const bucket = buckets.get(range.keyOf(order.paidAt ?? order.createdAt));
       // An order outside the window is skipped, not clamped — clamping would
       // pile a whole month of sales onto its first or last bucket.
       if (bucket === undefined) continue;
       bucket.revenuePaise += netPaise(order);
       bucket.tickets += ticketsIn(order);
+      if (!order.id.startsWith('RSVP-') && order.lines.some((line) => line.unitPricePaise > 0)) {
+        bucket.paidOrderCount += 1;
+        bucket.guestGrossCollectedPaise += order.grandTotalPaise;
+        bucket.ticketRevenuePaise += order.discountedSubtotalPaise;
+      }
     }
 
     // `scannedAt` is a list of instants, one per scan, so a ticket admitted on
@@ -270,6 +644,16 @@ export class AnalyticsService {
     // multi-day entitlement to a single arbitrary day would make the per-day
     // check-in bars disagree with the total, which counts every scan.
     for (const entry of entitlementList) {
+      const order = ordersById.get(entry.orderId);
+      const issueBucket = buckets.get(range.keyOf(entry.createdAt));
+      if (issueBucket !== undefined) {
+        issueBucket.totalTicketsIssued += 1;
+        if (order && isCaptured(order.status)) {
+          if (order.id.startsWith('RSVP-')) issueBucket.freeRsvpTickets += 1;
+          else if (order.lines.some((line) => line.unitPricePaise > 0))
+            issueBucket.paidTickets += 1;
+        }
+      }
       for (const instant of entry.scannedAt) {
         const bucket = buckets.get(range.keyOf(instant));
         if (bucket !== undefined) bucket.checkIns += 1;
@@ -282,19 +666,31 @@ export class AnalyticsService {
       from: range.from,
       to: range.to,
       buckets: [...buckets.values()],
-      totals: {
-        revenuePaise: orderList.reduce(
-          (sum, order) => (isCaptured(order.status) ? sum + netPaise(order) : sum),
-          0,
-        ),
-        tickets: orderList.reduce(
-          (sum, order) => (isCaptured(order.status) ? sum + ticketsIn(order) : sum),
-          0,
-        ),
-        // Counts individual scans, so it matches the per-bucket sums above
-        // rather than `entry.scanCount` being trusted to equal its array length.
-        checkIns: entitlementList.reduce((sum, entry) => sum + entry.scannedAt.length, 0),
-      },
+      totals: [...buckets.values()].reduce(
+        (totals, bucket) => ({
+          revenuePaise: totals.revenuePaise + bucket.revenuePaise,
+          tickets: totals.tickets + bucket.tickets,
+          checkIns: totals.checkIns + bucket.checkIns,
+          totalTicketsIssued: totals.totalTicketsIssued + bucket.totalTicketsIssued,
+          paidTickets: totals.paidTickets + bucket.paidTickets,
+          freeRsvpTickets: totals.freeRsvpTickets + bucket.freeRsvpTickets,
+          paidOrderCount: totals.paidOrderCount + bucket.paidOrderCount,
+          guestGrossCollectedPaise:
+            totals.guestGrossCollectedPaise + bucket.guestGrossCollectedPaise,
+          ticketRevenuePaise: totals.ticketRevenuePaise + bucket.ticketRevenuePaise,
+        }),
+        {
+          revenuePaise: 0,
+          tickets: 0,
+          checkIns: 0,
+          totalTicketsIssued: 0,
+          paidTickets: 0,
+          freeRsvpTickets: 0,
+          paidOrderCount: 0,
+          guestGrossCollectedPaise: 0,
+          ticketRevenuePaise: 0,
+        },
+      ),
     };
   }
 
@@ -373,7 +769,13 @@ export class AnalyticsService {
         status: event.status,
         venueId: event.venueId,
         venueName: venue?.public.name ?? null,
-        imageUrl: event.imageUrl,
+        // Older private events may still carry a long-lived public poster URL.
+        // Partner cards are not an authorized media-delivery path, so redact it
+        // even for tenant-scoped reads until the poster ACL inventory is fixed.
+        imageUrl:
+          event.visibilityMode === 'code' || event.visibilityMode === 'invited'
+            ? null
+            : event.imageUrl,
         ticketsSold: soldByEvent.get(event.id) ?? 0,
         // `public.capacity` is nullable by design (a venue may never declare
         // one), and that `null` must survive to the wire as `null`.
@@ -504,12 +906,15 @@ export class AnalyticsService {
   }
 
   private async computeEventAnalytics(event: Event): Promise<EventAnalytics> {
-    const { orders, entitlements, venues } = this.deps.repositories;
+    const { orders, entitlements } = this.deps.repositories;
 
-    const [orderList, entitlementList] = await Promise.all([
-      this.scanAll<Order>((q) => orders.listByEvent(event.id, q)),
-      this.scanAll<Entitlement>((q) => entitlements.listByEvent(event.id, q)),
+    const [orderScan, entitlementScan, tiers] = await Promise.all([
+      this.scanAllWithCompleteness<Order>((q) => orders.listByEvent(event.id, q)),
+      this.scanAllWithCompleteness<Entitlement>((q) => entitlements.listByEvent(event.id, q)),
+      this.deps.repositories.catalog.listTiers(event.id),
     ]);
+    const orderList = orderScan.items;
+    const entitlementList = entitlementScan.items;
 
     let totalRevenuePaise = 0;
     let refundAmountPaise = 0;
@@ -523,10 +928,52 @@ export class AnalyticsService {
 
     const totalCheckIns = entitlementList.reduce((sum, entry) => sum + entry.scanCount, 0);
 
-    const venueCapacity = event.venueId
-      ? ((await venues.getById(event.venueId))?.public.capacity ?? 0)
-      : 0;
-    const capacity = venueCapacity;
+    const operationalByTier = new Map<
+      EntityId,
+      {
+        tierId: EntityId;
+        name: string;
+        unitKind: 'ticket' | 'rsvp';
+        unitsIssued: number;
+        expectedGuests: number;
+        checkedInGuests: number;
+      }
+    >();
+    let ticketUnitsIssued = 0;
+    let rsvpUnitsIssued = 0;
+    let expectedGuests = 0;
+    let checkedInGuests = 0;
+    for (const entitlement of entitlementList) {
+      const kind =
+        (entitlement.unitKind ??
+          (entitlement.orderId.startsWith('RSVP-') ? 'free_rsvp' : 'paid')) === 'free_rsvp'
+          ? 'rsvp'
+          : 'ticket';
+      checkedInGuests += entitlement.scanCount;
+      const tier = operationalByTier.get(entitlement.tierId) ?? {
+        tierId: entitlement.tierId,
+        name: entitlement.tierName,
+        unitKind: kind,
+        unitsIssued: 0,
+        expectedGuests: 0,
+        checkedInGuests: 0,
+      };
+      tier.checkedInGuests += entitlement.scanCount;
+      if (entitlement.status !== 'void') {
+        const guests = entitlement.scanCountAllowed;
+        expectedGuests += guests;
+        if (kind === 'rsvp') rsvpUnitsIssued += 1;
+        else ticketUnitsIssued += 1;
+        tier.unitsIssued += 1;
+        tier.expectedGuests += guests;
+      }
+      operationalByTier.set(entitlement.tierId, tier);
+    }
+
+    // Event operations and door occupancy use the event's explicitly declared
+    // legal room capacity. Ticket-tier quantities are inventory, and the
+    // venue's default capacity must not silently override an event-level null.
+    const capacity = event.capacity;
 
     // Repeat guests requires per-user purchase history; the fallback has only a
     // bounded entitlement scan, so count distinct entitled users instead.
@@ -540,21 +987,117 @@ export class AnalyticsService {
       totalRevenuePaise,
       ticketsSold,
       totalCheckIns,
+      totalTicketInventory: tiers.reduce((sum, tier) => sum + tier.quantity, 0),
       capacity,
       // Projection-only in the cached model; no source aggregate exists yet.
       views: 0,
       guestlistSignups: 0,
       avgTicketPricePaise: ticketsSold > 0 ? Math.round(totalRevenuePaise / ticketsSold) : 0,
-      occupancyRate: ratio(totalCheckIns, capacity),
-      sellThroughRate: ratio(ticketsSold, capacity),
+      occupancyRate: capacity === null ? null : ratio(totalCheckIns, capacity),
+      sellThroughRate: capacity === null ? null : ratio(ticketsSold, capacity),
       refundAmountPaise,
       refundRate: ratio(refundAmountPaise, totalRevenuePaise),
+      // A no-show is only knowable after the event's declared end. A future or
+      // in-progress event must not count every unscanned ticket as a no-show.
       noShowRate:
-        ticketsSold > 0 ? Math.min(1, Math.max(0, (ticketsSold - totalCheckIns) / ticketsSold)) : 0,
+        event.endAt && Date.parse(event.endAt) <= Date.now() && ticketsSold > 0
+          ? Math.min(1, Math.max(0, (ticketsSold - totalCheckIns) / ticketsSold))
+          : null,
       repeatGuests: repeatGuests.size,
       conversionRate: 0,
+      ticketUnitsIssued,
+      rsvpUnitsIssued,
+      expectedGuests,
+      checkedInGuests,
+      operationalCountsComplete: entitlementScan.complete,
+      operationalTierCounts: [...operationalByTier.values()].sort((a, b) =>
+        a.name.localeCompare(b.name),
+      ),
     };
   }
+
+  private async scanAllWithCompleteness<T>(
+    query: (page: PaginationQuery) => Promise<Page<T>>,
+  ): Promise<{ items: T[]; complete: boolean }> {
+    const items: T[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await query({ limit: COMPUTE_SCAN_LIMIT, cursor });
+      items.push(...page.items);
+      cursor = page.nextCursor;
+    } while (cursor !== null && items.length < COMPUTE_SCAN_LIMIT);
+    return { items, complete: cursor === null };
+  }
+}
+
+export interface EventPromoterAnalyticsItem {
+  readonly promoterOrganizationId: EntityId;
+  /** Historical acquisitions; settled refunds do not erase a conversion. */
+  readonly attributedOrderCount: number;
+  readonly historicalRsvpConversionCount: number;
+  /** RSVP acquisitions whose RSVP order is still active. */
+  readonly activeRsvpCount: number;
+  readonly attributedTicketCount: number;
+  /** Backward-compatible alias for gross attributed ticket sales. */
+  readonly attributedTicketValuePaise: number;
+  readonly grossAttributedTicketValuePaise: number;
+  readonly refundedAttributedTicketValuePaise: number;
+  readonly netAttributedTicketValuePaise: number;
+  /** Frozen commission from the original attributed orders. */
+  readonly recordedCommissionPaise: number;
+  /** Canonical journal reversal total; null on the legacy ledger read model. */
+  readonly reversedCommissionPaise: number | null;
+  /** Legacy compatibility field: ticket value less recorded commission. */
+  readonly netAttributedValuePaise: number;
+  /** Signed net payable balance from the selected finance read model. */
+  readonly commissionPayableBalancePaise: number;
+  readonly liabilityComplete: boolean;
+  readonly liabilityReadModel: 'legacy_ledger_v1' | 'financial_journal_v2';
+}
+
+export interface EventPromoterAnalytics {
+  readonly eventId: EntityId;
+  /** False when more than the bounded source scan cap remains. */
+  readonly complete: boolean;
+  /** False when a refunded order lacks an authoritative refund recognition. */
+  readonly refundValueComplete: boolean;
+  /** Historical attributed orders, including settled refunds. */
+  readonly historicalConversionCount: number;
+  readonly historicalRsvpConversionCount: number;
+  /** Attributed RSVP orders whose current status remains active. */
+  readonly activeRsvpCount: number;
+  readonly capturedTicketCount: number;
+  readonly attributedTicketCount: number;
+  /** Captured discounted ticket value before refund adjustments. */
+  readonly attributedTicketValuePaise: number;
+  readonly grossAttributedTicketValuePaise: number;
+  readonly refundedAttributedTicketValuePaise: number;
+  readonly netAttributedTicketValuePaise: number;
+  /** Frozen commission from captured orders before refund adjustments. */
+  readonly recordedCommissionPaise: number;
+  /** Canonical journal reversals; null on the legacy ledger read model. */
+  readonly reversedCommissionPaise: number | null;
+  /** Legacy compatibility field: ticket value less recorded commission. */
+  readonly netAttributedValuePaise: number;
+  readonly commissionPayableBalancePaise: number;
+  readonly liabilityComplete: boolean;
+  readonly liabilityReadModel: 'legacy_ledger_v1' | 'financial_journal_v2';
+  readonly items: readonly EventPromoterAnalyticsItem[];
+}
+
+export interface OrganizationSalesBreakdown {
+  /** Historical entitlement records, including ones later voided. */
+  readonly totalTicketsIssued: number;
+  /** Issued entitlement units whose source order is a captured, paid-ticket order. */
+  readonly paidTickets: number;
+  /** Issued entitlement units from deterministic free-RSVP orders. */
+  readonly freeRsvpTickets: number;
+  /** Captured non-RSVP orders containing at least one positive-price tier. */
+  readonly paidOrderCount: number;
+  /** Captured order grand totals (fees and tax included), before refunds. */
+  readonly guestGrossCollectedPaise: number;
+  /** Discounted ticket subtotals, excluding fees and tax, before refunds. */
+  readonly ticketRevenuePaise: number;
 }
 
 function startAtFor(events: Event[], eventId: EntityId): string {

@@ -2,6 +2,7 @@ import { suspendOrganization } from '@c1rcle/core/domain';
 import { describe, expect, it } from 'vitest';
 
 import { createV2Services } from '../../../lib/v2-services.js';
+import { seedApprovedPartnerOrganization } from '../../../test-utils/approved-partner-organization.js';
 import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
 
 import partnerOrganizationRoutes from './organizations.js';
@@ -21,14 +22,10 @@ type Server = Awaited<ReturnType<typeof buildServer>>;
 const read = (org: string) => ({ 'x-organization-id': org });
 const write = (org: string) => ({ ...read(org), 'idempotency-key': `pc-key-${++keySeq}` });
 
-async function createOrganization(server: Server): Promise<string> {
-  const created = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: { 'x-organization-id': 'org_seed', 'idempotency-key': `seed-${++keySeq}` },
-    payload: { name: 'Org', slug: `org-${keySeq}` },
-  });
-  const id: string = created.json().id;
+async function createOrganization(_server: Server): Promise<string> {
+  ++keySeq;
+  const created = await seedApprovedPartnerOrganization({ name: 'Org', slug: `org-${keySeq}` });
+  const id: string = created.id;
   return id;
 }
 
@@ -82,6 +79,15 @@ describe('answering', () => {
   it('lets the recipient approve', async () => {
     const server = await buildServer();
     const { target, connectionId } = await pending(server);
+    const notifications = createV2Services().repos().notifications;
+    const before = await notifications.listUnreadByRecipient(target, {
+      limit: 100,
+      cursor: null,
+    });
+    const requestNotification = before.items.find(
+      (notification) => notification.action?.resourceId === connectionId,
+    );
+    expect(requestNotification).toBeDefined();
 
     const response = await server.inject({
       method: 'POST',
@@ -91,6 +97,39 @@ describe('answering', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ status: 'active' });
+    if (!requestNotification) throw new Error('connection request notification was not created');
+    await expect(notifications.getById(requestNotification.id)).resolves.toMatchObject({
+      read: true,
+      action: null,
+    });
+    await server.close();
+  });
+
+  it('resolves the recipient notification when it rejects a connection', async () => {
+    const server = await buildServer();
+    const { target, connectionId } = await pending(server);
+    const notifications = createV2Services().repos().notifications;
+    const before = await notifications.listUnreadByRecipient(target, {
+      limit: 100,
+      cursor: null,
+    });
+    const requestNotification = before.items.find(
+      (notification) => notification.action?.resourceId === connectionId,
+    );
+
+    const response = await server.inject({
+      method: 'POST',
+      url: `/promoter-connections/${connectionId}/reject`,
+      headers: write(target),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ status: 'rejected' });
+    if (!requestNotification) throw new Error('connection request notification was not created');
+    await expect(notifications.getById(requestNotification.id)).resolves.toMatchObject({
+      read: true,
+      action: null,
+    });
     await server.close();
   });
 

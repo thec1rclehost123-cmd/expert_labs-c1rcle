@@ -9,9 +9,13 @@ import { PricingService } from '../../application/pricing/pricing-service.js';
 import { createCoreConfig } from '../../config/index.js';
 import { createTicketTier } from '../../domain/models/event-catalog.js';
 import { createEvent, transitionEvent } from '../../domain/models/event.js';
+import { MemoryOnboardingRepository } from '../memory/memory-onboarding-repository.js';
+import { MemoryOutboxStore } from '../memory/memory-outbox-store.js';
+import { MemoryPartnershipRepository } from '../memory/memory-partnership-repository.js';
 import { MemoryEventRepository } from '../memory/memory-repositories.js';
 
 import { FirestoreCartReservationRepository } from './firestore-cart-reservation-repository.js';
+import { FirestoreEntitlementRepository } from './firestore-entitlement-repository.js';
 import { FirestoreEventCatalogRepository } from './firestore-event-catalog-repository.js';
 import { FirestoreOrderRepository } from './firestore-order-repository.js';
 
@@ -59,6 +63,7 @@ describe.runIf(EMULATOR)('seat reservation (Firestore emulator)', () => {
     const events = new MemoryEventRepository();
     const catalog = new FirestoreEventCatalogRepository(db);
     const carts = new FirestoreCartReservationRepository(db);
+    const entitlements = new FirestoreEntitlementRepository(db);
     const orders = new FirestoreOrderRepository(db);
 
     let event = createEvent({
@@ -87,13 +92,23 @@ describe.runIf(EMULATOR)('seat reservation (Firestore emulator)', () => {
 
     const deps = {
       config,
+      outbox: new MemoryOutboxStore(),
       pricing: new PricingService({ eventCatalog: catalog }),
       inventory: new InventoryService({
         eventCatalog: catalog,
         cartReservation: carts,
         order: orders,
       }),
-      repositories: { events, catalog, cartReservations: carts, orders },
+      repositories: {
+        users: { getById: async (id: string) => ({ id, emailVerified: true }) },
+        events,
+        partnerships: new MemoryPartnershipRepository(),
+        onboarding: new MemoryOnboardingRepository(),
+        catalog,
+        cartReservations: carts,
+        orders,
+        entitlements,
+      },
     } as unknown as ServiceDeps;
     const service = new CheckoutService(deps);
 
@@ -259,7 +274,11 @@ describe.runIf(EMULATOR)('seat reservation (Firestore emulator)', () => {
         { tierId: 'tier_x', quantity: 3 },
       ]);
       // A projection: nothing else about the order comes back.
-      expect(Object.keys(claims[0] ?? {}).sort()).toEqual(['lines', 'status']);
+      expect(Object.keys(claims[0] ?? {}).sort()).toEqual([
+        'lines',
+        'refundedTicketClaims',
+        'status',
+      ]);
     }, 60_000);
 
     it('lets inventory count paid and refund-held seats, but not refunded ones', async () => {

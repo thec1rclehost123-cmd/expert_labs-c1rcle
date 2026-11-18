@@ -28,6 +28,7 @@ import {
 
 import type {
   CheckInResult,
+  LoginResponse,
   DoorEvent,
   DoorSale,
   DoorSessionResponse,
@@ -82,17 +83,32 @@ async function withSessionHeader(): Promise<Record<string, string>> {
   };
 }
 
-export async function login(
-  email: string,
-  password: string,
-): Promise<{
-  accessToken: string;
-  expiresAt: number;
-  user: { id: string; email: string; displayName: string | null; role: string };
-}> {
+export async function login(email: string, password: string): Promise<LoginResponse> {
   return getClient().post({
     path: '/api/v2/auth/login',
     body: { email, password },
+    schema: loginResponseSchema,
+  });
+}
+
+/**
+ * Replaces the emailed temporary password with one the staff member chose.
+ *
+ * `accessToken` is passed explicitly, like `fetchMyOrganizations`, because no
+ * staff session is stored yet: the account is deliberately held at the
+ * password step until this succeeds. The gateway ends every other session for
+ * the account and answers with a fresh one, which is what the caller continues
+ * the sign-in with.
+ */
+export async function changePassword(
+  accessToken: string,
+  currentPassword: string,
+  newPassword: string,
+): Promise<LoginResponse> {
+  return getClient().post({
+    path: '/api/v2/auth/change-password',
+    headers: { authorization: `Bearer ${accessToken}` },
+    body: { currentPassword, newPassword },
     schema: loginResponseSchema,
   });
 }
@@ -160,6 +176,7 @@ export async function checkIn(input: {
   qrPayload: string;
   operatorName?: string;
   gate?: string | null;
+  eligibilityVerified?: boolean;
 }): Promise<CheckInResult> {
   return getClient().post({
     path: '/api/v2/door/check-ins',
@@ -300,10 +317,11 @@ export async function fetchGuests(input: {
 export async function manualCheckIn(
   entitlementId: string,
   eventId: string,
+  options: { eligibilityVerified?: boolean; coupleConfirmed?: boolean; reason?: string } = {},
 ): Promise<ManualCheckInResponse> {
   return getClient().post({
     path: '/api/v2/door/guests/check-in',
-    body: { entitlementId, eventId },
+    body: { entitlementId, eventId, ...options },
     headers: await withSessionHeader(),
     schema: manualCheckInResponseSchema,
   });

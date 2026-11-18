@@ -1,9 +1,13 @@
 import Link from 'next/link';
 
+import { SocialPrivacyPanel } from '@/features/social/SocialPrivacyPanel';
+
+import { ChangePasswordFormClient } from './ChangePasswordFormClient';
 import { PersonalProfileFormClient } from './PersonalProfileFormClient';
 import { SignOutControl } from './SignOutControl';
 
 import type { ProfileIdentity, ProfileSettingsSection } from '../types/profile.types';
+import type { UpsertGuestProfileRequest } from '@c1rcle/contracts';
 
 const settingsSections: readonly {
   href: string;
@@ -11,30 +15,46 @@ const settingsSections: readonly {
   value: ProfileSettingsSection;
 }[] = [
   { href: '/profile?view=settings&section=personal', label: 'Personal profile', value: 'personal' },
+  {
+    href: '/profile?view=settings&section=social',
+    label: 'Privacy',
+    value: 'social',
+  },
   { href: '/profile?view=settings&section=account', label: 'Account & security', value: 'account' },
 ];
 
 export function ProfileSettings({
   activeSection,
   identity,
+  profileFields,
 }: {
   activeSection: ProfileSettingsSection;
   identity: ProfileIdentity;
+  profileFields: Pick<UpsertGuestProfileRequest, 'dateOfBirth' | 'tastes' | 'intents'> | null;
 }) {
   return (
-    <section id="profile-settings" aria-labelledby="profile-settings-heading">
-      <p className="text-[9px] font-black uppercase tracking-[0.3em] text-[#FF6B4A]">Account</p>
-      <h2
+    <section
+      id="profile-settings"
+      aria-labelledby="profile-settings-heading"
+      className="mx-auto max-w-4xl"
+    >
+      <Link
+        href="/profile"
+        className="mb-5 inline-flex min-h-11 items-center text-sm text-white/60 hover:text-white"
+      >
+        ← Profile
+      </Link>
+      <h1
         id="profile-settings-heading"
-        className="mt-3 text-4xl font-black uppercase tracking-[-0.055em] text-white sm:text-6xl"
+        className="text-3xl font-bold uppercase tracking-[-0.04em] text-white sm:text-4xl"
       >
         Settings
-      </h2>
+      </h1>
 
-      <div className="mt-8 grid gap-5 lg:grid-cols-[280px_minmax(0,1fr)]">
+      <div className="mt-6 grid gap-8 lg:mt-9 lg:grid-cols-[176px_minmax(0,1fr)] lg:gap-12">
         <nav
           aria-label="Settings categories"
-          className="flex gap-2 overflow-x-auto rounded-[1.5rem] border border-white/10 bg-black/45 p-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:flex-col lg:self-start"
+          className="flex flex-wrap gap-x-5 gap-y-1 border-b border-white/10 lg:flex-col lg:gap-x-0 lg:gap-y-1 lg:self-start lg:border-b-0"
         >
           {settingsSections.map((section) => {
             const active = section.value === activeSection;
@@ -43,10 +63,10 @@ export function ProfileSettings({
                 key={section.value}
                 href={section.href}
                 aria-current={active ? 'page' : undefined}
-                className={`inline-flex min-h-12 shrink-0 items-center rounded-2xl px-5 text-[9px] font-black uppercase tracking-[0.18em] transition-colors ${
+                className={`inline-flex min-h-11 items-center border-b-2 text-sm transition-colors lg:border-b-0 lg:border-l-2 lg:pl-4 ${
                   active
-                    ? 'bg-[#FF4400] text-white'
-                    : 'text-white/40 hover:bg-white/10 hover:text-white'
+                    ? 'border-[#FF4400] font-semibold text-white'
+                    : 'border-transparent text-white/60 hover:text-white'
                 }`}
               >
                 {section.label}
@@ -56,7 +76,19 @@ export function ProfileSettings({
         </nav>
 
         {activeSection === 'personal' ? (
-          <PersonalProfileFormClient identity={identity} />
+          profileFields ? (
+            <PersonalProfileFormClient identity={identity} profileFields={profileFields} />
+          ) : (
+            <div
+              role="status"
+              className="rounded-[1.75rem] border border-white/10 p-6 text-sm text-white/60"
+            >
+              Complete profile onboarding before editing these details. Profile setup is not
+              available for this account yet.
+            </div>
+          )
+        ) : activeSection === 'social' ? (
+          <SocialPrivacyPanel />
         ) : (
           <AccountSecurityPanel identity={identity} />
         )}
@@ -73,32 +105,74 @@ function AccountSecurityPanel({ identity }: { identity: ProfileIdentity }) {
           Sign-in identity
         </p>
         <dl className="mt-6 grid gap-6 sm:grid-cols-2">
-          {identity.signInMethod ? (
-            <div>
-              <dt className="text-[8px] font-black uppercase tracking-[0.2em] text-white/30">
-                Method
-              </dt>
-              <dd className="mt-2 text-sm font-bold text-white">{identity.signInMethod}</dd>
-            </div>
-          ) : null}
+          <div>
+            <dt className="text-[8px] font-black uppercase tracking-[0.2em] text-white/30">
+              Method
+            </dt>
+            <dd className="mt-2 text-sm font-bold text-white">{identity.signInMethod}</dd>
+          </div>
           <div>
             <dt className="text-[8px] font-black uppercase tracking-[0.2em] text-white/30">
               Email
             </dt>
-            <dd className="mt-2 break-all text-sm font-bold text-white">{identity.email || '—'}</dd>
+            <dd className="mt-2 break-all text-sm font-bold text-white">{identity.email}</dd>
           </div>
-          {identity.phoneNumber ? (
-            <div>
-              <dt className="text-[8px] font-black uppercase tracking-[0.2em] text-white/30">
-                Phone
-              </dt>
-              <dd className="mt-2 text-sm font-bold text-white">{identity.phoneNumber}</dd>
-            </div>
-          ) : null}
+          <div>
+            <dt className="text-[8px] font-black uppercase tracking-[0.2em] text-white/30">
+              Phone
+            </dt>
+            <dd className="mt-2 text-sm font-bold text-white">
+              {identity.phoneNumber ?? 'Not provided'}
+            </dd>
+          </div>
         </dl>
-        <p className="mt-7 border-t border-white/10 pt-5 text-xs leading-6 text-white/35">
-          Security and recovery follow the sign-in method connected to this account.
+        <p className="mt-7 border-t border-white/10 pt-5 text-xs leading-6 text-white/50">
+          Email and phone changes are not available for this account yet.
         </p>
+      </div>
+
+      <ChangePasswordFormClient />
+
+      <div className="rounded-[1.75rem] border border-white/10 bg-white/[0.035] p-6 sm:p-8">
+        <h3 className="text-xl font-black uppercase tracking-[-0.03em] text-white">
+          Checkout payments
+        </h3>
+        <p className="mt-2 text-sm leading-6 text-white/50">
+          Card, UPI, and bank payment details are entered in Razorpay during checkout. They are not
+          stored as profile settings. Guest accounts do not receive payouts, so bank payout details
+          do not belong here.
+        </p>
+      </div>
+
+      <div className="rounded-[1.75rem] border border-white/10 bg-white/[0.035] p-6 sm:p-8">
+        <h3 className="text-xl font-black uppercase tracking-[-0.03em] text-white">
+          Account recovery
+        </h3>
+        <p className="mt-2 text-sm leading-6 text-white/50">
+          Forgot your current password? Request a secure reset link for your account email.
+        </p>
+        <Link
+          href="/forgot-password"
+          className="mt-5 inline-flex min-h-11 items-center rounded-full border border-white/20 px-5 text-xs font-bold text-white hover:bg-white/10"
+        >
+          Reset with email
+        </Link>
+      </div>
+
+      <div className="rounded-[1.75rem] border border-white/10 bg-white/[0.035] p-6 sm:p-8">
+        <h3 className="text-xl font-black uppercase tracking-[-0.03em] text-white">
+          Account deletion
+        </h3>
+        <p className="mt-2 text-sm leading-6 text-white/50">
+          Account deletion is handled by C1RCLE support. Send a request and support will verify your
+          identity and explain the next steps. This does not delete your account immediately.
+        </p>
+        <Link
+          href="/help?request=account-deletion"
+          className="mt-5 inline-flex min-h-11 items-center rounded-full border border-white/20 px-5 text-xs font-bold text-white hover:bg-white/10"
+        >
+          Request account deletion
+        </Link>
       </div>
 
       <div className="rounded-[1.75rem] border border-white/10 bg-black/55 p-6 sm:p-8">

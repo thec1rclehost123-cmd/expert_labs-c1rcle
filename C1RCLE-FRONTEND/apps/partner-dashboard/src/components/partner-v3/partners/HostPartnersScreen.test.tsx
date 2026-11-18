@@ -23,7 +23,7 @@ describe('HostPartnersScreen', () => {
       '/partner/host/partners',
     );
     expect(screen.getByText('Skyline Rooftop')).toBeInTheDocument();
-    expect(screen.getByText('Capacity 400 · 6 events booked')).toBeInTheDocument();
+    expect(screen.getAllByRole('link', { name: /View profile/ }).length).toBeGreaterThan(0);
     expect(screen.queryByPlaceholderText('Search partners')).not.toBeInTheDocument();
   });
 
@@ -38,8 +38,15 @@ describe('HostPartnersScreen', () => {
       'href',
       '/partner/host/partners',
     );
+    expect(screen.getByRole('link', { name: 'My Promoters' })).toHaveAttribute(
+      'href',
+      '/partner/host/partners?tab=promoters',
+    );
+    expect(screen.queryByRole('link', { name: 'My Venues' })).not.toBeInTheDocument();
 
-    rerender(<HostPartnersScreen data={data} segment="staff" />);
+    rerender(
+      <HostPartnersScreen data={data} segment="staff" organizationId="org-test" staffCanManage />,
+    );
     expect(screen.getByRole('button', { name: 'Add staff' })).toBeInTheDocument();
     expect(screen.getByText('Maya S.')).toBeInTheDocument();
   });

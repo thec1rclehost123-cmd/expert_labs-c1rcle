@@ -1,34 +1,82 @@
 import { createHash } from 'node:crypto';
 
 import {
-  ConflictError,
   EventNotFoundError,
+  EventNotOnSaleError,
+  ForbiddenError,
   InvalidOperationError,
   NotFoundError,
-  PaymentRefundedError,
   TicketTierNotFoundError,
   UnauthorizedError,
   VersionConflictError,
 } from '../../domain/errors.js';
-import { issueEntitlements } from '../../domain/models/entitlement.js';
-import { effectiveTierPricePaise } from '../../domain/models/event-catalog.js';
+import { deterministicDomainEventId, domainEvent } from '../../domain/events.js';
+import { newVersionedEntity } from '../../domain/identity.js';
+import { snapshotBookingFeePolicy } from '../../domain/models/booking-fee-policy.js';
+import {
+  currentEntitlementHolderId,
+  issueEntitlements,
+  requiresEligibilityVerification,
+} from '../../domain/models/entitlement.js';
+import {
+  effectiveTierPricePaise,
+  COMMERCIAL_ALLOCATION_POLICY_VERSION,
+  PROMOTER_COMMISSION_POLICY_VERSION,
+} from '../../domain/models/event-catalog.js';
+import {
+  createEventCoverAccount,
+  isEventCoverPolicyAccepted,
+} from '../../domain/models/event-cover.js';
+import {
+  eventEffectiveEndAt,
+  eventSalesUnavailableReason,
+} from '../../domain/models/event-policy.js';
+import { M4_ACCOUNTING_POLICY } from '../../domain/models/financial-journal.js';
+import {
+  orderReceiptFacts,
+  saleAccountingComplete,
+  originalSaleJournalsComplete,
+} from '../../domain/models/fulfilment.js';
+import {
+  computeSettlementSplit,
+  promoterCommissionFitsDistributableValue,
+} from '../../domain/models/ledger.js';
 import { platformFeePercentFor } from '../../domain/models/onboarding.js';
 import { commissionTierFor } from '../../domain/models/partnership.js';
+import { calculatePricing } from '../../domain/models/pricing.js';
+import { snapshotOriginalPurchase } from '../../domain/models/purchase-refund-snapshot.js';
+import {
+  createReconciliationRun,
+  completeReconciliationRun,
+} from '../../domain/models/reconciliation.js';
+import {
+  allocationFromLedger,
+  validateSaleAllocation,
+} from '../../domain/models/sale-allocation.js';
 import { isSystemActor, SYSTEM_ACTOR } from '../context.js';
+import { requestCaptureCompensation } from '../finance/capture-compensation.js';
 import { createFinanceService } from '../finance/finance-service.js';
 import { FinancialPostingService } from '../finance/financial-posting-service.js';
 import { createLeaderboardService } from '../finance/leaderboard-service.js';
+import { ProviderPaymentService } from '../finance/provider-payment-service.js';
 import {
   ReferralLinkService,
   signPromoterAttribution,
 } from '../promoters/referral-link-service.js';
+import { TicketAccessService } from '../tickets/ticket-access-service.js';
 
 import type { EntityId } from '../../domain/identity.js';
-import type { CartReservation } from '../../domain/models/cart-reservation.js';
+import type {
+  CartReservation,
+  TicketUpgradeSnapshot,
+} from '../../domain/models/cart-reservation.js';
 import type { Entitlement } from '../../domain/models/entitlement.js';
 import type { CommissionTerms } from '../../domain/models/event-catalog.js';
+import type { EventCoverPolicyProposal } from '../../domain/models/event-cover.js';
 import type { Order, OrderContact } from '../../domain/models/order.js';
 import type { PricingBreakdown } from '../../domain/models/pricing.js';
+import type { SaleAllocationSnapshot } from '../../domain/models/sale-allocation.js';
+import type { PaymentVerificationResponse } from '../../domain/ports/payment-provider.js';
 import type { ActorContext, ServiceDeps } from '../context.js';
 import type { FinanceService } from '../finance/finance-service.js';
 import type { LeaderboardService } from '../finance/leaderboard-service.js';
@@ -41,6 +89,10 @@ export interface CheckoutAttribution {
   assignmentId: EntityId;
   assignmentVersion: number;
   termsSnapshot: CommissionTerms;
+  eligibleTierIds: EntityId[] | null;
+  commissionPolicyVersion: string;
+  commercialPolicyVersion: string;
+  attributedAt: string;
   attributionSignature: string;
   promoterCommissionPaise: number;
 }
@@ -62,7 +114,16 @@ export function rsvpOrderId(eventId: EntityId, userId: EntityId): EntityId {
  * All mutations are idempotent and use the transactional outbox for fulfillment events.
  */
 /** A fulfilment step a paid order may be missing. */
-export type FulfilmentGap = 'hold' | 'hold_conversion' | 'tickets' | 'ledger';
+export type FulfilmentGap =
+  | 'hold'
+  | 'hold_conversion'
+  | 'tickets'
+  | 'cover_accounts'
+  | 'ledger'
+  | 'issuance_intents'
+  | 'order_outbox'
+  | 'completion'
+  | 'order';
 
 export interface FulfilmentGaps {
   /** False when no hold is bound to the order's provider order (nothing can be repaired). */
@@ -89,16 +150,66 @@ export interface PaymentRecoveryStatus {
 
 /** How long a hold keeps its seats (10 minutes). */
 export const DEFAULT_HOLD_TTL_MS = 10 * 60 * 1000;
+export const MAX_ACTIVE_PAID_UNITS_PER_EVENT_PER_PURCHASER = 10;
 
 /** The smallest amount the payment provider will take (₹1). */
 export const MIN_ONLINE_PAYMENT_PAISE = 100;
+
+const EVENT_COVER_SALES_FLAG = 'm5EventCoverSales';
+const EVENT_COVER_MERCHANT_APPROVAL_FLAG = 'm5CoverMerchantApproved';
+
+function requiresEligibilityAttestation(tier: {
+  audienceType?: string;
+  minAge?: number | null;
+  maxAge?: number | null;
+}): boolean {
+  return requiresEligibilityVerification(tier);
+}
+
+function assertEligibilityAttested(
+  tier: { audienceType?: string; minAge?: number | null; maxAge?: number | null },
+  attested?: boolean,
+  eligibilityRulesEnabled?: boolean,
+): void {
+  const v1DoorRequirement = ['MALE', 'FEMALE', 'COUPLE'].includes(tier.audienceType ?? '');
+  if (
+    requiresEligibilityAttestation(tier) &&
+    !v1DoorRequirement &&
+    eligibilityRulesEnabled !== true
+  ) {
+    throw new ForbiddenError(
+      'This eligibility-restricted ticket is unavailable until the required policy and entry controls are approved',
+    );
+  }
+  if (requiresEligibilityAttestation(tier) && attested !== true) {
+    throw new InvalidOperationError(
+      'Confirm that all attendees meet this ticket eligibility policy',
+    );
+  }
+}
 
 export class CheckoutService {
   private readonly financeService: FinanceService;
   private readonly financialPostingService: FinancialPostingService;
   private readonly leaderboardService: LeaderboardService;
+  private readonly providerPayments: ProviderPaymentService;
 
-  constructor(private readonly deps: ServiceDeps) {
+  private async requireVerifiedGuestPhone(actor: ActorContext): Promise<void> {
+    // Guest sessions are not acting for an organization. Organization-scoped
+    // service actors (for example staff-created orders) keep their existing
+    // authorization path; their callers are not Guest checkout sessions.
+    if (!actor.userId || isSystemActor(actor) || actor.organizationId) return;
+    const profile = await this.deps.repositories.guestProfiles.getByUserId(actor.userId);
+    if (!profile?.phoneNumber || !profile.phoneVerifiedAt) {
+      throw new ForbiddenError('Phone verification is required before booking tickets');
+    }
+  }
+
+  constructor(
+    private readonly deps: ServiceDeps,
+    providerPayments = new ProviderPaymentService(deps),
+  ) {
+    this.providerPayments = providerPayments;
     this.financeService = createFinanceService({
       ledger: deps.repositories.ledger,
       financialJournals: deps.repositories.financialJournals,
@@ -106,6 +217,7 @@ export class CheckoutService {
       payouts: deps.repositories.payouts,
       events: deps.repositories.events,
       reconciliations: deps.repositories.reconciliations,
+      financialExposure: deps.repositories,
       config: deps.config,
     });
     this.financialPostingService = new FinancialPostingService(deps.repositories.financialJournals);
@@ -115,6 +227,60 @@ export class CheckoutService {
     });
   }
 
+  private async requireAcceptedCoverPolicy(
+    event: NonNullable<Awaited<ReturnType<ServiceDeps['repositories']['events']['getById']>>>,
+    amountPaise: number,
+    expected?: { proposalId: EntityId; policyVersion: string; termsDigest: string },
+    requireSalesApproval = true,
+  ): Promise<EventCoverPolicyProposal> {
+    if (
+      requireSalesApproval &&
+      (this.deps.config.features[EVENT_COVER_SALES_FLAG] !== true ||
+        this.deps.config.features[EVENT_COVER_MERCHANT_APPROVAL_FLAG] !== true ||
+        this.deps.config.features.m5CoverAccountingApproved !== true)
+    ) {
+      throw new InvalidOperationError('Event cover sales are not approved or enabled');
+    }
+    const proposals = await this.deps.repositories.eventCoverPolicies.listProposalsByEvent(
+      event.id,
+    );
+    const candidates = expected
+      ? proposals.filter((proposal) => proposal.id === expected.proposalId)
+      : proposals.filter((proposal) => proposal.terms.coverAmountPaise === amountPaise);
+    for (const proposal of candidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt))) {
+      if (
+        proposal.hostOrganizationId !== event.organizationId ||
+        proposal.terms.eventId !== event.id ||
+        proposal.terms.coverAmountPaise !== amountPaise ||
+        (expected &&
+          (proposal.policyVersion !== expected.policyVersion ||
+            proposal.termsDigest !== expected.termsDigest))
+      ) {
+        continue;
+      }
+      const venue = event.venueId
+        ? await this.deps.repositories.venues.getById(event.venueId)
+        : null;
+      if (
+        !venue ||
+        venue.status !== 'active' ||
+        venue.organizationId !== proposal.venueOrganizationId
+      ) {
+        continue;
+      }
+      if (event.organizationId !== venue.organizationId) {
+        const partnership = await this.deps.repositories.partnerships.findByPair(
+          event.organizationId,
+          venue.id,
+        );
+        if (!partnership || partnership.status !== 'active') continue;
+      }
+      const acceptance = await this.deps.repositories.eventCoverPolicies.getAcceptance(proposal.id);
+      if (isEventCoverPolicyAccepted(proposal, acceptance)) return proposal;
+    }
+    throw new InvalidOperationError('This ticket requires an accepted current Venue cover policy');
+  }
+
   /**
    * Step 1: Quote — calculates pricing for a set of lines + promo.
    * Pure calculation, no side effects.
@@ -122,21 +288,229 @@ export class CheckoutService {
   async quote(input: {
     actor: ActorContext;
     eventId: EntityId;
-    lines: { tierId: EntityId; quantity: number }[];
+    lines: {
+      tierId: EntityId;
+      quantity: number;
+      ticketAddons?: { addonId: EntityId; quantityPerEntitlement: number }[];
+      accessGrantId?: EntityId;
+      eligibilityAttested?: boolean;
+    }[];
     promoCode?: string | null;
     referralCode?: string | null;
-  }): Promise<{ pricing: PricingBreakdown; attribution: CheckoutAttribution | null }> {
-    const { eventId, lines, promoCode, referralCode } = input;
+    referralContextTokens?: readonly string[];
+    upgradeFromEntitlementId?: EntityId;
+  }): Promise<{
+    pricing: PricingBreakdown;
+    attribution: CheckoutAttribution | null;
+    upgrade: TicketUpgradeSnapshot | null;
+  }> {
+    await this.requireVerifiedGuestPhone(input.actor);
+    const {
+      eventId,
+      lines,
+      promoCode,
+      referralCode,
+      referralContextTokens,
+      upgradeFromEntitlementId,
+    } = input;
+    if (
+      lines.some((line) => line.ticketAddons?.length) &&
+      this.deps.config.features.m5TicketAddonsEnabled !== true
+    ) {
+      throw new ForbiddenError('Ticket add-on sales are not enabled');
+    }
+
+    let sourceUpgrade: Omit<
+      TicketUpgradeSnapshot,
+      'targetTierId' | 'replacementAdmissionPaise' | 'incrementalAdmissionPaise'
+    > | null = null;
+    if (upgradeFromEntitlementId) {
+      if (
+        !input.actor.userId ||
+        lines.length !== 1 ||
+        lines[0]?.quantity !== 1 ||
+        Boolean(lines[0]?.ticketAddons?.length) ||
+        promoCode ||
+        referralCode
+      ) {
+        throw new InvalidOperationError(
+          'A ticket upgrade requires one authenticated, undiscounted ticket',
+        );
+      }
+      const source = await this.deps.repositories.entitlements.getById(upgradeFromEntitlementId);
+      if (
+        !source ||
+        source.eventId !== eventId ||
+        currentEntitlementHolderId(source) !== input.actor.userId ||
+        source.status !== 'valid' ||
+        source.scanCount !== 0 ||
+        source.refundLock ||
+        source.pendingTransferId ||
+        (source.unitKind ?? (source.orderId.startsWith('RSVP-') ? 'free_rsvp' : 'paid')) !== 'paid'
+      ) {
+        throw new InvalidOperationError('This ticket is not eligible for an upgrade');
+      }
+      const sourceOrder = await this.deps.repositories.orders.getById(source.orderId);
+      const sourceLine = sourceOrder?.lines.find((line) => line.tierId === source.tierId);
+      const sourceHold = sourceOrder?.paymentIntentId
+        ? await this.deps.repositories.cartReservations.getByProviderOrderId(
+            sourceOrder.paymentIntentId,
+          )
+        : null;
+      const sourcePrice = sourceHold?.pricing.lines.find((line) => line.tierId === source.tierId);
+      const sourceEntitlements = sourceOrder
+        ? await this.deps.repositories.entitlements.getByOrderId(sourceOrder.id)
+        : [];
+      const sourceLineEntitlements = sourceEntitlements.filter(
+        (item) => item.tierId === source.tierId,
+      );
+      if (
+        !sourceOrder ||
+        sourceOrder.status !== 'paid' ||
+        sourceOrder.eventId !== eventId ||
+        sourceHold?.convertedOrderId !== sourceOrder.id ||
+        !sourceLine ||
+        !sourcePrice ||
+        sourceLine.quantity !== 1 ||
+        sourceLineEntitlements.length !== 1 ||
+        source.scanCountAllowed !== 1 ||
+        (sourceLine.coverUnitPricePaise ?? 0) !== 0 ||
+        (sourcePrice.coverUnitPricePaise ?? 0) !== 0
+      ) {
+        throw new InvalidOperationError(
+          'Only a single-admission ticket without cover can be upgraded',
+        );
+      }
+      const priorAdmissionPaidPaise =
+        sourcePrice.discountedAdmissionSubtotalPaise ??
+        sourcePrice.admissionSubtotalPaise ??
+        sourcePrice.subtotalPaise;
+      sourceUpgrade = {
+        sourceEntitlementId: source.id,
+        sourceEntitlementVersion: source.version,
+        sourceOrderId: sourceOrder.id,
+        sourceTierId: source.tierId,
+        priorAdmissionPaidPaise,
+      };
+    }
 
     await this.assertOnSale(eventId);
+    const event = await this.deps.repositories.events.getById(eventId);
+    if (!event) throw new EventNotFoundError(eventId);
 
-    const pricingLines = lines.map((l) => ({ tierId: l.tierId, quantity: l.quantity }));
+    const coverPolicies = new Map<EntityId, EventCoverPolicyProposal>();
+    for (const line of lines) {
+      const tier = await this.deps.repositories.catalog.getTierById(line.tierId);
+      if (!tier || tier.eventId !== eventId) {
+        throw new TicketTierNotFoundError(line.tierId);
+      }
+      if (tier.accessType === 'RSVP' && line.ticketAddons?.length) {
+        throw new InvalidOperationError('Ticket add-ons cannot be purchased with a free RSVP');
+      }
+      assertEligibilityAttested(
+        tier,
+        line.eligibilityAttested,
+        this.deps.config.features.m5EligibilityRulesEnabled,
+      );
+      if ((tier.coverAmountPaise ?? 0) > 0) {
+        coverPolicies.set(
+          tier.id,
+          await this.requireAcceptedCoverPolicy(event, tier.coverAmountPaise ?? 0),
+        );
+      }
+      if (
+        (tier.accessMode ?? 'public') !== 'public' &&
+        (!line.accessGrantId ||
+          !input.actor.userId ||
+          !(await new TicketAccessService(this.deps).hasGrantForTier(
+            line.accessGrantId,
+            input.actor.userId,
+            eventId,
+            line.tierId,
+          )))
+      ) {
+        throw new TicketTierNotFoundError(line.tierId);
+      }
+      if (
+        (event.visibilityMode === 'code' || event.visibilityMode === 'invited') &&
+        (!line.accessGrantId ||
+          !input.actor.userId ||
+          !(await new TicketAccessService(this.deps).hasGrantForEvent(
+            line.accessGrantId,
+            input.actor.userId,
+            eventId,
+            event.visibilityMode === 'invited' ? 'invitation' : 'code',
+          )))
+      ) {
+        throw new TicketTierNotFoundError(line.tierId);
+      }
+    }
 
-    const pricing = await this.deps.pricing.calculate({
+    const pricingLines = lines.map((l) => ({
+      tierId: l.tierId,
+      quantity: l.quantity,
+      ...(l.ticketAddons === undefined ? {} : { ticketAddons: l.ticketAddons }),
+    }));
+
+    const targetPricing = await this.deps.pricing.calculate({
       eventId,
       lines: pricingLines,
       promoCode,
     });
+    let upgrade: TicketUpgradeSnapshot | null = null;
+    let basePricing = targetPricing;
+    if (sourceUpgrade) {
+      const requestedTarget = lines[0];
+      if (!requestedTarget) throw new InvalidOperationError('A ticket upgrade requires one target');
+      const targetLine = targetPricing.lines[0];
+      const targetTier = await this.deps.repositories.catalog.getTierById(requestedTarget.tierId);
+      const replacementAdmissionPaise = targetLine?.admissionUnitPricePaise ?? 0;
+      const incrementalAdmissionPaise =
+        replacementAdmissionPaise - sourceUpgrade.priorAdmissionPaidPaise;
+      if (
+        !targetLine ||
+        !targetTier ||
+        targetTier.id === sourceUpgrade.sourceTierId ||
+        targetTier.coverAmountPaise ||
+        (targetTier.admissionMode === 'per_person' && (targetTier.guestCount ?? 1) !== 1) ||
+        incrementalAdmissionPaise <= 0
+      ) {
+        throw new InvalidOperationError(
+          'The selected ticket does not have a positive upgrade price',
+        );
+      }
+      basePricing = calculatePricing({
+        lines: [
+          {
+            tier: { ...targetTier, priceInPaise: incrementalAdmissionPaise, coverAmountPaise: 0 },
+            quantity: 1,
+          },
+        ],
+        currency: 'INR',
+      });
+      upgrade = {
+        ...sourceUpgrade,
+        targetTierId: targetTier.id,
+        replacementAdmissionPaise,
+        incrementalAdmissionPaise,
+      };
+    }
+    const pricing: PricingBreakdown = {
+      ...basePricing,
+      lines: basePricing.lines.map((line) => {
+        const policy = coverPolicies.get(line.tierId);
+        return policy
+          ? {
+              ...line,
+              coverPolicy: {
+                proposalId: policy.id,
+                policyVersion: policy.policyVersion,
+                termsDigest: policy.termsDigest,
+              },
+            }
+          : line;
+      }),
+    };
 
     if (pricing.discountPaise > 0 && pricing.discountFundingOwner == null) {
       throw new InvalidOperationError(
@@ -154,16 +528,56 @@ export class CheckoutService {
     }
 
     let attribution: CheckoutAttribution | null = null;
-    if (referralCode) {
-      const signed = await new ReferralLinkService(this.deps).resolveAttribution(
-        eventId,
-        referralCode,
-      );
-      if (signed) {
-        const promoterCommissionPaise = commissionForLines(pricing.lines, signed.terms);
-        if (promoterCommissionPaise > pricing.grandTotalPaise - pricing.platformFeePaise) {
+    if (referralCode || referralContextTokens?.length) {
+      const referralLinks = new ReferralLinkService(this.deps);
+      const signed = referralContextTokens?.length
+        ? await referralLinks.resolveClickContexts(
+            eventId,
+            referralContextTokens,
+            input.actor.userId,
+          )
+        : referralCode
+          ? await referralLinks.resolveAttribution(
+              eventId,
+              referralCode,
+              input.actor.userId,
+              this.deps.config.clock.now(),
+            )
+          : null;
+      if (
+        signed &&
+        (!signed.eligibleTierIds?.length ||
+          lines.every((line) => signed.eligibleTierIds?.includes(line.tierId) === true))
+      ) {
+        const promoterCommissionPaise = commissionForLines(
+          pricing.lines,
+          signed.terms,
+          signed.eligibleTierIds ?? null,
+        );
+        const event = await this.deps.repositories.events.getById(eventId);
+        if (!event) throw new EventNotFoundError(eventId);
+        const onboarding = await this.deps.repositories.onboarding.findByProvisionedOrganizationId(
+          event.organizationId,
+        );
+        const platformFeeRate = platformFeePercentFor(onboarding?.plan ?? 'basic') / 100;
+        let venueShareRate = 0;
+        if (event.venueId) {
+          const partnership = await this.deps.repositories.partnerships.findByPair(
+            event.organizationId,
+            event.venueId,
+          );
+          venueShareRate = (partnership?.venueShareRate ?? 0) / 100;
+        }
+        if (
+          !promoterCommissionFitsDistributableValue(
+            pricing.discountedAdmissionSubtotalPaise ?? pricing.discountedSubtotalPaise,
+            promoterCommissionPaise,
+            platformFeeRate,
+            venueShareRate,
+          )
+        ) {
           throw new InvalidOperationError(
-            'The assigned promoter commission exceeds this order’s distributable total',
+            'The assigned promoter commission exceeds this order’s distributable ticket revenue',
           );
         }
         attribution = {
@@ -173,25 +587,32 @@ export class CheckoutService {
           assignmentId: signed.assignmentId,
           assignmentVersion: signed.assignmentVersion,
           termsSnapshot: signed.terms,
+          eligibleTierIds: signed.eligibleTierIds ?? null,
+          commissionPolicyVersion:
+            signed.commissionPolicyVersion ?? PROMOTER_COMMISSION_POLICY_VERSION,
+          commercialPolicyVersion:
+            signed.commercialPolicyVersion ?? COMMERCIAL_ALLOCATION_POLICY_VERSION,
+          attributedAt: this.deps.config.clock.now().toISOString(),
           attributionSignature: signPromoterAttribution(signed, this.deps.config.magicTicketSecret),
           promoterCommissionPaise,
         };
       }
     }
 
-    return { pricing, attribution };
+    return { pricing, attribution, upgrade };
   }
 
-  /**
-   * Online sales take money only for a published event. A draft, paused,
-   * cancelled or finished event is not on sale, whatever its tiers say.
-   */
-  private async assertOnSale(eventId: EntityId): Promise<void> {
+  /** One authoritative lifecycle and cutoff check for every new sale. */
+  private async assertOnSale(
+    eventId: EntityId,
+    preexistingAttemptAt?: string | null,
+  ): Promise<void> {
     const event = await this.deps.repositories.events.getById(eventId);
     if (!event) throw new EventNotFoundError(eventId);
-    if (event.status !== 'published') {
-      throw new InvalidOperationError('This event is not on sale');
-    }
+    const attemptAt = Date.parse(preexistingAttemptAt ?? '');
+    if (Number.isFinite(attemptAt) && attemptAt < eventEffectiveEndAt(event)) return;
+    const unavailable = eventSalesUnavailableReason(event, this.deps.config.clock.now());
+    if (unavailable) throw new EventNotOnSaleError(unavailable);
   }
 
   /**
@@ -205,7 +626,8 @@ export class CheckoutService {
     promoCode: string,
     userId: EntityId | null,
   ): Promise<void> {
-    const promo = await this.deps.repositories.catalog.getPromoByCode(promoCode, eventId);
+    const normalizedPromoCode = promoCode.trim().toUpperCase();
+    const promo = await this.deps.repositories.catalog.getPromoByCode(normalizedPromoCode, eventId);
     if (!promo) return;
     const redemptions = this.deps.repositories.promoRedemptions;
     if (promo.maxRedemptions !== null) {
@@ -235,16 +657,30 @@ export class CheckoutService {
     actor: ActorContext;
     eventId: EntityId;
     organizationId: EntityId;
-    lines: { tierId: EntityId; tierName: string; quantity: number; unitPricePaise: number }[];
+    lines: {
+      tierId: EntityId;
+      pricingPhaseId?: string | null;
+      tierName: string;
+      quantity: number;
+      unitPricePaise: number;
+      admissionUnitPricePaise?: number;
+      coverUnitPricePaise?: number;
+      coverPolicy?: { proposalId: EntityId; policyVersion: string; termsDigest: string };
+      ticketAddons?: PricingBreakdown['lines'][number]['ticketAddons'];
+      accessGrantId?: EntityId;
+      eligibilityAttested?: boolean;
+    }[];
     pricing: PricingBreakdown;
     appliedPromoCode: string | null;
     attribution: CheckoutAttribution | null;
     userId?: EntityId | null;
     /** Who the tickets are for; becomes the order contact. */
     attendee?: OrderContact | null;
+    upgrade?: TicketUpgradeSnapshot | null;
     idempotencyKey: string;
     reservationTtlMs?: number;
   }): Promise<CartReservation> {
+    await this.requireVerifiedGuestPhone(input.actor);
     const {
       eventId,
       organizationId,
@@ -254,12 +690,41 @@ export class CheckoutService {
       attribution,
       userId,
       attendee,
+      upgrade,
       idempotencyKey,
       reservationTtlMs,
     } = input;
 
-    const now = new Date();
+    const now = this.deps.config.clock.now();
     const buyerId = userId ?? input.actor.userId;
+    if (!buyerId || (!isSystemActor(input.actor) && buyerId !== input.actor.userId))
+      throw new UnauthorizedError('A verified account is required to book tickets');
+    const buyer = await this.deps.repositories.users?.getById(buyerId);
+    if (!buyer?.emailVerified)
+      throw new ForbiddenError('A verified account is required to book tickets');
+    const event = await this.deps.repositories.events.getById(eventId);
+    if (!event) throw new EventNotFoundError(eventId);
+
+    if (upgrade) {
+      const source = await this.deps.repositories.entitlements.getById(upgrade.sourceEntitlementId);
+      if (
+        !buyerId ||
+        lines.length !== 1 ||
+        lines[0]?.quantity !== 1 ||
+        lines[0]?.tierId !== upgrade.targetTierId ||
+        upgrade.sourceOrderId !== source?.orderId ||
+        upgrade.sourceTierId !== source?.tierId ||
+        upgrade.sourceEntitlementVersion !== source?.version ||
+        source?.eventId !== eventId ||
+        currentEntitlementHolderId(source) !== buyerId ||
+        source.status !== 'valid' ||
+        source.scanCount !== 0 ||
+        source.refundLock ||
+        source.pendingTransferId
+      ) {
+        throw new InvalidOperationError('The source ticket changed after the upgrade quote');
+      }
+    }
 
     // An idempotency key identifies a request by ONE buyer. Looking it up on its
     // own would hand a buyer someone else's hold (and its holdId and pricing)
@@ -270,11 +735,169 @@ export class CheckoutService {
     const existing = await this.deps.repositories.cartReservations.getByIdempotencyKey(scopedKey);
     if (existing) return existing;
 
+    const unavailable = eventSalesUnavailableReason(event, now);
+    if (unavailable) throw new EventNotOnSaleError(unavailable);
+
+    if (
+      lines.some((line) => line.ticketAddons?.length) &&
+      this.deps.config.features.m5TicketAddonsEnabled !== true
+    ) {
+      throw new ForbiddenError('Ticket add-on sales are not enabled');
+    }
+
+    // The server owns group semantics. Snapshot the tier's attendee count and
+    // issuance mode into the hold so edits after quote cannot change fulfillment.
+    const holdLines = await Promise.all(
+      lines.map(async (line) => {
+        const tier = await this.deps.repositories.catalog.getTierById(line.tierId);
+        if (!tier || tier.eventId !== eventId) {
+          throw new TicketTierNotFoundError(line.tierId);
+        }
+        if (tier.accessType === 'RSVP' && line.ticketAddons?.length) {
+          throw new InvalidOperationError('Ticket add-ons cannot be purchased with a free RSVP');
+        }
+        assertEligibilityAttested(
+          tier,
+          line.eligibilityAttested,
+          this.deps.config.features.m5EligibilityRulesEnabled,
+        );
+        const coverAmountPaise = tier.coverAmountPaise ?? 0;
+        const ticketAddons = await Promise.all(
+          (line.ticketAddons ?? []).map(async (selection) => {
+            const addon = await this.deps.repositories.catalog.getTicketAddonById(
+              selection.addonId,
+            );
+            const nowMs = now.getTime();
+            if (
+              !addon ||
+              addon.eventId !== eventId ||
+              addon.organizationId !== organizationId ||
+              addon.status !== 'active' ||
+              addon.name !== selection.name ||
+              addon.kind !== selection.kind ||
+              addon.priceInPaise !== selection.unitPricePaise ||
+              selection.quantityPerEntitlement < 1 ||
+              selection.quantityPerEntitlement > addon.maxPerEntitlement ||
+              (addon.salesStartAt !== null && Date.parse(addon.salesStartAt) > nowMs) ||
+              (addon.salesEndAt !== null && Date.parse(addon.salesEndAt) <= nowMs)
+            ) {
+              throw new InvalidOperationError('A selected ticket add-on changed after the quote');
+            }
+            return { ...selection };
+          }),
+        );
+        const entitlementCountPerPurchaseUnit =
+          (tier.admissionMode ?? 'bundle') === 'per_person' ? (tier.guestCount ?? 1) : 1;
+        const addOnUnitPricePaise = ticketAddons.reduce(
+          (sum, addon) => sum + addon.unitPricePaise * addon.quantityPerEntitlement,
+          0,
+        );
+        if (
+          (line.coverUnitPricePaise ?? 0) !== coverAmountPaise ||
+          line.unitPricePaise !==
+            (line.admissionUnitPricePaise ?? line.unitPricePaise) +
+              (line.coverUnitPricePaise ?? 0) *
+                ((tier.admissionMode ?? 'bundle') === 'per_person' ? (tier.guestCount ?? 1) : 1) +
+              addOnUnitPricePaise * entitlementCountPerPurchaseUnit
+        ) {
+          throw new InvalidOperationError('Ticket price components changed after the quote');
+        }
+        let coverPolicy: EventCoverPolicyProposal | null = null;
+        if (coverAmountPaise > 0 && line.coverPolicy) {
+          coverPolicy = await this.requireAcceptedCoverPolicy(
+            event,
+            coverAmountPaise,
+            line.coverPolicy,
+          );
+        } else if (coverAmountPaise > 0 || line.coverPolicy) {
+          throw new InvalidOperationError('This ticket no longer has its accepted cover policy');
+        }
+        if (
+          (tier.accessMode ?? 'public') !== 'public' &&
+          (!line.accessGrantId ||
+            !buyerId ||
+            !(await new TicketAccessService(this.deps).hasGrantForTier(
+              line.accessGrantId,
+              buyerId,
+              eventId,
+              line.tierId,
+            )))
+        ) {
+          throw new TicketTierNotFoundError(line.tierId);
+        }
+        if (
+          (event.visibilityMode === 'code' || event.visibilityMode === 'invited') &&
+          (!line.accessGrantId ||
+            !buyerId ||
+            !(await new TicketAccessService(this.deps).hasGrantForEvent(
+              line.accessGrantId,
+              buyerId,
+              eventId,
+              event.visibilityMode === 'invited' ? 'invitation' : 'code',
+            )))
+        ) {
+          throw new TicketTierNotFoundError(line.tierId);
+        }
+        return {
+          ...line,
+          ...(line.admissionUnitPricePaise === undefined
+            ? {}
+            : { admissionUnitPricePaise: line.admissionUnitPricePaise }),
+          ...(line.coverUnitPricePaise === undefined
+            ? {}
+            : { coverUnitPricePaise: line.coverUnitPricePaise }),
+          ...(coverPolicy
+            ? {
+                coverPolicy: {
+                  proposalId: coverPolicy.id,
+                  policyVersion: coverPolicy.policyVersion,
+                  termsDigest: coverPolicy.termsDigest,
+                },
+              }
+            : {}),
+          ...(ticketAddons.length > 0 ? { ticketAddons } : {}),
+          guestCount: tier.guestCount ?? 1,
+          admissionMode: tier.admissionMode ?? 'bundle',
+          ...(requiresEligibilityAttestation(tier)
+            ? {
+                eligibility: {
+                  audienceType: tier.audienceType ?? 'GENERAL',
+                  minAge: tier.minAge ?? null,
+                  maxAge: tier.maxAge ?? null,
+                  attested: true as const,
+                  attestedAt: now.toISOString(),
+                },
+              }
+            : {}),
+        };
+      }),
+    );
+
     // Check inventory availability
-    for (const line of lines) {
+    for (const line of holdLines) {
       const available = await this.deps.inventory.getAvailableQuantity(eventId, line.tierId);
-      if (available < line.quantity) {
+      const requestedUnits =
+        line.quantity * (line.admissionMode === 'per_person' ? line.guestCount : 1);
+      if (available < requestedUnits) {
         throw new InvalidOperationError(`Insufficient inventory for tier ${line.tierName}`);
+      }
+    }
+
+    const requestedAddons = new Map<EntityId, number>();
+    for (const line of holdLines) {
+      const entitlementCount =
+        line.quantity * (line.admissionMode === 'per_person' ? (line.guestCount ?? 1) : 1);
+      for (const addon of line.ticketAddons ?? []) {
+        requestedAddons.set(
+          addon.addonId,
+          (requestedAddons.get(addon.addonId) ?? 0) +
+            entitlementCount * addon.quantityPerEntitlement,
+        );
+      }
+    }
+    for (const [addonId, requested] of requestedAddons) {
+      if ((await this.deps.inventory.getAvailableTicketAddonQuantity(addonId)) < requested) {
+        throw new InvalidOperationError('Insufficient inventory for a selected ticket add-on');
       }
     }
 
@@ -284,7 +907,7 @@ export class CheckoutService {
     // any identity (`buyerId` null) fall through — there is no stable key to
     // count against, and v1 never enforced a per-user tier cap either.
     if (buyerId) {
-      for (const line of lines) {
+      for (const line of holdLines) {
         const tier = await this.deps.repositories.catalog.getTierById(line.tierId);
         if (!tier?.maxPerUser) continue;
         const alreadyHeld = await this.deps.repositories.cartReservations.countActiveQuantity(
@@ -298,7 +921,9 @@ export class CheckoutService {
           eventId,
           line.tierId,
         );
-        if (alreadyHeld + alreadyBought + line.quantity > tier.maxPerUser) {
+        const requestedUnits =
+          line.quantity * (line.admissionMode === 'per_person' ? line.guestCount : 1);
+        if (alreadyHeld + alreadyBought + requestedUnits > tier.maxPerUser) {
           throw new InvalidOperationError(
             `${tier.name} has a maximum of ${tier.maxPerUser} per user`,
           );
@@ -308,24 +933,34 @@ export class CheckoutService {
 
     const holdId = `HOLD-${scopedKey}`;
     const ttl = reservationTtlMs ?? DEFAULT_HOLD_TTL_MS;
+    // Inventory reads use wall-clock expiry today, so persist the hold against
+    // the same clock while keeping lifecycle/pricing decisions injectable.
+    const holdCreatedAt = new Date();
 
     const hold: CartReservation = {
       id: holdId,
       eventId,
       organizationId,
       userId: buyerId,
-      lines: lines.map((l) => ({ ...l })),
+      lines: holdLines.map((line) => ({ ...line })),
       pricing,
+      saleAllocation: await this.snapshotSaleAllocation(
+        eventId,
+        organizationId,
+        pricing.discountedAdmissionSubtotalPaise ?? pricing.discountedSubtotalPaise,
+        attribution,
+      ),
       appliedPromoCode,
       attribution: attribution ?? null,
       status: 'active',
-      expiresAt: new Date(now.getTime() + ttl).toISOString(),
+      expiresAt: new Date(holdCreatedAt.getTime() + ttl).toISOString(),
       convertedOrderId: null,
       attendee: attendee ?? null,
+      ...(upgrade ? { upgrade: { ...upgrade } } : {}),
       idempotencyKey: scopedKey,
       version: 1,
-      createdAt: now.toISOString(),
-      updatedAt: now.toISOString(),
+      createdAt: holdCreatedAt.toISOString(),
+      updatedAt: holdCreatedAt.toISOString(),
     };
 
     const stored = await this.deps.repositories.cartReservations.create(hold);
@@ -341,6 +976,14 @@ export class CheckoutService {
       const tierName = stored.lines.find((line) => line.tierId === overbooked)?.tierName ?? 'tier';
       throw new InvalidOperationError(`Insufficient inventory for tier ${tierName}`);
     }
+    const overbookedAddon = await this.deps.inventory.firstOverbookedTicketAddon(stored);
+    if (overbookedAddon !== null) {
+      await this.deps.repositories.cartReservations.release(stored.id);
+      const addon = await this.deps.repositories.catalog.getTicketAddonById(overbookedAddon);
+      throw new InvalidOperationError(
+        `Insufficient inventory for ${addon?.name ?? 'a selected ticket add-on'}`,
+      );
+    }
 
     // The per-user cap has the same check-then-write shape: one buyer firing
     // several requests at once passes the early check on every one of them. Judge
@@ -349,6 +992,12 @@ export class CheckoutService {
     if (overCap !== null) {
       await this.deps.repositories.cartReservations.release(stored.id);
       throw new InvalidOperationError(`${overCap.name} has a maximum of ${overCap.max} per user`);
+    }
+    if (await this.isOverActivePaidUnitCap(stored)) {
+      await this.deps.repositories.cartReservations.release(stored.id);
+      throw new InvalidOperationError(
+        `A maximum of ${MAX_ACTIVE_PAID_UNITS_PER_EVENT_PER_PURCHASER} paid admission units is allowed per event`,
+      );
     }
     return stored;
   }
@@ -371,28 +1020,67 @@ export class CheckoutService {
     actor: ActorContext;
     eventId: EntityId;
     tierId: EntityId;
+    accessGrantId?: EntityId;
+    eligibilityAttested?: boolean;
+    referralCode?: string | null;
+    referralContextTokens?: readonly string[];
   }): Promise<{ order: Order; entitlements: Entitlement[] }> {
-    const { actor, eventId, tierId } = input;
+    const {
+      actor,
+      eventId,
+      tierId,
+      referralCode,
+      referralContextTokens,
+      accessGrantId,
+      eligibilityAttested,
+    } = input;
 
     if (!actor.userId || isSystemActor(actor)) {
       throw new UnauthorizedError('Authentication is required to book tickets');
+    }
+
+    await this.requireVerifiedGuestPhone(actor);
+
+    // M5 RSVP uniqueness is enforced per account backed by the platform's
+    // existing verified identity signal. Missing directory records fail
+    // closed; account IDs do not prove one-human-per-account identity.
+    const account = await this.deps.repositories.users.getById(actor.userId);
+    if (!account?.emailVerified) {
+      throw new ForbiddenError('A verified account is required to RSVP');
     }
 
     const event =
       (await this.deps.repositories.events.getById(eventId)) ??
       (await this.deps.repositories.events.getBySlug(eventId));
     if (!event) throw new EventNotFoundError(eventId);
-    if (event.status !== 'published') {
-      throw new InvalidOperationError(`Event is ${event.status}, RSVP is unavailable`);
-    }
-    if (!event.isFree) {
-      throw new InvalidOperationError('RSVP is available only for free events');
-    }
-
-    const tier = await this.deps.repositories.catalog.getTierById(tierId);
-    if (!tier || tier.eventId !== event.id) {
+    const unavailable = eventSalesUnavailableReason(event, this.deps.config.clock.now());
+    if (unavailable) throw new EventNotOnSaleError(unavailable);
+    if (
+      (event.visibilityMode === 'code' || event.visibilityMode === 'invited') &&
+      !(await new TicketAccessService(this.deps).hasGrantForEvent(
+        accessGrantId ?? '',
+        actor.userId,
+        event.id,
+        event.visibilityMode === 'invited' ? 'invitation' : 'code',
+      ))
+    ) {
       throw new TicketTierNotFoundError(tierId);
     }
+    // A mixed catalog may offer free RSVP alongside paid entry. The selected
+    // tier's authoritative effective price below determines RSVP eligibility;
+    // the event-level discovery classification does not price this booking.
+
+    const tier = await this.deps.repositories.catalog.getTierById(tierId);
+    if (!tier || tier.eventId !== event.id || (tier.accessMode ?? 'public') !== 'public') {
+      throw new TicketTierNotFoundError(tierId);
+    }
+    assertEligibilityAttested(
+      tier,
+      eligibilityAttested,
+      this.deps.config.features.m5EligibilityRulesEnabled,
+    );
+    if (tier.audienceType === 'STUDENT' || tier.audienceType === 'MEMBER')
+      throw new InvalidOperationError('This ticket category is unavailable');
     if (tier.status !== 'active') {
       throw new InvalidOperationError(`Tier ${tier.name} is ${tier.status}`);
     }
@@ -402,26 +1090,69 @@ export class CheckoutService {
     if (unitPricePaise !== 0) {
       throw new InvalidOperationError('RSVP is available only for zero-price tiers');
     }
+    if ((tier.guestCount ?? 1) > 1 || tier.admissionMode === 'per_person') {
+      throw new InvalidOperationError(
+        'Group RSVPs require an individually verified attendee claim for every admission',
+      );
+    }
 
     // Deterministic id from the RESOLVED event id (callers may pass id or
     // slug — both must converge on one RSVP): one RSVP per user per event.
     // Same rationale as entitlement ids — a retried RSVP collides with itself
     // at the storage layer instead of minting a second ticket.
     const orderId = rsvpOrderId(event.id, actor.userId);
-    const existing = await this.deps.repositories.orders.getById(orderId);
-    if (existing && existing.status === 'paid') {
-      throw new ConflictError('An RSVP already exists for this event');
+
+    // The authenticated Guest profile is the authoritative attendee identity.
+    // Keep contact email/phone blank for RSVP; they are not needed to issue the
+    // pass, and the profile name is sufficient for the partner attendee roster.
+    const guestProfile = await this.deps.repositories.guestProfiles.getByUserId(actor.userId);
+
+    let attribution: CheckoutAttribution | null = null;
+    if (referralCode || referralContextTokens?.length) {
+      const referralLinks = new ReferralLinkService(this.deps);
+      const signed = referralContextTokens?.length
+        ? await referralLinks.resolveClickContexts(event.id, referralContextTokens, actor.userId)
+        : referralCode
+          ? await referralLinks.resolveAttribution(
+              event.id,
+              referralCode,
+              actor.userId,
+              this.deps.config.clock.now(),
+            )
+          : null;
+      if (
+        signed &&
+        (tier.accessType === 'RSVP' ||
+          !signed.eligibleTierIds?.length ||
+          signed.eligibleTierIds.includes(tier.id))
+      ) {
+        attribution = {
+          referralLinkId: signed.referralLinkId,
+          promoterId: signed.promoterId,
+          code: signed.code,
+          assignmentId: signed.assignmentId,
+          assignmentVersion: signed.assignmentVersion,
+          termsSnapshot: signed.terms,
+          eligibleTierIds: signed.eligibleTierIds ?? null,
+          commissionPolicyVersion:
+            signed.commissionPolicyVersion ?? PROMOTER_COMMISSION_POLICY_VERSION,
+          commercialPolicyVersion:
+            signed.commercialPolicyVersion ?? COMMERCIAL_ALLOCATION_POLICY_VERSION,
+          attributedAt: this.deps.config.clock.now().toISOString(),
+          attributionSignature: signPromoterAttribution(signed, this.deps.config.magicTicketSecret),
+          // Free RSVPs count as conversions, but have no monetary commission.
+          promoterCommissionPaise: 0,
+        };
+      }
     }
 
-    await this.deps.inventory.assertAvailable(event.id, tierId, 1);
-
-    const now = new Date();
-    const order: Order = {
+    const now = this.deps.config.clock.now();
+    let order: Order = {
       id: orderId,
       eventId: event.id,
       organizationId: event.organizationId,
       userId: actor.userId,
-      contact: { name: 'RSVP Guest', email: '', phone: '' },
+      contact: { name: guestProfile?.displayName ?? 'RSVP Guest', email: '', phone: '' },
       status: 'paid',
       lines: [
         {
@@ -430,10 +1161,24 @@ export class CheckoutService {
           quantity: 1,
           unitPricePaise: 0,
           subtotalPaise: 0,
+          ...(requiresEligibilityAttestation(tier)
+            ? {
+                eligibility: {
+                  audienceType: tier.audienceType ?? 'GENERAL',
+                  minAge: tier.minAge ?? null,
+                  maxAge: tier.maxAge ?? null,
+                  attested: true as const,
+                  attestedAt: now.toISOString(),
+                },
+              }
+            : {}),
         },
       ],
       currency: tier.currency,
       subtotalPaise: 0,
+      admissionSubtotalPaise: 0,
+      coverSubtotalPaise: 0,
+      discountedAdmissionSubtotalPaise: 0,
       discountPaise: 0,
       discountFundingOwner: null,
       discountedSubtotalPaise: 0,
@@ -442,7 +1187,7 @@ export class CheckoutService {
       gstPaise: 0,
       grandTotalPaise: 0,
       appliedPromoCode: null,
-      attribution: null,
+      attribution,
       paymentIntentId: null,
       paymentId: orderId,
       paidAt: now.toISOString(),
@@ -455,29 +1200,20 @@ export class CheckoutService {
       updatedAt: now.toISOString(),
     };
 
-    try {
-      await this.deps.repositories.orders.save(order);
-    } catch (error) {
-      // Lost a concurrent race with a double-tap on the same RSVP — converge
-      // on the winner rather than failing the guest.
-      if (error instanceof VersionConflictError) {
-        const winner = await this.deps.repositories.orders.getById(orderId);
-        if (winner) {
-          const winnerEntitlements = await this.deps.repositories.entitlements.getByOrderId(
-            winner.id,
-          );
-          return { order: winner, entitlements: winnerEntitlements };
-        }
-      }
-      throw error;
-    }
-
-    const issuedEntitlements = issueEntitlements({ order, now });
-    for (const e of issuedEntitlements) {
-      await this.deps.repositories.entitlements.save(e);
-    }
-
-    const entitlements = await this.deps.repositories.entitlements.getByOrderId(orderId);
+    const acquired = await this.deps.repositories.orders.acquireRsvp({
+      order,
+      entitlements: issueEntitlements({
+        order,
+        now,
+        admitsPerUnit: { [tier.id]: admitsForTier(tier) },
+      }),
+      expectedEventVersion: event.version,
+      expectedTierVersion: tier.version,
+      now,
+    });
+    order = acquired.order;
+    const entitlements = acquired.entitlements;
+    await this.recordAttributionSale(order);
     await this.financialPostingService.postZeroValueEvidence({
       organizationId: order.organizationId,
       orderId: order.id,
@@ -486,7 +1222,39 @@ export class CheckoutService {
       sourceType: 'free_ticket',
       postedAt: now,
     });
+    await this.ensureOrderFulfilledEvent(order);
     return { order, entitlements };
+  }
+
+  async cancelRsvp(orderId: EntityId, actor: ActorContext): Promise<Order> {
+    if (!actor.userId) throw new UnauthorizedError('Sign in to cancel your RSVP');
+    const order = await this.deps.repositories.orders.cancelRsvp(
+      orderId,
+      actor.userId,
+      this.deps.config.clock.now(),
+    );
+    await this.deps.outbox.append(
+      domainEvent({
+        id: deterministicDomainEventId('rsvp.cancelled', order.id),
+        type: 'rsvp.cancelled',
+        aggregateId: order.id,
+        organizationId: order.organizationId,
+        actorId: actor.userId,
+        payload: { orderId: order.id, eventId: order.eventId },
+        occurredAt: Date.parse(order.updatedAt),
+      }),
+    );
+    return order;
+  }
+
+  private async recordAttributionSale(order: Order): Promise<void> {
+    if (!order.attribution) return;
+    await this.deps.repositories.referralLinks.recordSale(
+      order.attribution.referralLinkId,
+      order.id,
+      order.discountedAdmissionSubtotalPaise ?? order.discountedSubtotalPaise,
+      order.attribution.promoterCommissionPaise,
+    );
   }
 
   /**
@@ -517,12 +1285,49 @@ export class CheckoutService {
       const held = mine.reduce(
         (sum, other) =>
           sum +
-          other.lines.filter((l) => l.tierId === line.tierId).reduce((n, l) => n + l.quantity, 0),
+          other.lines
+            .filter((l) => l.tierId === line.tierId)
+            .reduce(
+              (n, l) =>
+                n + l.quantity * (l.admissionMode === 'per_person' ? (l.guestCount ?? 1) : 1),
+              0,
+            ),
         0,
       );
       if (bought + held > tier.maxPerUser) return { name: tier.name, max: tier.maxPerUser };
     }
     return null;
+  }
+
+  /**
+   * Enforces the event-wide paid-unit cap after the hold receives its ordered
+   * repository position. Existing purchaser entitlements and active holds at
+   * or before this hold converge concurrent tabs on the first ten units.
+   */
+  private async isOverActivePaidUnitCap(hold: CartReservation): Promise<boolean> {
+    if (!hold.userId) return false;
+    const repos = this.deps.repositories;
+    const purchased = await repos.entitlements.countActivePaidUnitsByUserAndEvent(
+      hold.userId,
+      hold.eventId,
+    );
+    const myPosition = hold.sequence ?? Number.MAX_SAFE_INTEGER;
+    const mine = (await repos.cartReservations.listActiveByEvent(hold.eventId, new Date())).filter(
+      (other) =>
+        other.userId === hold.userId &&
+        (other.id === hold.id || (other.sequence ?? 0) <= myPosition),
+    );
+    let heldUnits = 0;
+    for (const other of mine) {
+      for (const line of other.lines) {
+        const tier = await repos.catalog.getTierById(line.tierId);
+        heldUnits += line.quantity * (line.guestCount ?? tier?.guestCount ?? 1);
+      }
+    }
+    // The source ticket remains valid while the replacement is being paid for,
+    // but the two admissions must not consume two purchaser-cap units.
+    const upgradeCredit = hold.upgrade ? 1 : 0;
+    return purchased - upgradeCredit + heldUnits > MAX_ACTIVE_PAID_UNITS_PER_EVENT_PER_PURCHASER;
   }
 
   /**
@@ -549,17 +1354,44 @@ export class CheckoutService {
     holdId: EntityId;
     idempotencyKey: string;
   }): Promise<{ paymentIntentId: string; amountPaise: number }> {
-    const { holdId, idempotencyKey } = input;
+    const { holdId } = input;
 
-    const hold = await this.deps.repositories.cartReservations.getById(holdId);
+    let hold = await this.deps.repositories.cartReservations.getById(holdId);
     // Same answer for "missing" and "not yours", so a caller cannot probe which
     // hold ids exist.
     if (!hold || !this.actsForHold(input.actor, hold)) {
       throw new InvalidOperationError('Hold not found');
     }
+    // Recover provider identity even after expiration or event closure. This
+    // never reopens payment: all current payability checks still run below.
+    if (hold.providerOrderCreation && !hold.providerOrderId) {
+      const snapshot = hold.providerOrderCreation;
+      try {
+        const candidate = await this.lookupClaimedProviderOrder(snapshot);
+        const bound = await this.deps.repositories.cartReservations.bindProviderOrder(
+          hold.id,
+          candidate.id,
+        );
+        if (bound !== candidate.id)
+          throw new InvalidOperationError('Provider order binding conflict');
+        hold = { ...hold, providerOrderId: bound };
+      } catch {
+        await this.deps.repositories.cartReservations.markProviderOrderRequiresSupport(
+          hold.id,
+          snapshot.receipt,
+        );
+        throw new InvalidOperationError(
+          'Payment creation requires_support; provider identity is unresolved',
+        );
+      }
+    }
     if (hold.status !== 'active')
       throw new InvalidOperationError(`Hold is ${hold.status}, cannot proceed to payment`);
-    if (new Date().getTime() > Date.parse(hold.expiresAt)) {
+    // Reservation TTLs are persisted using wall-clock timestamps, so validate
+    // and claim them against the same clock. Event lifecycle uses the injected
+    // clock independently in assertOnSale below.
+    const now = new Date();
+    if (now.getTime() >= Date.parse(hold.expiresAt)) {
       await this.deps.repositories.cartReservations.release(holdId);
       throw new InvalidOperationError('Hold has expired');
     }
@@ -567,38 +1399,159 @@ export class CheckoutService {
     // A hold made while the event was on sale does not oblige us to take money
     // after the host has cancelled or paused it. (A payment already in flight is
     // a different case: confirmPayment still honours or refunds it.)
-    await this.assertOnSale(hold.eventId);
+    await this.assertOnSale(hold.eventId, hold.providerOrderCreation?.claimedAt);
 
-    if (hold.providerOrderId) {
-      return {
-        paymentIntentId: hold.providerOrderId,
-        amountPaise: hold.pricing.grandTotalPaise,
-      };
+    const event = await this.deps.repositories.events.getById(hold.eventId);
+    if (!event) throw new EventNotFoundError(hold.eventId);
+    if (hold.upgrade) {
+      const source = await this.deps.repositories.entitlements.getById(
+        hold.upgrade.sourceEntitlementId,
+      );
+      if (
+        !source ||
+        source.version !== hold.upgrade.sourceEntitlementVersion ||
+        source.orderId !== hold.upgrade.sourceOrderId ||
+        source.tierId !== hold.upgrade.sourceTierId ||
+        source.eventId !== hold.eventId ||
+        currentEntitlementHolderId(source) !== hold.userId ||
+        source.status !== 'valid' ||
+        source.scanCount !== 0 ||
+        source.refundLock ||
+        source.pendingTransferId
+      ) {
+        throw new InvalidOperationError('The source ticket changed before upgrade payment began');
+      }
+    }
+    for (const line of hold.lines) {
+      const tier = await this.deps.repositories.catalog.getTierById(line.tierId);
+      if (!tier || tier.eventId !== event.id) throw new TicketTierNotFoundError(line.tierId);
+      if (
+        (tier.accessMode ?? 'public') !== 'public' &&
+        (!line.accessGrantId ||
+          !hold.userId ||
+          !(await new TicketAccessService(this.deps).hasGrantForTier(
+            line.accessGrantId,
+            hold.userId,
+            event.id,
+            tier.id,
+          )))
+      ) {
+        throw new TicketTierNotFoundError(line.tierId);
+      }
+      if (
+        (event.visibilityMode === 'code' || event.visibilityMode === 'invited') &&
+        (!line.accessGrantId ||
+          !hold.userId ||
+          !(await new TicketAccessService(this.deps).hasGrantForEvent(
+            line.accessGrantId,
+            hold.userId,
+            event.id,
+            event.visibilityMode === 'invited' ? 'invitation' : 'code',
+          )))
+      ) {
+        throw new TicketTierNotFoundError(line.tierId);
+      }
     }
 
-    const paymentProvider = this.deps.paymentProvider;
-    const paymentIntent = await paymentProvider.createOrder({
-      amountPaise: hold.pricing.grandTotalPaise,
-      currency: hold.pricing.currency,
-      idempotencyKey,
-      metadata: {
-        holdId,
-        eventId: hold.eventId,
-        organizationId: hold.organizationId,
-      },
-    });
+    if (hold.providerOrderId) {
+      return this.payableBoundIntent(hold.id, hold.providerOrderId);
+    }
 
-    // First writer wins. If a concurrent attempt bound a different order while
-    // we were calling the provider, that one is authoritative and ours is
-    // simply never paid.
-    const bound = await this.deps.repositories.cartReservations.bindProviderOrder(
+    // The durable claim precedes all network I/O. A lost response/restart may
+    // only reconcile this receipt, never blindly create a second provider order.
+    const receipt = `c1_${createHash('sha256').update(hold.id).digest('hex').slice(0, 36)}`;
+    const claim = await this.deps.repositories.cartReservations.claimProviderOrderCreation(
       holdId,
-      paymentIntent.id,
+      receipt,
+      now,
     );
+    if (!claim) throw new InvalidOperationError('Hold not found');
+    if (claim.hold.providerOrderId)
+      return this.payableBoundIntent(holdId, claim.hold.providerOrderId);
+    const snapshot = claim.hold.providerOrderCreation;
+    if (!snapshot) throw new InvalidOperationError('Payment creation requires_support');
+    const paymentProvider = this.deps.paymentProvider;
+    const metadata = {
+      holdId: snapshot.holdId,
+      eventId: snapshot.eventId,
+      organizationId: snapshot.organizationId,
+    };
+    try {
+      let paymentIntent;
+      if (claim.claimed) {
+        paymentIntent = await paymentProvider.createOrder({
+          amountPaise: snapshot.amountPaise,
+          currency: snapshot.currency,
+          idempotencyKey: snapshot.receipt,
+          metadata,
+        });
+      } else {
+        paymentIntent = await this.lookupClaimedProviderOrder(snapshot);
+      }
+      if (
+        !paymentIntent.id ||
+        paymentIntent.amountPaise !== snapshot.amountPaise ||
+        paymentIntent.currency !== snapshot.currency
+      ) {
+        throw new InvalidOperationError('Provider order amount or currency mismatch');
+      }
+      const bound = await this.deps.repositories.cartReservations.bindProviderOrder(
+        holdId,
+        paymentIntent.id,
+      );
+      if (!bound || bound !== paymentIntent.id)
+        throw new InvalidOperationError('Provider order binding conflict');
+      return await this.payableBoundIntent(holdId, bound);
+    } catch {
+      await this.deps.repositories.cartReservations.markProviderOrderRequiresSupport(
+        holdId,
+        snapshot.receipt,
+      );
+      throw new InvalidOperationError(
+        'Payment creation requires_support; retry recovery without creating another order',
+      );
+    }
+  }
 
+  private async lookupClaimedProviderOrder(
+    snapshot: NonNullable<CartReservation['providerOrderCreation']>,
+  ) {
+    const provider = this.deps.paymentProvider;
+    if (!provider.findOrdersByReceipt)
+      throw new InvalidOperationError('Provider order lookup unavailable');
+    const matches = await provider.findOrdersByReceipt(snapshot.receipt);
+    const candidate = matches[0];
+    if (
+      matches.length !== 1 ||
+      !candidate ||
+      candidate.receipt !== snapshot.receipt ||
+      candidate.amountPaise !== snapshot.amountPaise ||
+      candidate.currency !== snapshot.currency ||
+      candidate.metadata.holdId !== snapshot.holdId ||
+      candidate.metadata.eventId !== snapshot.eventId ||
+      candidate.metadata.organizationId !== snapshot.organizationId
+    )
+      throw new InvalidOperationError(
+        'Provider order identity is missing, ambiguous or mismatched',
+      );
+    return candidate;
+  }
+
+  /** Re-check hold identity after I/O. A durable pre-cutoff attempt may finish. */
+  private async payableBoundIntent(holdId: string, providerOrderId: string) {
+    const current = await this.deps.repositories.cartReservations.getById(holdId);
+    if (
+      !current ||
+      current.providerOrderId !== providerOrderId ||
+      current.status !== 'active' ||
+      !(Date.parse(current.expiresAt) > Date.now())
+    )
+      throw new InvalidOperationError(
+        'The payment hold expired or changed before checkout could open',
+      );
     return {
-      paymentIntentId: bound ?? paymentIntent.id,
-      amountPaise: hold.pricing.grandTotalPaise,
+      paymentIntentId: providerOrderId,
+      amountPaise: current.providerOrderCreation?.amountPaise ?? current.pricing.grandTotalPaise,
     };
   }
 
@@ -649,6 +1602,7 @@ export class CheckoutService {
       paymentIntentId: serverOrderId,
       holdId,
       _idempotencyKey: input.idempotencyKey ?? paymentId,
+      _verifiedPayment: verification,
     });
   }
 
@@ -663,8 +1617,9 @@ export class CheckoutService {
     paymentIntentId: string;
     holdId: EntityId;
     _idempotencyKey: string;
+    _verifiedPayment?: PaymentVerificationResponse;
   }): Promise<{ order: Order; entitlements: Entitlement[] }> {
-    const { actor, paymentId, paymentIntentId, holdId } = input;
+    const { actor, paymentId, paymentIntentId, holdId, _verifiedPayment } = input;
 
     let hold = await this.deps.repositories.cartReservations.getById(holdId);
     if (!hold || !this.actsForHold(actor, hold)) throw new InvalidOperationError('Hold not found');
@@ -680,11 +1635,27 @@ export class CheckoutService {
     const existingOrder = await this.deps.repositories.orders.getByPaymentId(paymentId);
     if (existingOrder) {
       const belongsToHold =
+        existingOrder.paymentId === paymentId &&
+        existingOrder.paymentIntentId !== null &&
+        existingOrder.paymentIntentId === hold.providerOrderId &&
+        paymentIntentId === hold.providerOrderId &&
+        existingOrder.organizationId === hold.organizationId &&
         existingOrder.userId === hold.userId &&
         existingOrder.eventId === hold.eventId &&
         (hold.convertedOrderId === null || hold.convertedOrderId === existingOrder.id);
       if (!belongsToHold) throw new InvalidOperationError('Payment belongs to a different hold');
-      return this.completeFulfilment(existingOrder, hold);
+      if (_verifiedPayment) {
+        this.assertProviderCaptureMatchesHold(_verifiedPayment, hold, paymentIntentId, paymentId);
+        await this.recordProviderCapture(_verifiedPayment, hold, null);
+      }
+      const result = await this.completeFulfilment(existingOrder, hold);
+      if (_verifiedPayment)
+        await this.recordProviderCapture(
+          _verifiedPayment,
+          hold,
+          result.order.fulfillmentState === 'pending' ? null : result.order.id,
+        );
+      return result;
     }
 
     // The hold already lost this exact race — some other caller converted it
@@ -694,7 +1665,39 @@ export class CheckoutService {
     // contention, and losing it is not an error for a dual confirmation path.
     if (hold.status === 'converted' && hold.convertedOrderId) {
       const convertedOrder = await this.deps.repositories.orders.getById(hold.convertedOrderId);
-      if (convertedOrder) return this.completeFulfilment(convertedOrder, hold);
+      if (convertedOrder) {
+        if (
+          convertedOrder.paymentId !== paymentId ||
+          convertedOrder.paymentIntentId !== paymentIntentId ||
+          convertedOrder.paymentIntentId !== hold.providerOrderId ||
+          convertedOrder.userId !== hold.userId ||
+          convertedOrder.eventId !== hold.eventId ||
+          convertedOrder.organizationId !== hold.organizationId
+        ) {
+          if (_verifiedPayment) {
+            this.assertProviderCaptureMatchesHold(
+              _verifiedPayment,
+              hold,
+              paymentIntentId,
+              paymentId,
+            );
+            await this.recordContradictoryCapture(_verifiedPayment, hold);
+          }
+          throw new InvalidOperationError('Converted hold belongs to a different payment');
+        }
+        if (_verifiedPayment) {
+          this.assertProviderCaptureMatchesHold(_verifiedPayment, hold, paymentIntentId, paymentId);
+          await this.recordProviderCapture(_verifiedPayment, hold, null);
+        }
+        const result = await this.completeFulfilment(convertedOrder, hold);
+        if (_verifiedPayment)
+          await this.recordProviderCapture(
+            _verifiedPayment,
+            hold,
+            result.order.fulfillmentState === 'pending' ? null : result.order.id,
+          );
+        return result;
+      }
     }
     // A hold can be past its TTL (or already released by the sweep) by the time
     // a payment lands — the guest was inside the provider's checkout when it
@@ -728,10 +1731,14 @@ export class CheckoutService {
     // route and signature verification at the redirect route authenticate
     // *who* is calling; this authenticates *what actually happened* with the
     // money, which is a separate and equally required check (D-022).
-    const verified = await this.deps.paymentProvider.getPayment(paymentId);
+    const verified = _verifiedPayment ?? (await this.deps.paymentProvider.getPayment(paymentId));
     if (!verified) {
       throw new InvalidOperationError(`Payment ${paymentId} was not found with the provider`);
     }
+    if (verified.paymentId !== paymentId)
+      throw new InvalidOperationError(
+        'Provider payment identity does not match the requested payment',
+      );
     if (!verified.captured) {
       throw new InvalidOperationError(`Payment ${paymentId} has not been captured`);
     }
@@ -751,16 +1758,26 @@ export class CheckoutService {
       );
     }
 
+    await this.recordProviderCapture(verified, hold, null);
+
     // Captured after the hold lapsed: honour the payment if the seats are still
     // free (the order is built from the frozen hold, so the guest gets exactly
     // what they were quoted), otherwise give the money back rather than keep it
     // for nothing. Captured money always ends in an order or a refund.
-    if (lateCapture) hold = await this.reviveHoldForLatePayment(hold, paymentId);
+    let compensationReason: NonNullable<Order['compensationRequired']>['reason'] | null = null;
+    const capturedEvent = await this.deps.repositories.events.getById(hold.eventId);
+    if (!capturedEvent || capturedEvent.status === 'cancelled')
+      compensationReason = 'event_unavailable';
+    if (lateCapture && !compensationReason) {
+      const revival = await this.reviveHoldForLatePayment(hold);
+      hold = revival.hold;
+      if (!revival.available) compensationReason = 'capacity_unavailable';
+    }
 
     // Create order
     const orderId = `ORD-${paymentId}`;
     const now = new Date();
-    const order: Order = {
+    let order: Order = {
       id: orderId,
       eventId: hold.eventId,
       organizationId: hold.organizationId,
@@ -770,13 +1787,33 @@ export class CheckoutService {
       contact: hold.attendee ?? { name: 'Guest', email: 'guest@example.com', phone: '' },
       status: 'paid',
       lines: hold.lines.map((l) => ({
+        ...hold.pricing.lines.find((priced) => priced.tierId === l.tierId),
         tierId: l.tierId,
         tierName: l.tierName,
         quantity: l.quantity,
         unitPricePaise: l.unitPricePaise,
         subtotalPaise: l.unitPricePaise * l.quantity,
+        ...(l.pricingPhaseId === undefined ? {} : { pricingPhaseId: l.pricingPhaseId }),
+        ...(l.admissionUnitPricePaise === undefined
+          ? {}
+          : { admissionUnitPricePaise: l.admissionUnitPricePaise }),
+        ...(l.coverUnitPricePaise === undefined
+          ? {}
+          : { coverUnitPricePaise: l.coverUnitPricePaise }),
+        ...(l.coverPolicy === undefined ? {} : { coverPolicy: l.coverPolicy }),
+        ...(l.ticketAddons === undefined ? {} : { ticketAddons: l.ticketAddons }),
+        ...(l.guestCount === undefined ? {} : { guestCount: l.guestCount }),
+        ...(l.admissionMode === undefined ? {} : { admissionMode: l.admissionMode }),
+        ...(l.eligibility === undefined ? {} : { eligibility: l.eligibility }),
       })),
       currency: hold.pricing.currency,
+      ...(hold.pricing.feePolicy
+        ? { feePolicy: snapshotBookingFeePolicy(hold.pricing.feePolicy) }
+        : {}),
+      accountingPolicy: { ...M4_ACCOUNTING_POLICY, capturedAt: hold.createdAt },
+      bookedAt: hold.createdAt,
+      ...(hold.saleAllocation ? { saleAllocation: hold.saleAllocation } : {}),
+      fulfillmentState: 'pending',
       subtotalPaise: hold.pricing.subtotalPaise,
       discountPaise: hold.pricing.discountPaise,
       discountFundingOwner: hold.pricing.discountFundingOwner ?? null,
@@ -785,6 +1822,11 @@ export class CheckoutService {
       paymentFeePaise: hold.pricing.paymentFeePaise,
       gstPaise: hold.pricing.gstPaise,
       grandTotalPaise: hold.pricing.grandTotalPaise,
+      admissionSubtotalPaise: hold.pricing.admissionSubtotalPaise ?? hold.pricing.subtotalPaise,
+      coverSubtotalPaise: hold.pricing.coverSubtotalPaise ?? 0,
+      addOnSubtotalPaise: hold.pricing.addOnSubtotalPaise ?? 0,
+      discountedAdmissionSubtotalPaise:
+        hold.pricing.discountedAdmissionSubtotalPaise ?? hold.pricing.discountedSubtotalPaise,
       appliedPromoCode: hold.appliedPromoCode,
       attribution: hold.attribution,
       paymentIntentId,
@@ -798,22 +1840,23 @@ export class CheckoutService {
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
     };
+    if (order.feePolicy) order = { ...order, refundSnapshot: snapshotOriginalPurchase(order) };
 
     // A promo discount becomes financially effective at capture, not quote.
     // Claim it under a datastore transaction before the paid order is exposed;
     // quote-time counts are only an early UX check and cannot protect against
     // two buyers paying concurrently for the last redemption.
-    const promoClaim = await this.claimPromoRedemption(order, hold, true);
-    if (promoClaim === 'global_limit' || promoClaim === 'user_limit') {
+    const promoClaim = compensationReason
+      ? 'already_claimed'
+      : await this.claimPromoRedemption(order, hold, true);
+    if (promoClaim === 'global_limit' || promoClaim === 'user_limit')
+      compensationReason = 'promotion_unavailable';
+    if (compensationReason) {
       await this.deps.repositories.cartReservations.release(hold.id);
-      await this.deps.paymentProvider.refundPayment({
-        paymentId,
-        amountPaise: hold.pricing.grandTotalPaise,
-        idempotencyKey: `promo-limit-refund:${paymentId}`,
-      });
-      throw new PaymentRefundedError(
-        'The promotional offer reached its limit while your payment was completing. Your payment has been refunded in full.',
-      );
+      order = {
+        ...order,
+        compensationRequired: { reason: compensationReason, requestedAt: now.toISOString() },
+      };
     }
 
     try {
@@ -825,12 +1868,99 @@ export class CheckoutService {
       // caller-facing error: converge on whichever write actually landed.
       if (error instanceof VersionConflictError) {
         const winner = await this.deps.repositories.orders.getByPaymentId(paymentId);
-        if (winner) return this.completeFulfilment(winner, hold);
+        if (!winner) throw error;
+        order = winner;
+      } else {
+        throw error;
       }
-      throw error;
     }
 
-    return this.completeFulfilment(order, hold);
+    const result = await this.completeFulfilment(order, hold);
+    await this.recordProviderCapture(
+      verified,
+      hold,
+      result.order.fulfillmentState === 'pending' ? null : result.order.id,
+    );
+    return result;
+  }
+
+  private assertProviderCaptureMatchesHold(
+    verified: PaymentVerificationResponse,
+    hold: CartReservation,
+    providerOrderId: string,
+    paymentId: string,
+  ): void {
+    if (verified.paymentId !== paymentId)
+      throw new InvalidOperationError(
+        'Provider payment identity does not match the requested payment',
+      );
+    if (!verified.captured)
+      throw new InvalidOperationError(`Payment ${verified.paymentId} has not been captured`);
+    if (verified.orderId !== providerOrderId || providerOrderId !== hold.providerOrderId) {
+      throw new InvalidOperationError('Payment was not made against this hold');
+    }
+    if (verified.amountPaise !== hold.pricing.grandTotalPaise) {
+      throw new InvalidOperationError('Payment amount does not match hold total');
+    }
+    if (verified.currency !== undefined && verified.currency !== hold.pricing.currency) {
+      throw new InvalidOperationError('Payment currency does not match hold currency');
+    }
+  }
+
+  /** Retain verified contradictory money for support; never correlate it to another payment's sale. */
+  private async recordContradictoryCapture(
+    verified: PaymentVerificationResponse,
+    hold: CartReservation,
+  ) {
+    await this.recordProviderCapture(verified, hold, null);
+    const repo = this.deps.repositories.providerPayments;
+    const current = await repo.findByPaymentId(verified.paymentId);
+    if (current && current.processingState !== 'requires_support') {
+      await repo.save({
+        ...current,
+        processingState: 'requires_support',
+        version: current.version + 1,
+        updatedAt: this.deps.config.clock.now().toISOString(),
+      });
+    }
+  }
+
+  private async recordProviderCapture(
+    verified: PaymentVerificationResponse,
+    hold: CartReservation,
+    orderId: EntityId | null,
+  ): Promise<void> {
+    const existing = await this.deps.repositories.providerPayments.findByPaymentId(
+      verified.paymentId,
+    );
+    if (existing) {
+      if (
+        existing.providerOrderId !== hold.providerOrderId ||
+        existing.capturedPaise !== verified.amountPaise ||
+        existing.currency !== (verified.currency ?? hold.pricing.currency) ||
+        (orderId !== null && existing.orderId !== null && existing.orderId !== orderId)
+      ) {
+        throw new InvalidOperationError('Provider payment record conflicts with verified capture');
+      }
+      if (orderId === null || existing.orderId === orderId) return;
+    }
+
+    const receivedAt = this.deps.config.clock.now();
+    await this.providerPayments.recordEvent(
+      {
+        type: 'captured',
+        paymentId: verified.paymentId,
+        providerOrderId: hold.providerOrderId ?? null,
+        orderId,
+        correlated: true,
+        amountPaise: verified.amountPaise,
+        currency: verified.currency ?? hold.pricing.currency,
+        feePaise: existing?.feePaise ?? verified.feePaise ?? 0,
+        taxOnFeePaise: existing?.taxOnFeePaise ?? verified.taxOnFeePaise ?? 0,
+        occurredAt: existing?.capturedAt ?? receivedAt.toISOString(),
+      },
+      { trustedIngestion: 'internal_provider_response', receivedAt },
+    );
   }
 
   /** Read-only, owner-scoped source of truth for reload/lost-callback recovery. */
@@ -865,6 +1995,17 @@ export class CheckoutService {
       return { ...base, status: 'processing', orderId: order.id };
     }
 
+    if (!hold.providerOrderId && hold.providerOrderCreation) {
+      return {
+        ...base,
+        status:
+          hold.providerOrderCreation.state === 'requires_support'
+            ? 'requires_support'
+            : 'processing',
+        orderId: null,
+      };
+    }
+
     const providerPayment = hold.providerOrderId
       ? await this.deps.repositories.providerPayments.findByProviderOrderId(hold.providerOrderId)
       : null;
@@ -872,6 +2013,26 @@ export class CheckoutService {
       return { ...base, status: 'refunded', orderId: null };
     }
     if (providerPayment?.processingState === 'requires_support') {
+      await this.deps.outbox.append(
+        domainEvent({
+          id: deterministicDomainEventId(
+            'payment.support_required',
+            providerPayment.id,
+            String(providerPayment.version),
+          ),
+          type: 'payment.support_required',
+          aggregateId: providerPayment.id,
+          organizationId: hold.organizationId,
+          actorId: SYSTEM_ACTOR.userId,
+          payload: {
+            paymentId: providerPayment.id,
+            holdId: hold.id,
+            organizationId: hold.organizationId,
+            stateVersion: providerPayment.version,
+          },
+          occurredAt: this.deps.config.clock.now().getTime(),
+        }),
+      );
       return { ...base, status: 'requires_support', orderId: null };
     }
     if (providerPayment?.capturedPaise) {
@@ -884,9 +2045,48 @@ export class CheckoutService {
   }
 
   /**
+   * Reconcile a captured provider payment when the browser redirect callback
+   * was lost. The caller must own the hold; provider capture is re-read from
+   * Razorpay before the normal idempotent fulfillment path is invoked.
+   */
+  async reconcilePaymentRecovery(
+    actor: ActorContext,
+    holdId: EntityId,
+  ): Promise<PaymentRecoveryStatus> {
+    const hold = await this.deps.repositories.cartReservations.getById(holdId);
+    if (!hold || !this.actsForHold(actor, hold)) throw new NotFoundError('hold', holdId);
+
+    const current = await this.getPaymentRecoveryStatus(actor, holdId);
+    if (current.status === 'fulfilled' || current.status === 'refunded') return current;
+    if (!hold.providerOrderId) return current;
+
+    const recorded = await this.deps.repositories.providerPayments.findByProviderOrderId(
+      hold.providerOrderId,
+    );
+    if (!recorded || recorded.capturedPaise <= 0) return current;
+
+    // A persisted webhook fact is a reconciliation hint, not authority to
+    // issue tickets. Confirm capture and its order/amount/currency with the
+    // provider before entering the same idempotent fulfillment path as the
+    // signed webhook and redirect callback.
+    const verified = await this.deps.paymentProvider.getPayment(recorded.id);
+    if (!verified?.captured) return current;
+
+    await this.confirmPayment({
+      actor,
+      paymentId: verified.paymentId,
+      paymentIntentId: hold.providerOrderId,
+      holdId,
+      _idempotencyKey: `recovery:${verified.paymentId}`,
+      _verifiedPayment: verified,
+    });
+    return this.getPaymentRecoveryStatus(actor, holdId);
+  }
+
+  /**
    * For a payment that arrived after its hold lapsed: bring the hold back to life
-   * and confirm its seats still fit, or refund the payment in full and say so.
-   * Captured money always ends in an order or a refund.
+   * and confirm its seats still fit. Unavailable admission becomes a durable,
+   * approval-gated full-paid compensation request; no direct provider refund.
    *
    * Re-activating the hold gives it a NEW position in the event's strict order of
    * holds, taken in a transaction, and capacity is then judged exactly as it is
@@ -898,8 +2098,7 @@ export class CheckoutService {
    */
   private async reviveHoldForLatePayment(
     hold: CartReservation,
-    paymentId: string,
-  ): Promise<CartReservation> {
+  ): Promise<{ hold: CartReservation; available: boolean }> {
     const repo = this.deps.repositories.cartReservations;
     const lapsesAt = new Date(Date.now() + DEFAULT_HOLD_TTL_MS).toISOString();
     const revived = await repo.reactivate(hold.id, lapsesAt);
@@ -914,17 +2113,13 @@ export class CheckoutService {
       if (!(error instanceof InvalidOperationError)) throw error;
       overbooked = revived.lines[0]?.tierId ?? '';
     }
-    if (overbooked === null) return revived;
+    const overTierUserCap = await this.firstTierOverUserCap(revived);
+    const overEventUserCap = await this.isOverActivePaidUnitCap(revived);
+    if (overbooked === null && overTierUserCap === null && !overEventUserCap)
+      return { hold: revived, available: true };
 
     await repo.release(revived.id);
-    await this.deps.paymentProvider.refundPayment({
-      paymentId,
-      amountPaise: hold.pricing.grandTotalPaise,
-      idempotencyKey: `autorefund:${paymentId}`,
-    });
-    throw new PaymentRefundedError(
-      'Your payment arrived after the reservation expired and the tickets are no longer available. It has been refunded in full.',
-    );
+    return { hold: { ...revived, status: 'released' }, available: false };
   }
 
   /**
@@ -935,6 +2130,7 @@ export class CheckoutService {
    */
   async assessFulfilment(order: Order): Promise<FulfilmentGaps> {
     const repos = this.deps.repositories;
+    order = (await repos.orders.getById(order.id)) ?? order;
     const hold = order.paymentIntentId
       ? await repos.cartReservations.getByProviderOrderId(order.paymentIntentId)
       : null;
@@ -951,6 +2147,33 @@ export class CheckoutService {
       now: new Date(),
     });
     if (wanted.some((entitlement) => !have.has(entitlement.id))) missing.push('tickets');
+    if (order.fulfillmentState !== undefined) {
+      if (order.fulfillmentState !== 'complete' || !order.receiptFacts) missing.push('completion');
+      if (
+        !this.deps.outbox.hasEvent ||
+        !(await this.deps.outbox.hasEvent(deterministicDomainEventId('order.fulfilled', order.id)))
+      )
+        missing.push('order_outbox');
+      const issuance = await Promise.all(
+        wanted.map(
+          (ticket) =>
+            this.deps.outbox.hasEvent?.(deterministicDomainEventId('ticket.issued', ticket.id)) ??
+            Promise.resolve(false),
+        ),
+      );
+      if (issuance.some((present) => !present)) missing.push('issuance_intents');
+    }
+
+    for (const entitlement of wanted) {
+      const line = hold.lines.find((item) => item.tierId === entitlement.tierId);
+      if (
+        (line?.coverUnitPricePaise ?? 0) > 0 &&
+        !(await repos.eventCoverAccounts.getByEntitlement(entitlement.id))
+      ) {
+        missing.push('cover_accounts');
+        break;
+      }
+    }
     // A zero-value order has no money to split, so no ledger entry is expected.
     if (order.grandTotalPaise > 0) {
       const sourceType = order.paymentId?.startsWith('door_cash_')
@@ -962,7 +2185,19 @@ export class CheckoutService {
         repos.ledger.findByOrder(order.id),
         repos.financialJournals.findBySource(sourceType, order.id),
       ]);
-      if (legacyEntries.length === 0 || journals.length === 0) missing.push('ledger');
+      const complete =
+        order.fulfillmentState === undefined
+          ? legacyEntries.length > 0 && journals.length > 0
+          : saleAccountingComplete(order, legacyEntries, journals) &&
+            (
+              await Promise.all(
+                journals.map(
+                  (journal) =>
+                    repos.financialJournals.hasAllLines?.(journal.id) ?? Promise.resolve(false),
+                ),
+              )
+            ).every(Boolean);
+      if (!complete) missing.push('ledger');
     }
     return { holdFound: true, missing };
   }
@@ -1004,6 +2239,58 @@ export class CheckoutService {
     hold: CartReservation,
   ): Promise<{ order: Order; entitlements: Entitlement[] }> {
     const repos = this.deps.repositories;
+    const currentOrder = await repos.orders.getById(order.id);
+    if (!currentOrder) throw new NotFoundError('order', order.id);
+    order = currentOrder;
+
+    // A payment callback can be redelivered after an Admin refund request has
+    // locked the order. Resume only still-paid orders; otherwise this path
+    // could issue fresh tickets or cover balances while money is under review.
+    if (order.status !== 'paid') {
+      if (
+        order.paymentId &&
+        order.fulfillmentState === 'pending' &&
+        ['refund_requested', 'refunded'].includes(order.status)
+      )
+        await this.repairSaleAccounting(order.id);
+      return { order, entitlements: await repos.entitlements.getByOrderId(order.id) };
+    }
+
+    if (order.compensationRequired) {
+      await this.recordSettlement(order);
+      const compensation = await requestCaptureCompensation(this.deps, order.id);
+      return { order: compensation.order, entitlements: [] };
+    }
+    if (order.fulfillmentState === 'complete') {
+      const gaps = await this.assessFulfilment(order);
+      if (gaps.holdFound && gaps.missing.length === 0)
+        return { order, entitlements: await repos.entitlements.getByOrderId(order.id) };
+    }
+    const event = await repos.events.getById(order.eventId);
+    if (!event || event.status === 'cancelled') {
+      const existingTickets = await repos.entitlements.getByOrderId(order.id);
+      if (order.fulfillmentState === 'pending' && existingTickets.length === 0) {
+        const blocked = {
+          ...order,
+          compensationRequired: {
+            reason: 'event_unavailable' as const,
+            requestedAt: this.deps.config.clock.now().toISOString(),
+          },
+          version: order.version + 1,
+        };
+        await repos.orders.save(blocked);
+        await this.recordSettlement(blocked);
+        const compensation = await requestCaptureCompensation(this.deps, order.id);
+        return { order: compensation.order, entitlements: [] };
+      }
+      await this.repairSaleAccounting(order.id);
+      // Existing admissions use the established exact-ticket cancellation flow.
+      await this.ensureOrderFulfilledEvent(order);
+      return {
+        order: (await repos.orders.getById(order.id)) ?? order,
+        entitlements: existingTickets,
+      };
+    }
 
     if (hold.status !== 'converted') {
       await repos.cartReservations.convertToOrder(hold.id, order.id);
@@ -1016,25 +2303,135 @@ export class CheckoutService {
     // so repair records the missing audit row without retroactively rejecting it.
     await this.claimPromoRedemption(order, hold, false);
 
-    // Entitlement ids are deterministic per (order, tier, unit) and saves are
-    // compare-and-set, so re-saving an existing one would conflict. Issue only
-    // the units that are missing.
-    const existing = await repos.entitlements.getByOrderId(order.id);
-    const have = new Set(existing.map((e) => e.id));
+    // Original sale accounting must be durable before any admission can be created.
+    await this.recordSettlement(order);
+
+    // Initial issuance saves atomically repair missing intents while preserving
+    // any later custody, scan or refund state already stored for that unit.
     const wanted = issueEntitlements({
       order,
       admitsPerUnit: await this.buildAdmitsPerUnit(hold.lines),
       now: new Date(),
     });
-    for (const entitlement of wanted) {
-      if (!have.has(entitlement.id)) await repos.entitlements.save(entitlement);
+    if (hold.upgrade) {
+      const issued = wanted[0];
+      if (wanted.length !== 1 || !issued) {
+        throw new InvalidOperationError('A ticket upgrade must issue exactly one replacement pass');
+      }
+      const replacement = {
+        ...issued,
+        upgradeFromEntitlementId: hold.upgrade.sourceEntitlementId,
+      };
+      await repos.entitlements.replaceForUpgrade({
+        sourceEntitlementId: hold.upgrade.sourceEntitlementId,
+        expectedSourceVersion: hold.upgrade.sourceEntitlementVersion,
+        replacement,
+        now: this.deps.config.clock.now(),
+      });
+      await repos.entitlements.save(
+        replacement,
+        undefined,
+        this.ticketIssuedEvent(order, replacement),
+      );
+    } else {
+      for (const entitlement of wanted) {
+        await repos.entitlements.save(
+          entitlement,
+          undefined,
+          this.ticketIssuedEvent(order, entitlement),
+        );
+      }
     }
 
-    // Settlement: the only writer into the partner ledger for a ticket sale.
-    // `recordTicketSale` is idempotent per orderId, so repeating it is a no-op.
-    await this.recordSettlement(order);
+    for (const entitlement of wanted) {
+      const line = hold.lines.find((item) => item.tierId === entitlement.tierId);
+      const amountPaise = line?.coverUnitPricePaise ?? 0;
+      if (amountPaise <= 0) continue;
+      if (!event || !line?.coverPolicy) {
+        throw new InvalidOperationError('Paid cover entitlement has no accepted policy snapshot');
+      }
+      const proposal = await this.requireAcceptedCoverPolicy(
+        event,
+        amountPaise,
+        line.coverPolicy,
+        false,
+      );
+      const account = createEventCoverAccount({
+        entitlementId: entitlement.id,
+        orderId: order.id,
+        eventId: order.eventId,
+        guestUserId: currentEntitlementHolderId(entitlement),
+        hostOrganizationId: order.organizationId,
+        venueOrganizationId: proposal.venueOrganizationId,
+        amountPaise,
+        providerCaptureConfirmed: order.status === 'paid' && Boolean(order.paymentId),
+        // The immutable accepted policy in the paid hold is the approval
+        // evidence; later disabling sales must not strand captured orders.
+        merchantApproved: true,
+        policyVersion: proposal.policyVersion,
+        refundPolicy: proposal.terms.refundPolicy,
+        activationApproved: this.deps.config.features.m5CoverActivationApproved === true,
+        now: this.deps.config.clock.now(),
+      });
+      await repos.eventCoverAccounts.createIssuedAccount(account);
+    }
 
-    return { order, entitlements: await repos.entitlements.getByOrderId(order.id) };
+    if (order.fulfillmentState !== undefined) {
+      order = await repos.orders.completeFulfilment({
+        orderId: order.id,
+        holdId: hold.id,
+        now: this.deps.config.clock.now(),
+        event: this.orderFulfilledEvent(order),
+      });
+    }
+    const entitlements = await repos.entitlements.getByOrderId(order.id);
+    await this.ensureOrderFulfilledEvent(order);
+    return { order, entitlements };
+  }
+
+  private async ensureOrderFulfilledEvent(order: Order): Promise<void> {
+    const entitlements = await this.deps.repositories.entitlements.getByOrderId(order.id);
+    for (const entitlement of entitlements) {
+      await this.deps.outbox.append(this.ticketIssuedEvent(order, entitlement));
+    }
+    await this.deps.outbox.append(this.orderFulfilledEvent(order));
+  }
+
+  private orderFulfilledEvent(order: Order) {
+    return domainEvent({
+      id: deterministicDomainEventId('order.fulfilled', order.id),
+      type: 'order.fulfilled',
+      aggregateId: order.id,
+      organizationId: order.organizationId,
+      actorId: order.userId ?? SYSTEM_ACTOR.userId,
+      payload: {
+        orderId: order.id,
+        eventId: order.eventId,
+        ...(order.fulfillmentState !== undefined ? { receiptFacts: orderReceiptFacts(order) } : {}),
+      },
+      occurredAt: this.deps.config.clock.now().getTime(),
+    });
+  }
+
+  private ticketIssuedEvent(order: Order, entitlement: Entitlement) {
+    return domainEvent({
+      id: deterministicDomainEventId('ticket.issued', entitlement.id),
+      type: 'ticket.issued',
+      aggregateId: entitlement.id,
+      organizationId: entitlement.organizationId,
+      actorId: order.userId ?? SYSTEM_ACTOR.userId,
+      payload: {
+        entitlementId: entitlement.id,
+        orderId: order.id,
+        eventId: entitlement.eventId,
+        purchaserUserId: entitlement.userId,
+        holderUserId: currentEntitlementHolderId(entitlement),
+        ...(entitlement.upgradeFromEntitlementId
+          ? { upgradeFromEntitlementId: entitlement.upgradeFromEntitlementId }
+          : {}),
+      },
+      occurredAt: this.deps.config.clock.now().getTime(),
+    });
   }
 
   private async claimPromoRedemption(
@@ -1080,21 +2477,136 @@ export class CheckoutService {
     return this.recordSettlement(order);
   }
 
-  private async recordSettlement(order: Order): Promise<void> {
-    const hostOrganizationId = order.organizationId;
+  /** Repairs only original money facts. Never converts holds, issues tickets, or changes order status. */
+  async repairSaleAccounting(orderId: EntityId): Promise<void> {
+    const order = await this.deps.repositories.orders.getById(orderId);
+    if (!order?.paymentId)
+      throw new InvalidOperationError('Original sale payment evidence is unavailable');
+    const repo = this.deps.repositories.financialJournals;
+    let journals = await repo.findByOrderId(order.id);
+    if (originalSaleJournalsComplete(order, journals)) {
+      // Replays immutable aggregates to restore missing companion line documents.
+      await repo.postBatch(
+        journals.filter((journal) =>
+          journal.idempotencyKey.startsWith(`m2:ticket-sale:${order.id}:`),
+        ),
+      );
+    } else {
+      const provider = await this.deps.repositories.providerPayments.findByPaymentId(
+        order.paymentId,
+      );
+      if (
+        !provider ||
+        provider.capturedPaise !== order.grandTotalPaise ||
+        provider.currency !== order.currency ||
+        provider.providerOrderId !== order.paymentIntentId ||
+        (provider.orderId && provider.orderId !== order.id) ||
+        !provider.capturedAt
+      ) {
+        throw new InvalidOperationError('Original sale captured payment evidence is invalid');
+      }
+      try {
+        await this.recordSettlement(order);
+      } catch (error) {
+        if (error instanceof InvalidOperationError && error.message.includes('Original sale'))
+          await this.recordSaleAccountingReview(order, error.message);
+        throw error;
+      }
+      journals = await repo.findByOrderId(order.id);
+    }
+    const hasAllLines = repo.hasAllLines?.bind(repo);
+    if (
+      !originalSaleJournalsComplete(order, journals) ||
+      !hasAllLines ||
+      !(
+        await Promise.all(
+          journals
+            .filter((journal) => journal.idempotencyKey.startsWith(`m2:ticket-sale:${order.id}:`))
+            .map((journal) => hasAllLines(journal.id)),
+        )
+      ).every(Boolean)
+    ) {
+      throw new InvalidOperationError('Original sale accounting is incomplete');
+    }
+  }
+
+  private async recordSaleAccountingReview(order: Order, reason: string): Promise<void> {
+    const store = this.deps.repositories.reconciliations;
+    const identity = createHash('sha256')
+      .update(`original-sale:${order.id}`)
+      .digest('hex')
+      .slice(0, 40);
+    const runId = `SALE-RUN-${identity}`;
+    const id = `SALE-REVIEW-${identity}`;
+    const now = this.deps.config.clock.now();
+    let run = await store.getRun(runId);
+    if (!run) {
+      run = createReconciliationRun({ id: runId, requestedBy: 'system_original_sale_repair', now });
+      try {
+        await store.createRun(run);
+      } catch (error) {
+        const winner = await store.getRun(runId);
+        if (!winner) throw error;
+        run = winner;
+      }
+    }
+    if (!(await store.getDiscrepancy(id))) {
+      try {
+        await store.createDiscrepancies([
+          {
+            id,
+            runId,
+            kind: 'missing_journal',
+            state: 'finance_review',
+            organizationId: order.organizationId,
+            orderId: order.id,
+            paymentId: order.paymentId,
+            payoutId: null,
+            amountPaise: order.grandTotalPaise,
+            currency: order.currency,
+            evidence: { reason: 'original_sale_allocation_missing', detail: reason },
+            repair: 'recheck_evidence',
+            resolutionReason: null,
+            resolvedBy: null,
+            resolvedAt: null,
+            ...newVersionedEntity(now),
+          },
+        ]);
+      } catch (error) {
+        if (!(await store.getDiscrepancy(id))) throw error;
+      }
+    }
+    if (run.status === 'running') {
+      try {
+        await store.saveRun(completeReconciliationRun(run, { orders: 1 }, 1, now));
+      } catch (error) {
+        if ((await store.getRun(runId))?.status !== 'completed') throw error;
+      }
+    }
+  }
+
+  private async snapshotSaleAllocation(
+    eventId: EntityId,
+    organizationId: EntityId,
+    grossPaise: number,
+    attribution: CheckoutAttribution | null,
+  ): Promise<SaleAllocationSnapshot> {
+    const hostOrganizationId = organizationId;
+    let partnershipIdentity: { id: string; version: number } | null = null;
 
     // Venue org + share: resolved via the host<->venue Partnership for the
     // event's venue. A host-run event with no venue partnership settles
     // entirely to the host — there is no separate venue party to pay.
     let venueOrganizationId = hostOrganizationId;
     let venueShareRate = 0;
-    const event = await this.deps.repositories.events.getById(order.eventId);
+    const event = await this.deps.repositories.events.getById(eventId);
     if (event?.venueId) {
       const partnership = await this.deps.repositories.partnerships.findByPair(
         hostOrganizationId,
         event.venueId,
       );
       if (partnership) {
+        partnershipIdentity = partnership;
         venueOrganizationId = partnership.venueOrganizationId;
         // The negotiated venue share (whole-number % on the Partnership, v1's
         // venueCommissionRate convention) → settlement ratio. `null` (never
@@ -1116,7 +2628,7 @@ export class CheckoutService {
 
     // Promoter commission rate: the v1-proven performance tier, keyed by the
     // promoter's total attributed conversions across all their links.
-    const promoterOrganizationId = order.attribution?.promoterId ?? null;
+    const promoterOrganizationId = attribution?.promoterId ?? null;
     let promoterCommissionRate: number | null = null;
     if (promoterOrganizationId) {
       const links = await this.deps.repositories.referralLinks.listByPromoter(
@@ -1127,6 +2639,61 @@ export class CheckoutService {
       promoterCommissionRate = commissionTierFor(ticketsSold).rate / 100;
     }
 
+    const split = computeSettlementSplit(
+      grossPaise,
+      platformFeeRate,
+      venueShareRate,
+      promoterCommissionRate,
+    );
+    const promoterPaise = attribution?.promoterCommissionPaise ?? split.promoterCommission;
+    return validateSaleAllocation(
+      {
+        version: 'sale-allocation-v1',
+        grossPaise,
+        platformPaise: split.platformFee,
+        venuePaise: split.venueShare,
+        promoterPaise,
+        hostPaise: grossPaise - split.platformFee - split.venueShare - promoterPaise,
+        hostOrganizationId,
+        venueOrganizationId,
+        promoterOrganizationId,
+        partnershipId: partnershipIdentity?.id ?? null,
+        partnershipVersion: partnershipIdentity?.version ?? null,
+        onboardingId: onboarding?.id ?? null,
+        onboardingVersion: onboarding?.version ?? null,
+        capturedAt: this.deps.config.clock.now().toISOString(),
+      },
+      grossPaise,
+      organizationId,
+    );
+  }
+
+  private async recordSettlement(order: Order): Promise<void> {
+    const hostOrganizationId = order.organizationId;
+    const event = await this.deps.repositories.events.getById(order.eventId);
+    const historical = await this.deps.repositories.ledger.findByOrder(order.id);
+    const allocation = order.saleAllocation
+      ? validateSaleAllocation(
+          order.saleAllocation,
+          order.discountedAdmissionSubtotalPaise ?? order.discountedSubtotalPaise,
+          order.organizationId,
+        )
+      : historical.length > 0
+        ? allocationFromLedger(order, historical)
+        : order.paymentId?.startsWith('door_')
+          ? await this.snapshotSaleAllocation(
+              order.eventId,
+              order.organizationId,
+              order.discountedAdmissionSubtotalPaise ?? order.discountedSubtotalPaise,
+              order.attribution,
+            )
+          : (() => {
+              throw new InvalidOperationError(
+                'Original sale allocation evidence is unavailable; finance review required',
+              );
+            })();
+    const venueOrganizationId = allocation.venueOrganizationId;
+    const promoterOrganizationId = allocation.promoterOrganizationId;
     const entries = await this.financeService.recordTicketSale(
       {
         organizationId: hostOrganizationId,
@@ -1135,13 +2702,14 @@ export class CheckoutService {
         // Compatibility ledger now follows the same basis as the canonical
         // journal: only discounted ticket face value is distributable. Guest
         // fees and GST remain separate liabilities/revenue components.
-        grossAmount: order.discountedSubtotalPaise,
+        grossAmount: order.discountedAdmissionSubtotalPaise ?? order.discountedSubtotalPaise,
         hostOrganizationId,
         venueOrganizationId,
         promoterOrganizationId,
-        platformFeeRate,
-        venueShareRate,
-        promoterCommissionRate,
+        allocation,
+        platformFeeRate: 0,
+        venueShareRate: 0,
+        promoterCommissionRate: null,
         promoterCommissionPaise: order.attribution?.promoterCommissionPaise ?? null,
       },
       SYSTEM_ACTOR,
@@ -1157,7 +2725,6 @@ export class CheckoutService {
         : 'online_payment_capture';
     const amountFor = (entryType: (typeof entries)[number]['entryType']): number =>
       entries.find((entry) => entry.entryType === entryType)?.amount ?? 0;
-    const platformSettings = await this.deps.repositories.platformSettings.get();
     await this.financialPostingService.postTicketSale({
       organizationId: hostOrganizationId,
       orderId: order.id,
@@ -1169,10 +2736,12 @@ export class CheckoutService {
       // command entry until a terminal confirmation integration exists.
       providerConfirmed: sourceType !== 'door_electronic_sale',
       currency: order.currency,
-      ticketFaceValuePaise: order.subtotalPaise,
+      ticketFaceValuePaise: order.admissionSubtotalPaise ?? order.subtotalPaise,
+      eventCoverLiabilityPaise: order.coverSubtotalPaise ?? 0,
       discountPaise: order.discountPaise,
       discountFundingOwner: order.discountFundingOwner,
-      netTicketRevenuePaise: order.discountedSubtotalPaise,
+      netTicketRevenuePaise:
+        order.discountedAdmissionSubtotalPaise ?? order.discountedSubtotalPaise,
       gstPaise: order.gstPaise,
       platformFeePaise: order.platformFeePaise,
       paymentFeePaise: order.paymentFeePaise,
@@ -1180,7 +2749,7 @@ export class CheckoutService {
         ? providerPayment.feePaise + providerPayment.taxOnFeePaise
         : 0,
       policy: {
-        ...platformSettings.accountingPolicy,
+        ...(order.accountingPolicy ?? M4_ACCOUNTING_POLICY),
         // The policy snapshot is part of the journal's idempotent facts. Reuse
         // the immutable payment/order capture time so duplicate callbacks,
         // concurrent confirmation and fulfilment repair rebuild byte-for-byte
@@ -1196,6 +2765,9 @@ export class CheckoutService {
         promoterOrganizationId,
         promoterPaise: amountFor('promoter_commission'),
       },
+      promoterAssignmentId: order.attribution?.assignmentId ?? null,
+      commissionPolicyVersion: order.attribution?.commissionPolicyVersion ?? null,
+      commercialPolicyVersion: order.attribution?.commercialPolicyVersion ?? null,
       postedAt: this.deps.config.clock.now(),
     });
 
@@ -1259,13 +2831,19 @@ export function admitsForTier(
   return tier?.guestCount ?? (tier?.entryType === 'couple' ? 2 : 1);
 }
 
-function commissionForLines(lines: PricingBreakdown['lines'], terms: CommissionTerms): number {
-  return lines.reduce((sum, line) => {
-    const rate = terms.tierRates?.[line.tierId] ?? terms;
-    return (
-      sum +
-      Math.floor((line.subtotalPaise * rate.ratePercent) / 100) +
-      rate.flatPaise * line.quantity
-    );
-  }, 0);
+function commissionForLines(
+  lines: PricingBreakdown['lines'],
+  terms: CommissionTerms,
+  eligibleTierIds: EntityId[] | null,
+): number {
+  return lines
+    .filter((line) => eligibleTierIds === null || eligibleTierIds.includes(line.tierId))
+    .reduce((sum, line) => {
+      const rate = terms.tierRates?.[line.tierId] ?? terms;
+      return (
+        sum +
+        Math.floor(((line.admissionSubtotalPaise ?? line.subtotalPaise) * rate.ratePercent) / 100) +
+        rate.flatPaise * line.quantity
+      );
+    }, 0);
 }

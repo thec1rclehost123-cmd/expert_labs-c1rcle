@@ -17,7 +17,7 @@ graph TB
     end
 
     subgraph PrivateNet["Private Network"]
-      FastifyContainer["Private Service: circle-v2-backend-staging<br/>Dockerfile<br/>node:24-slim<br/>Listen: 0.0.0.0:8080<br/>Public: no"]
+      FastifyContainer["Private Service: c1rcle-api-staging<br/>Dockerfile<br/>node:24-slim<br/>Listen: 0.0.0.0:8080<br/>Public: no"]
     end
 
     RenderTLS["Render TLS termination<br/>(platform-owned certificate)"]
@@ -37,7 +37,7 @@ graph TB
 
 | Setting | Nginx Edge (Public) | Fastify Backend (Private) |
 |---|---|---|
-| **Render name** | `circle-v2-edge-staging` | `circle-v2-backend-staging` |
+| **Render name** | `circle-v2-edge-staging` | `c1rcle-api-staging` |
 | **Type** | Web Service | Private Service |
 | **Runtime** | Docker | Docker |
 | **Dockerfile** | `deploy/docker/Dockerfile.nginx` | `./Dockerfile` |
@@ -68,7 +68,7 @@ graph TB
     end
 
     subgraph PrivateNet["Render Private Network"]
-      Fastify["Private Service: circle-v2-backend-staging<br/>:8080"]
+      Fastify["Private Service: c1rcle-api-staging<br/>:8080"]
       Guest["Private Service: circle-guest-portal<br/>:3000"]
       Partner["Private Service: circle-partner-dashboard<br/>:3001"]
       Admin["Private Service: circle-admin-console<br/>:3002"]
@@ -123,10 +123,10 @@ omitted.
 | **Internal listener** | `0.0.0.0:3000` | `0.0.0.0:3001` | `0.0.0.0:3002` |
 | **Public exposure** | via `guest.<domain>` only | via `partner.<domain>` only | via `admin.<domain>` only |
 | **NEXT_PUBLIC_API_BASE_URL** | `https://staging-api.circle1.com` | `https://staging-api.circle1.com` | `https://staging-api.circle1.com` |
-| **INTERNAL_API_BASE_URL** | `http://circle-v2-backend-staging:8080` | `http://circle-v2-backend-staging:8080` | `http://circle-v2-backend-staging:8080` |
+| **INTERNAL_API_BASE_URL** | `http://c1rcle-api-staging:8080` | `http://c1rcle-api-staging:8080` | `http://c1rcle-api-staging:8080` |
 
 The BFF origin served to the browser is the `guest./partner./admin.` name; the
-private Fastify `circle-v2-backend-staging:8080` endpoint is **never** exposed
+private Fastify `c1rcle-api-staging:8080` endpoint is **never** exposed
 to the browser, never inlined into client bundles (`INTERNAL_*` is not
 `NEXT_PUBLIC_*`), and never appears in logs the client can read.
 
@@ -139,7 +139,7 @@ docker build -f deploy/docker/Dockerfile.nginx -t c1rcle-nginx:test .
 
 docker run --rm -e NGINX_VALIDATE_ONLY=1 -e NGINX_PROFILE=staging \
   -e NGINX_TOPOLOGY=api-only \
-  -e FASTIFY_UPSTREAM=circle-v2-backend-staging:8080 \
+  -e FASTIFY_UPSTREAM=c1rcle-api-staging:8080 \
   -e NGINX_SERVER_NAME=staging-api.circle1.com \
   -e NGINX_FORWARDED_PROTO=https \
   -e NGINX_READINESS_TOKEN="a-real-32-byte-hex-secret" \
@@ -147,7 +147,7 @@ docker run --rm -e NGINX_VALIDATE_ONLY=1 -e NGINX_PROFILE=staging \
 
 docker run --rm -e NGINX_VALIDATE_ONLY=1 -e NGINX_PROFILE=staging \
   -e NGINX_TOPOLOGY=full-edge \
-  -e FASTIFY_UPSTREAM=circle-v2-backend-staging:8080 \
+  -e FASTIFY_UPSTREAM=c1rcle-api-staging:8080 \
   -e BFF_GUEST_UPSTREAM=circle-guest-portal:3000 \
   -e BFF_PARTNER_UPSTREAM=circle-partner-dashboard:3001 \
   -e BFF_ADMIN_UPSTREAM=circle-admin-console:3002 \
@@ -175,7 +175,7 @@ run exits 0; a bad template exits 64 with a message.
 | Variable | Value | Source |
 |---|---|---|
 | `NGINX_PROFILE` | `staging` | Dashboard |
-| `FASTIFY_UPSTREAM` | `circle-v2-backend-staging:8080` | Dashboard (private DNS) |
+| `FASTIFY_UPSTREAM` | `c1rcle-api-staging:8080` | Dashboard (private DNS) |
 | `NGINX_HTTP_PORT` | (omit — Render injects `PORT`) | Render platform |
 | `NGINX_SERVER_NAME` | `staging-api.circle1.com` | Dashboard |
 | `NGINX_FORWARDED_PROTO` | `https` | Dashboard |

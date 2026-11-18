@@ -5,7 +5,7 @@
 The backend is a Fastify gateway with Nginx-ready proxy behavior. The checked
 repository now contains a provider-neutral Nginx image and staging/production
 configuration templates. The gateway itself is deployed on Render
-(`circle-v2-backend`, CI-gated; see `docs/ci-cd.md` and `render.yaml`); whether the
+(`c1rcle-api`, CI-gated; see `docs/ci-cd.md` and `render.yaml`); whether the
 live service fronts it with the Nginx sidecar is recorded in
 `docs/nginx/sidecar-deployment.md`. This document covers the Nginx edge rollout,
 which this repository does not complete on its own.

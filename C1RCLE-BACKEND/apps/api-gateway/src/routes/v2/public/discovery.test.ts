@@ -1,4 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import {
+  createEvent as makeEvent,
+  createTicketTier,
+  createTicketAccessCode,
+  createTicketAddon,
+  UnauthorizedError,
+} from '@c1rcle/core/domain';
+import { describe, expect, it, vi } from 'vitest';
 
 import { createV2Services } from '../../../lib/v2-services.js';
 import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
@@ -22,6 +29,8 @@ async function seedPublishedEvent(overrides: {
   title: string;
   organizationId: string;
   venueId: string;
+  visibilityMode?: 'public' | 'unlisted' | 'code' | 'invited';
+  addressDisclosure?: 'public' | 'after_grant' | 'hidden';
 }) {
   const services = createV2Services();
   const repos = services.repos();
@@ -100,7 +109,9 @@ async function seedPublishedEvent(overrides: {
     startAt: new Date(Date.now() + 7 * 86400 * 1000).toISOString(),
     endAt: null,
     status: 'published',
-    isPublic: true,
+    visibilityMode: overrides.visibilityMode ?? 'public',
+    addressDisclosure: overrides.addressDisclosure,
+    isPublic: (overrides.visibilityMode ?? 'public') === 'public',
     tags: ['music'],
     startingPricePaise: 5000,
     isFree: false,
@@ -124,9 +135,340 @@ describe('V2 public/discovery routes', () => {
     const server = await buildServer();
     const response = await server.inject({ method: 'GET', url: '/events?limit=5' });
     expect(response.statusCode).toBe(200);
+    expect(response.headers['cache-control']).toContain('no-store');
     const body = response.json();
     expect(body.items).toEqual([]);
     expect(body.pageInfo.total).toBe(0);
+    await server.close();
+  });
+
+  it('exposes the active public price separately from the preserved event base price', async () => {
+    const eventId = 'evt_active_current_price';
+    await seedPublishedEvent({
+      eventId,
+      slug: 'active-current-price',
+      title: 'Active Current Price',
+      organizationId: 'org_active_current_price',
+      venueId: 'ven_active_current_price',
+    });
+    const services = createV2Services();
+    const event = await services.repos().events.getById(eventId);
+    if (!event) throw new Error('seeded price event should exist');
+    const now = new Date();
+    await services.repos().events.save({
+      ...event,
+      startingPricePaise: 8_000,
+      version: event.version + 1,
+      updatedAt: now.toISOString(),
+    });
+    await services.repos().catalog.saveTier(
+      createTicketTier({
+        id: 'evt_active_current_price_tier',
+        eventId,
+        organizationId: event.organizationId,
+        name: 'Early Bird',
+        priceInPaise: 8_000,
+        quantity: 20,
+        pricingPhases: [
+          {
+            id: 'early-bird',
+            name: 'Early Bird',
+            priceInPaise: 5_000,
+            quantity: null,
+            startsAt: new Date(now.getTime() - 86400000).toISOString(),
+            endsAt: new Date(now.getTime() + 86400000).toISOString(),
+          },
+        ],
+        now,
+      }),
+    );
+    const server = await buildServer();
+
+    const listing = await server.inject({ method: 'GET', url: '/events?limit=20' });
+    const listed = listing.json().items.find((item: { id: string }) => item.id === eventId);
+    expect(listed).toMatchObject({ startingPricePaise: 8_000, currentStartingPricePaise: 5_000 });
+
+    const detail = await server.inject({ method: 'GET', url: '/events/active-current-price' });
+    expect(detail.statusCode, detail.body).toBe(200);
+    expect(detail.json()).toMatchObject({
+      startingPricePaise: 8_000,
+      currentStartingPricePaise: 5_000,
+    });
+    await server.close();
+  });
+
+  it('normalizes legacy private poster URLs in discovery and event detail reads', async () => {
+    const server = await buildServer();
+    const services = createV2Services();
+    const event = makeEvent({
+      id: 'evt_legacy_local_poster',
+      organizationId: 'org_legacy_local_poster',
+      venueId: 'ven_legacy_local_poster',
+      title: 'Legacy poster event',
+      startAt: new Date(Date.now() + 7 * 86400 * 1000).toISOString(),
+    });
+    await services.repos().events.save({
+      ...event,
+      imageUrl: 'http://localhost:3001/poster.jpg',
+      status: 'published',
+      isPublic: true,
+      media: {
+        youtubeUrl: null,
+        gallery: [{ url: 'http://192.168.1.8/private.jpg', alt: 'private' }],
+        spotlights: [],
+      },
+    });
+
+    const discovery = await server.inject({ method: 'GET', url: '/discovery' });
+    expect(discovery.statusCode, discovery.body).toBe(200);
+    const discovered = discovery.json().items.find((item: { id: string }) => item.id === event.id);
+    expect(discovered).toMatchObject({ imageUrl: null, media: { gallery: [] } });
+    expect(JSON.stringify(discovered)).not.toMatch(/localhost|192\.168\.1\.8|blob:|data:/i);
+
+    const detail = await server.inject({ method: 'GET', url: `/events/${event.id}` });
+    expect(detail.statusCode, detail.body).toBe(200);
+    expect(detail.json().imageUrl).toBeNull();
+    expect(JSON.stringify(detail.json())).not.toMatch(/localhost|192\.168\.1\.8|blob:|data:/i);
+    await server.close();
+  });
+
+  it('preserves valid public HTTPS poster and gallery URLs', async () => {
+    const server = await buildServer();
+    const services = createV2Services();
+    const event = makeEvent({
+      id: 'evt_valid_public_poster',
+      organizationId: 'org_valid_public_poster',
+      venueId: 'ven_valid_public_poster',
+      title: 'Valid public poster event',
+      startAt: new Date(Date.now() + 7 * 86400 * 1000).toISOString(),
+      imageUrl: 'https://storage.googleapis.com/c1rcle-v2.firebasestorage.app/posters/public.jpg',
+    });
+    await services.repos().events.save({
+      ...event,
+      status: 'published',
+      isPublic: true,
+      media: {
+        youtubeUrl: 'https://youtu.be/abc123',
+        gallery: [
+          {
+            url: 'https://storage.googleapis.com/c1rcle-v2.firebasestorage.app/gallery/1.jpg',
+            alt: 'Stage',
+          },
+        ],
+        spotlights: [],
+      },
+    });
+
+    const detail = await server.inject({ method: 'GET', url: `/events/${event.id}` });
+    expect(detail.statusCode, detail.body).toBe(200);
+    expect(detail.json()).toMatchObject({
+      imageUrl: 'https://storage.googleapis.com/c1rcle-v2.firebasestorage.app/posters/public.jpg',
+      media: {
+        youtubeUrl: 'https://youtu.be/abc123',
+        gallery: [
+          { url: 'https://storage.googleapis.com/c1rcle-v2.firebasestorage.app/gallery/1.jpg' },
+        ],
+      },
+    });
+    await server.close();
+  });
+
+  it('exposes only public external-location details to guests', async () => {
+    const server = await buildServer();
+    const services = createV2Services();
+    const draft = makeEvent({
+      id: 'evt_external_public',
+      organizationId: 'org_external_public',
+      venueId: null,
+      externalLocation: {
+        name: 'Independent Hall',
+        address: '12 Example Road',
+        city: 'Pune',
+        mapUrl: 'https://maps.example.test/independent-hall',
+        contact: {
+          managerName: 'Private Manager',
+          phone: '+91 98765 43210',
+          email: 'private@example.test',
+        },
+        review: {
+          status: 'approved',
+          submittedAt: new Date().toISOString(),
+          reviewedAt: new Date().toISOString(),
+          reviewedBy: 'ops_1',
+          rejectionReason: null,
+        },
+      },
+      title: 'External public event',
+      startAt: new Date(Date.now() + 7 * 86400 * 1000).toISOString(),
+    });
+    await services.repos().events.save({ ...draft, status: 'published', isPublic: true });
+    const response = await server.inject({ method: 'GET', url: '/events/external-public-event' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().externalLocation).toMatchObject({
+      name: 'Independent Hall',
+      address: '12 Example Road',
+      city: 'Pune',
+    });
+    expect(JSON.stringify(response.json())).not.toContain('Private Manager');
+    expect(JSON.stringify(response.json())).not.toContain('+91 98765 43210');
+    expect(JSON.stringify(response.json())).not.toContain('private@example.test');
+    await server.close();
+  });
+
+  it('returns the same not-found response for private event detail without an event grant', async () => {
+    const server = await buildServer();
+    await seedPublishedEvent({
+      eventId: 'evt_private_no_grant_2',
+      slug: 'private-night-no-grant',
+      title: 'Private Night One',
+      organizationId: 'org_private_no_grant_2',
+      venueId: 'ven_private_no_grant_2',
+      visibilityMode: 'code',
+    });
+    const response = await server.inject({
+      method: 'GET',
+      url: '/events/private-night-no-grant',
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ code: 'not_found', status: 404 });
+    expect(response.headers['cache-control']).toContain('no-store');
+    await server.close();
+  });
+
+  it('hides private venue address by default and reveals it only under explicit after-grant policy', async () => {
+    const server = await buildServer();
+    const services = createV2Services();
+    const eventId = 'evt_private_address_policy';
+    const venueId = 'ven_private_address_policy';
+    const userId = 'guest_private_address_policy';
+    await seedPublishedEvent({
+      eventId,
+      slug: 'private-address-policy',
+      title: 'Private Address Policy',
+      organizationId: 'org_private_address_policy',
+      venueId,
+      visibilityMode: 'code',
+    });
+    const now = new Date();
+    const accessCode = createTicketAccessCode({
+      id: 'a'.repeat(64),
+      eventId,
+      organizationId: 'org_private_address_policy',
+      tierIds: [],
+      scope: 'event',
+      createdBy: 'host_admin',
+      startsAt: new Date(now.getTime() - 60_000).toISOString(),
+      expiresAt: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+      maxRedemptions: 1,
+      now,
+    });
+    await services.repos().ticketAccess.createCode(accessCode);
+    const redeemed = await services.repos().ticketAccess.redeem({
+      codeId: accessCode.id,
+      grantId: 'grant_private_address_policy',
+      userId,
+      now,
+    });
+    expect(redeemed).not.toBeNull();
+
+    const request = () =>
+      server.inject({
+        method: 'GET',
+        url: `/events/${eventId}`,
+        headers: {
+          'x-user-id': userId,
+          'x-ticket-access-grant-id': 'grant_private_address_policy',
+        },
+      });
+    const hidden = await request();
+    expect(hidden.statusCode).toBe(200);
+    expect(hidden.json().venue.address).toEqual({});
+    expect(hidden.json().imageUrl).toBeNull();
+    expect(hidden.headers['cache-control']).toContain('no-store');
+
+    const event = await services.repos().events.getById(eventId);
+    if (!event) throw new Error('seeded private event should exist');
+    await services.repos().events.save({
+      ...event,
+      addressDisclosure: 'after_grant',
+      imageUrl: null,
+      privateImageStoragePath: 'posters/org_private_address_policy/private-poster.webp',
+      version: event.version + 1,
+      updatedAt: new Date(now.getTime() + 1).toISOString(),
+    });
+    const revealed = await request();
+    expect(revealed.statusCode).toBe(200);
+    expect(revealed.json().imageUrl).toBe(null);
+    expect(revealed.json().venue.address).toMatchObject({
+      street: '1 Test Street',
+      zip: '411001',
+      lat: 18.5204,
+      lng: 73.8567,
+    });
+    await server.close();
+  });
+
+  it('keeps unlisted events out of discovery while serving their direct link', async () => {
+    await seedPublishedEvent({
+      eventId: 'evt_unlisted_1',
+      slug: 'unlisted-night-1',
+      title: 'Unlisted Night',
+      organizationId: 'org_unlisted_1',
+      venueId: 'ven_unlisted_1',
+      visibilityMode: 'unlisted',
+    });
+    const server = await buildServer();
+
+    const listing = await server.inject({ method: 'GET', url: '/events?limit=20' });
+    const detail = await server.inject({ method: 'GET', url: '/events/unlisted-night-1' });
+
+    expect(listing.statusCode).toBe(200);
+    expect(listing.json().items).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'evt_unlisted_1' })]),
+    );
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json()).toMatchObject({
+      id: 'evt_unlisted_1',
+      visibilityMode: 'unlisted',
+      isPublic: false,
+    });
+    await server.close();
+  });
+
+  it('requires a UUID click token on anonymous Promoter click tracking', async () => {
+    const server = await buildServer();
+    const response = await server.inject({
+      method: 'POST',
+      url: '/promoter-links/click',
+      payload: { eventSlug: 'unknown-event', code: 'M4CODE' },
+    });
+    expect(response.statusCode).toBe(422);
+    await server.close();
+  });
+
+  it('acknowledges an anonymous click without revealing whether its code exists', async () => {
+    const server = await buildServer();
+    await seedPublishedEvent({
+      eventId: 'evt_click_privacy',
+      slug: 'click-privacy-event',
+      title: 'Click Privacy Event',
+      organizationId: 'org_click_privacy',
+      venueId: 'ven_click_privacy',
+    });
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/promoter-links/click',
+      payload: {
+        eventSlug: 'click-privacy-event',
+        code: 'UNKNOWN',
+        clickId: '090d862e-85c0-46a6-9713-4504174f3d38',
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ accepted: true });
+    expect(typeof response.json().contextToken).toBe('string');
+    expect(response.json().contextToken.length).toBeGreaterThan(16);
     await server.close();
   });
 
@@ -177,6 +519,34 @@ describe('V2 public/discovery routes', () => {
     await server.close();
   });
 
+  it('serves public event detail, tiers, and add-ons when the strict actor resolver has no session', async () => {
+    const server = await buildServer();
+    await seedPublishedEvent({
+      eventId: 'evt_public_anonymous_reads',
+      slug: 'public-anonymous-reads',
+      title: 'Public Anonymous Reads',
+      organizationId: 'org_public_anonymous_reads',
+      venueId: 'ven_public_anonymous_reads',
+    });
+    const actorSpy = vi.spyOn(createV2Services(), 'actor').mockImplementation(() => {
+      throw new UnauthorizedError();
+    });
+
+    try {
+      for (const path of [
+        '/events/public-anonymous-reads',
+        '/events/public-anonymous-reads/tiers',
+        '/events/public-anonymous-reads/ticket-addons',
+      ]) {
+        const response = await server.inject({ method: 'GET', url: path });
+        expect(response.statusCode, path).toBe(200);
+      }
+    } finally {
+      actorSpy.mockRestore();
+      await server.close();
+    }
+  });
+
   it('fetches event detail by slug', async () => {
     const server = await buildServer();
     await seedPublishedEvent({
@@ -190,6 +560,76 @@ describe('V2 public/discovery routes', () => {
     const response = await server.inject({ method: 'GET', url: '/events/sky-night-3' });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ id: 'evt_pub_3', slug: 'sky-night-3' });
+    await server.close();
+  });
+
+  it('serves only the active add-on sell projection for a public event', async () => {
+    const server = await buildServer();
+    const eventId = 'evt_public_addons';
+    await seedPublishedEvent({
+      eventId,
+      slug: 'public-addons',
+      title: 'Public Add-ons',
+      organizationId: 'org_public_addons',
+      venueId: 'ven_public_addons',
+    });
+    const catalog = createV2Services().repos().catalog;
+    const active = createTicketAddon({
+      id: 'addon_public_parking',
+      eventId,
+      organizationId: 'org_public_addons',
+      name: 'Parking pass',
+      description: 'One vehicle',
+      kind: 'parking',
+      priceInPaise: 25_000,
+      quantity: 5,
+    });
+    await catalog.saveTicketAddon(active);
+    await catalog.saveTicketAddon(
+      createTicketAddon({
+        id: 'addon_paused',
+        eventId,
+        organizationId: 'org_public_addons',
+        name: 'Paused cloakroom',
+        kind: 'cloakroom',
+        priceInPaise: 1_000,
+        quantity: 5,
+        status: 'paused',
+      }),
+    );
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/events/${eventId}/ticket-addons`,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.headers['cache-control']).toContain('no-store');
+    expect(response.json().items).toEqual([
+      {
+        id: active.id,
+        eventId,
+        name: 'Parking pass',
+        description: 'One vehicle',
+        kind: 'parking',
+        priceInPaise: 25_000,
+        currency: 'INR',
+        availableQuantity: 5,
+        maxPerEntitlement: 1,
+      },
+    ]);
+    await seedPublishedEvent({
+      eventId: 'evt_private_addons',
+      slug: 'private-addons',
+      title: 'Private Add-ons',
+      organizationId: 'org_private_addons',
+      venueId: 'ven_private_addons',
+      visibilityMode: 'code',
+    });
+    const privateEvent = await server.inject({
+      method: 'GET',
+      url: '/events/private-addons/ticket-addons',
+    });
+    expect(privateEvent.statusCode).toBe(404);
     await server.close();
   });
 
@@ -493,6 +933,7 @@ describe('V2 public/discovery routes', () => {
 
     const response = await server.inject({ method: 'GET', url: '/discovery' });
     expect(response.statusCode).toBe(200);
+    expect(response.headers['cache-control']).toContain('no-store');
     const body = response.json();
     expect(Array.isArray(body.items)).toBe(true);
     expect(body.items.some((e: { id: string }) => e.id === 'evt_pub_6')).toBe(true);
@@ -514,6 +955,7 @@ describe('V2 public/discovery routes', () => {
       url: '/search?q=UniqueSearchableTitle',
     });
     expect(response.statusCode).toBe(200);
+    expect(response.headers['cache-control']).toContain('no-store');
     const body = response.json();
     expect(body.items.some((e: { id: string }) => e.id === 'evt_pub_7')).toBe(true);
     await server.close();

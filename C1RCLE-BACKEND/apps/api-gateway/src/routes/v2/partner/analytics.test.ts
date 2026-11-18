@@ -1,5 +1,19 @@
+import {
+  attachPaymentIntent,
+  calculatePricing,
+  createOrder,
+  createLedgerEntry,
+  createPostedJournal,
+  createTicketTier,
+  issueEntitlements,
+  markPaid,
+} from '@c1rcle/core/domain';
 import { describe, expect, it } from 'vitest';
 
+import type { MemoryAnalyticsReadModelRepository } from '@c1rcle/core/infrastructure/memory';
+
+import { createV2Services } from '../../../lib/v2-services.js';
+import { seedApprovedPartnerOrganization } from '../../../test-utils/approved-partner-organization.js';
 import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
 
 import partnerAnalyticsRoutes from './analytics.js';
@@ -14,8 +28,9 @@ import partnerVenueRoutes from './venues.js';
  */
 
 let keySeq = 0;
-const buildServer = () =>
+const buildServer = (cache = false) =>
   buildPartnerTestServer({
+    cache,
     routes: [
       partnerOrganizationRoutes,
       partnerVenueRoutes,
@@ -27,14 +42,13 @@ const buildServer = () =>
 type Server = Awaited<ReturnType<typeof buildServer>>;
 const read = (org: string) => ({ 'x-organization-id': org });
 
-async function seedOrganization(server: Server): Promise<string> {
-  const created = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: { 'x-organization-id': 'org_seed', 'idempotency-key': `seed-${++keySeq}` },
-    payload: { name: 'Skyline', slug: `skyline-${keySeq}` },
+async function seedOrganization(_server: Server): Promise<string> {
+  ++keySeq;
+  const created = await seedApprovedPartnerOrganization({
+    name: 'Skyline',
+    slug: `skyline-${keySeq}`,
   });
-  const id: string = created.json().id;
+  const id: string = created.id;
   return id;
 }
 
@@ -74,6 +88,234 @@ describe('organization analytics overview', () => {
     expect(response.statusCode).toBe(403);
     await server.close();
   });
+
+  it('refreshes cached published-event totals after the event is published', async () => {
+    const server = await buildServer(true);
+    server.addHook('onRequest', async (request) => {
+      request.actor = {
+        userId: String(request.headers['x-test-user'] ?? 'user_analytics'),
+        organizationId: String(request.headers['x-organization-id'] ?? ''),
+        role: 'owner',
+        capabilities: [],
+        platformRole: 'partner',
+      };
+    });
+    const org = await seedOrganization(server);
+    const venue = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/venues`,
+      headers: { ...read(org), 'idempotency-key': `venue-${++keySeq}` },
+      payload: { name: 'M3 Cache Venue', slug: `m3-cache-${keySeq}` },
+    });
+    expect(venue.statusCode).toBe(201);
+
+    const before = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/analytics/overview`,
+      headers: read(org),
+    });
+    expect(before.json()).toMatchObject({ totalEvents: 0, publishedEvents: 0 });
+    expect(before.headers['x-cache']).toBe('MISS');
+
+    const created = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/events`,
+      headers: { ...read(org), 'idempotency-key': `event-${++keySeq}` },
+      payload: {
+        title: 'M3 cache freshness event',
+        summary: 'Analytics cache acceptance event.',
+        description: 'A test event for publication and analytics cache invalidation.',
+        venueId: venue.json().id,
+        startAt: '2099-09-01T18:00:00Z',
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const eventId: string = created.json().id;
+
+    const afterCreate = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/analytics/overview`,
+      headers: read(org),
+    });
+    expect(afterCreate.json()).toMatchObject({ totalEvents: 1, publishedEvents: 0 });
+    expect(afterCreate.headers['x-cache']).toBe('MISS');
+
+    await server.inject({
+      method: 'POST',
+      url: `/events/${eventId}/review`,
+      headers: { ...read(org), 'idempotency-key': `review-${++keySeq}` },
+    });
+    const published = await server.inject({
+      method: 'POST',
+      url: `/events/${eventId}/publish`,
+      headers: { ...read(org), 'idempotency-key': `publish-${++keySeq}` },
+    });
+
+    expect(published.statusCode).toBe(200);
+
+    const afterPublish = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/analytics/overview`,
+      headers: read(org),
+    });
+    expect(afterPublish.json()).toMatchObject({ totalEvents: 1, publishedEvents: 1 });
+    expect(afterPublish.headers['x-cache']).toBe('MISS');
+    await server.close();
+  });
+});
+
+describe('organization analytics sales breakdown', () => {
+  it('returns ticket, RSVP, order and collection components from source records', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+    const venue = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/venues`,
+      headers: { ...read(org), 'idempotency-key': `venue-${++keySeq}` },
+      payload: { name: 'M3 Analytics Venue', slug: `m3-analytics-${keySeq}` },
+    });
+    const event = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/events`,
+      headers: { ...read(org), 'idempotency-key': `event-${++keySeq}` },
+      payload: {
+        title: 'M3 analytics breakdown',
+        venueId: venue.json().id,
+        startAt: '2099-09-01T18:00:00Z',
+      },
+    });
+    const eventId: string = event.json().id;
+    const paidTier = createTicketTier({
+      id: `tier_paid_${keySeq}`,
+      eventId,
+      organizationId: org,
+      name: 'Paid',
+      priceInPaise: 10_000,
+      quantity: 10,
+      now: new Date('2026-01-01T00:00:00Z'),
+    });
+    const rsvpTier = createTicketTier({
+      id: `tier_rsvp_${keySeq}`,
+      eventId,
+      organizationId: org,
+      name: 'RSVP',
+      accessType: 'RSVP',
+      quantity: 10,
+      now: new Date('2026-01-01T00:00:00Z'),
+    });
+    const repos = createV2Services().repos();
+    const now = new Date('2026-01-01T00:00:00Z');
+    let paidOrder = createOrder({
+      id: `ord_analytics_${keySeq}`,
+      eventId,
+      organizationId: org,
+      userId: `user_analytics_${keySeq}`,
+      contact: { name: 'M3 Analytics Guest', email: 'unused@example.test', phone: '' },
+      pricing: calculatePricing({ lines: [{ tier: paidTier, quantity: 2 }] }),
+      now,
+    });
+    await repos.orders.save(paidOrder);
+    paidOrder = attachPaymentIntent(paidOrder, `provider-order-${keySeq}`, now);
+    await repos.orders.save(paidOrder);
+    paidOrder = markPaid(paidOrder, `provider-payment-${keySeq}`, now);
+    await repos.orders.save(paidOrder);
+
+    const rsvpDraft = createOrder({
+      id: `RSVP-analytics-${keySeq}`,
+      eventId,
+      organizationId: org,
+      userId: `user_rsvp_${keySeq}`,
+      contact: { name: 'M3 RSVP Guest', email: '', phone: '' },
+      pricing: calculatePricing({ lines: [{ tier: rsvpTier, quantity: 1 }] }),
+      now,
+    });
+    const rsvpOrder = {
+      ...rsvpDraft,
+      status: 'paid' as const,
+      paymentIntentId: null,
+      paymentId: `rsvp-${keySeq}`,
+      paidAt: now.toISOString(),
+    };
+    await repos.orders.save(rsvpOrder);
+
+    for (const order of [paidOrder, rsvpOrder]) {
+      await Promise.all(
+        issueEntitlements({ order, now }).map((ticket) => repos.entitlements.save(ticket)),
+      );
+    }
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/analytics/sales-breakdown`,
+      headers: read(org),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      totalTicketsIssued: 3,
+      paidTickets: 2,
+      freeRsvpTickets: 1,
+      paidOrderCount: 1,
+      guestGrossCollectedPaise: paidOrder.grandTotalPaise,
+      ticketRevenuePaise: 20_000,
+    });
+
+    const trends = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/analytics/trends?from=2026-01-01&to=2026-01-02`,
+      headers: read(org),
+    });
+    expect(trends.statusCode).toBe(200);
+    expect(trends.json().totals).toMatchObject({
+      totalTicketsIssued: 3,
+      paidTickets: 2,
+      freeRsvpTickets: 1,
+      paidOrderCount: 1,
+      guestGrossCollectedPaise: paidOrder.grandTotalPaise,
+      ticketRevenuePaise: 20_000,
+    });
+    expect(trends.json().totals).toEqual(
+      Object.fromEntries(
+        Object.keys(trends.json().totals).map((key) => [
+          key,
+          trends
+            .json()
+            .buckets.reduce(
+              (sum: number, bucket: Record<string, number>) => sum + (bucket[key] ?? 0),
+              0,
+            ),
+        ]),
+      ),
+    );
+    await server.close();
+  });
+
+  it('returns zeroes for an empty organization and enforces tenant scope', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+    const response = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/analytics/sales-breakdown`,
+      headers: read(org),
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      totalTicketsIssued: 0,
+      paidTickets: 0,
+      freeRsvpTickets: 0,
+      paidOrderCount: 0,
+      guestGrossCollectedPaise: 0,
+      ticketRevenuePaise: 0,
+    });
+
+    const denied = await server.inject({
+      method: 'GET',
+      url: '/organizations/not_mine/analytics/sales-breakdown',
+      headers: read(org),
+    });
+    expect(denied.statusCode).toBe(403);
+    await server.close();
+  });
 });
 
 describe('event analytics', () => {
@@ -86,9 +328,15 @@ describe('event analytics', () => {
       url: '/events/evt_someone_else/analytics',
       headers: read(org),
     });
+    const heatmapResponse = await server.inject({
+      method: 'GET',
+      url: '/events/evt_someone_else/analytics/booking-heatmap',
+      headers: read(org),
+    });
 
     // Never confirms whether that event exists.
     expect(response.statusCode).toBe(404);
+    expect(heatmapResponse.statusCode).toBe(404);
     await server.close();
   });
 
@@ -100,7 +348,7 @@ describe('event analytics', () => {
       method: 'POST',
       url: `/organizations/${org}/venues`,
       headers: { ...read(org), 'idempotency-key': `venue-${++keySeq}` },
-      payload: { name: 'Sky Bar', slug: `sky-bar-${keySeq}` },
+      payload: { name: 'Sky Bar', slug: `sky-bar-${keySeq}`, capacity: 250 },
     });
     const event = await server.inject({
       method: 'POST',
@@ -113,6 +361,16 @@ describe('event analytics', () => {
       },
     });
     const eventId: string = event.json().id;
+    const tier = createTicketTier({
+      id: `tier_inventory_${keySeq}`,
+      eventId,
+      organizationId: org,
+      name: 'M3 inventory',
+      priceInPaise: 100,
+      quantity: 10,
+      now: new Date('2026-01-01T00:00:00Z'),
+    });
+    await createV2Services().repos().catalog.saveTier(tier);
 
     const response = await server.inject({
       method: 'GET',
@@ -123,7 +381,595 @@ describe('event analytics', () => {
     // The projection has not run, so the read model is absent — the service
     // falls back to a bounded compute-on-request instead of a fabricated 404.
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ eventId, totalRevenuePaise: 0, ticketsSold: 0 });
+    expect(response.json()).toMatchObject({
+      eventId,
+      totalRevenuePaise: 0,
+      ticketsSold: 0,
+      capacity: null,
+      totalTicketInventory: 10,
+      occupancyRate: null,
+      sellThroughRate: null,
+      noShowRate: null,
+    });
+    const heatmap = await server.inject({
+      method: 'GET',
+      url: `/events/${eventId}/analytics/booking-heatmap`,
+      headers: read(org),
+    });
+    expect(heatmap.statusCode).toBe(200);
+    expect(heatmap.json()).toMatchObject({
+      eventId,
+      timeZone: 'Asia/Kolkata',
+      totalBookings: 0,
+      complete: true,
+    });
+    expect(heatmap.json().weekdays).toHaveLength(7);
+    expect(
+      heatmap
+        .json()
+        .weekdays.every(
+          (day: { hours: number[] }) =>
+            day.hours.length === 24 && day.hours.every((count) => count === 0),
+        ),
+    ).toBe(true);
+    await server.close();
+  });
+
+  it('returns event-scoped Promoter metrics derived from captured attribution snapshots', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+    const venue = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/venues`,
+      headers: { ...read(org), 'idempotency-key': `venue-${++keySeq}` },
+      payload: { name: 'Sky Bar', slug: `sky-bar-${keySeq}`, capacity: 250 },
+    });
+    const event = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/events`,
+      headers: { ...read(org), 'idempotency-key': `event-${++keySeq}` },
+      payload: {
+        title: 'Sky Night',
+        venueId: venue.json().id,
+        startAt: '2026-09-01T18:00:00Z',
+      },
+    });
+    const eventId: string = event.json().id;
+    const now = new Date('2026-08-01T12:00:00.000Z');
+    const tier = createTicketTier({
+      id: `tier_promoter_metrics_${keySeq}`,
+      eventId,
+      organizationId: org,
+      name: 'General',
+      priceInPaise: 20_000,
+      quantity: 10,
+      now,
+    });
+    const order = {
+      ...createOrder({
+        id: `order_promoter_metrics_${keySeq}`,
+        eventId,
+        organizationId: org,
+        contact: { name: 'Guest', email: 'guest@example.test', phone: '5550100' },
+        pricing: calculatePricing({ lines: [{ tier, quantity: 2 }] }),
+        now,
+      }),
+      status: 'paid' as const,
+      attribution: {
+        referralLinkId: `link_${keySeq}`,
+        promoterId: 'org_promoter_metrics',
+        code: 'METRICS',
+        assignmentId: `assignment_${keySeq}`,
+        assignmentVersion: 1,
+        termsSnapshot: { version: 1, ratePercent: 10, flatPaise: 0 },
+        eligibleTierIds: null,
+        commissionPolicyVersion: 'commission-v1',
+        commercialPolicyVersion: 'commercial-v1',
+        attributedAt: now.toISOString(),
+        attributionSignature: 'test-signature',
+        promoterCommissionPaise: 4_000,
+      },
+    };
+    const repositories = createV2Services().repos();
+    await repositories.orders.save(order);
+    await repositories.ledger.createBatch([
+      createLedgerEntry({
+        id: `ledger_promoter_metrics_${keySeq}`,
+        organizationId: 'org_promoter_metrics',
+        orderId: order.id,
+        eventId,
+        entryType: 'promoter_commission',
+        amount: 3_000,
+        status: 'pending',
+        idempotencyKey: `promoter-metrics:${keySeq}`,
+        now,
+      }),
+    ]);
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/events/${eventId}/promoter-analytics`,
+      headers: read(org),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      eventId,
+      complete: true,
+      refundValueComplete: true,
+      historicalConversionCount: 1,
+      historicalRsvpConversionCount: 0,
+      activeRsvpCount: 0,
+      capturedTicketCount: 2,
+      attributedTicketCount: 2,
+      attributedTicketValuePaise: 40_000,
+      grossAttributedTicketValuePaise: 40_000,
+      refundedAttributedTicketValuePaise: 0,
+      netAttributedTicketValuePaise: 40_000,
+      recordedCommissionPaise: 4_000,
+      reversedCommissionPaise: null,
+      netAttributedValuePaise: 36_000,
+      commissionPayableBalancePaise: 3_000,
+      liabilityComplete: true,
+      liabilityReadModel: 'legacy_ledger_v1',
+      items: [
+        {
+          promoterOrganizationId: 'org_promoter_metrics',
+          attributedOrderCount: 1,
+          historicalRsvpConversionCount: 0,
+          activeRsvpCount: 0,
+          attributedTicketCount: 2,
+          attributedTicketValuePaise: 40_000,
+          grossAttributedTicketValuePaise: 40_000,
+          refundedAttributedTicketValuePaise: 0,
+          netAttributedTicketValuePaise: 40_000,
+          recordedCommissionPaise: 4_000,
+          reversedCommissionPaise: null,
+          netAttributedValuePaise: 36_000,
+          commissionPayableBalancePaise: 3_000,
+          liabilityComplete: true,
+          liabilityReadModel: 'legacy_ledger_v1',
+        },
+      ],
+    });
+    expect(response.json()).not.toHaveProperty('contact');
+    await server.close();
+  });
+
+  it('keeps cancelled RSVP acquisitions historical while reporting only active RSVPs', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+    const venue = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/venues`,
+      headers: { ...read(org), 'idempotency-key': `venue-${++keySeq}` },
+      payload: { name: 'Sky Bar', slug: `sky-bar-${keySeq}` },
+    });
+    const event = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/events`,
+      headers: { ...read(org), 'idempotency-key': `event-${++keySeq}` },
+      payload: {
+        title: 'RSVP Night',
+        venueId: venue.json().id,
+        startAt: '2026-12-01T18:00:00Z',
+      },
+    });
+    const eventId: string = event.json().id;
+    const now = new Date();
+    const tier = createTicketTier({
+      id: `tier_promoter_rsvp_${keySeq}`,
+      eventId,
+      organizationId: org,
+      name: 'RSVP',
+      accessType: 'RSVP',
+      quantity: 10,
+      now,
+    });
+    const repositories = createV2Services().repos();
+    for (const [id, status] of [
+      [`RSVP-cancelled-${keySeq}`, 'refunded'],
+      [`RSVP-active-${keySeq}`, 'paid'],
+    ] as const) {
+      const order = {
+        ...createOrder({
+          id,
+          eventId,
+          organizationId: org,
+          contact: { name: 'RSVP Guest', email: '', phone: '' },
+          pricing: calculatePricing({ lines: [{ tier, quantity: 1 }] }),
+          now,
+        }),
+        status,
+        attribution: {
+          referralLinkId: `link_${id}`,
+          promoterId: 'org_promoter_rsvp_metrics',
+          code: 'RSVP',
+          assignmentId: `assignment_${id}`,
+          assignmentVersion: 1,
+          termsSnapshot: { version: 1, ratePercent: 10, flatPaise: 0 },
+          eligibleTierIds: null,
+          commissionPolicyVersion: 'commission-v1',
+          commercialPolicyVersion: 'commercial-v1',
+          attributedAt: now.toISOString(),
+          attributionSignature: 'test-signature',
+          promoterCommissionPaise: 0,
+        },
+      };
+      await repositories.orders.save(order);
+    }
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/events/${eventId}/promoter-analytics`,
+      headers: read(org),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      historicalConversionCount: 2,
+      historicalRsvpConversionCount: 2,
+      activeRsvpCount: 1,
+      items: [
+        {
+          attributedOrderCount: 2,
+          historicalRsvpConversionCount: 2,
+          activeRsvpCount: 1,
+          attributedTicketCount: 2,
+        },
+      ],
+    });
+    await server.close();
+  });
+
+  it('reconciles journal-backed Promoter payable balance separately from captured attribution', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+    const venue = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/venues`,
+      headers: { ...read(org), 'idempotency-key': `venue-${++keySeq}` },
+      payload: { name: 'Sky Bar', slug: `sky-bar-${keySeq}`, capacity: 250 },
+    });
+    const event = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/events`,
+      headers: { ...read(org), 'idempotency-key': `event-${++keySeq}` },
+      payload: {
+        title: 'Sky Night',
+        venueId: venue.json().id,
+        startAt: '2026-09-01T18:00:00Z',
+      },
+    });
+    const eventId: string = event.json().id;
+    const now = new Date('2026-08-01T12:00:00.000Z');
+    const tier = createTicketTier({
+      id: `tier_promoter_journal_metrics_${keySeq}`,
+      eventId,
+      organizationId: org,
+      name: 'General',
+      priceInPaise: 20_000,
+      quantity: 10,
+      now,
+    });
+    const order = {
+      ...createOrder({
+        id: `order_promoter_journal_metrics_${keySeq}`,
+        eventId,
+        organizationId: org,
+        contact: { name: 'Guest', email: 'guest@example.test', phone: '5550100' },
+        pricing: calculatePricing({ lines: [{ tier, quantity: 2 }] }),
+        now,
+      }),
+      status: 'refunded' as const,
+      refundedPaise: 5_000,
+      attribution: {
+        referralLinkId: `link_${keySeq}`,
+        promoterId: 'org_promoter_journal_metrics',
+        code: 'JOURNAL',
+        assignmentId: `assignment_${keySeq}`,
+        assignmentVersion: 1,
+        termsSnapshot: { version: 1, ratePercent: 10, flatPaise: 0 },
+        eligibleTierIds: null,
+        commissionPolicyVersion: 'commission-v1',
+        commercialPolicyVersion: 'commercial-v1',
+        attributedAt: now.toISOString(),
+        attributionSignature: 'test-signature',
+        promoterCommissionPaise: 4_000,
+      },
+    };
+    const repositories = createV2Services().repos();
+    await repositories.orders.save(order);
+    const promoterOrganizationId = 'org_promoter_journal_metrics';
+    const journalSource = {
+      type: 'online_payment_capture' as const,
+      id: order.id,
+      orderId: order.id,
+      paymentId: null,
+      eventId,
+    };
+    const policy = {
+      version: 'analytics-test-v1',
+      capturedAt: now.toISOString(),
+      settlementDelayDays: 0,
+      reserveBasisPoints: 0,
+      requiresEventCompletion: false,
+      holdsOnCancellation: false,
+      holdsOnDispute: false,
+      holdsOnUnresolvedReconciliation: false,
+    };
+    await repositories.financialJournals.postBatch([
+      createPostedJournal({
+        organizationId: promoterOrganizationId,
+        currency: 'INR',
+        lines: [
+          {
+            account: 'ticket_collection_control',
+            side: 'debit',
+            amountPaise: 5_000,
+            organizationId: null,
+            component: 'netTicketRevenuePaise',
+            memo: 'test refunded ticket value',
+          },
+          {
+            account: 'customer_refund_liability',
+            side: 'credit',
+            amountPaise: 5_000,
+            organizationId: org,
+            component: 'refundPaise',
+            memo: 'test customer refund',
+          },
+        ],
+        source: {
+          ...journalSource,
+          type: 'refund',
+          id: `refund_${keySeq}`,
+        },
+        idempotencyKey: `m2:refund:${keySeq}:recognition`,
+        accountingPolicy: policy,
+        postedAt: now,
+      }),
+      createPostedJournal({
+        organizationId: promoterOrganizationId,
+        currency: 'INR',
+        lines: [
+          {
+            account: 'ticket_collection_control',
+            side: 'debit',
+            amountPaise: 3_000,
+            organizationId: null,
+            component: null,
+            memo: 'test commission posting',
+          },
+          {
+            account: 'promoter_payable',
+            side: 'credit',
+            amountPaise: 3_000,
+            organizationId: promoterOrganizationId,
+            component: 'promoterAllocationPaise',
+            memo: 'test commission payable',
+          },
+        ],
+        source: journalSource,
+        idempotencyKey: `analytics-journal-posting:${keySeq}`,
+        accountingPolicy: policy,
+        postedAt: now,
+      }),
+      createPostedJournal({
+        organizationId: promoterOrganizationId,
+        currency: 'INR',
+        lines: [
+          {
+            account: 'promoter_payable',
+            side: 'debit',
+            amountPaise: 1_000,
+            organizationId: promoterOrganizationId,
+            component: 'promoterAllocationPaise',
+            memo: 'test commission reversal',
+          },
+          {
+            account: 'ticket_collection_control',
+            side: 'credit',
+            amountPaise: 1_000,
+            organizationId: org,
+            component: 'refundPaise',
+            memo: 'test refund commission counterpart',
+          },
+        ],
+        source: {
+          ...journalSource,
+          type: 'refund',
+          id: `refund_${keySeq}`,
+        },
+        idempotencyKey: `m2:refund:${keySeq}:payable-reversal`,
+        accountingPolicy: policy,
+        postedAt: now,
+      }),
+    ]);
+
+    const transition = await repositories.journalTransition.get();
+    await repositories.journalTransition.save({
+      ...transition,
+      phase: 'journal_reads',
+      readModel: 'financial_journal_v2',
+      version: transition.version + 1,
+    });
+    let response;
+    try {
+      response = await server.inject({
+        method: 'GET',
+        url: `/events/${eventId}/promoter-analytics`,
+        headers: read(org),
+      });
+    } finally {
+      const currentTransition = await repositories.journalTransition.get();
+      await repositories.journalTransition.save({
+        ...currentTransition,
+        phase: 'legacy_reads',
+        readModel: 'legacy_ledger_v1',
+        version: currentTransition.version + 1,
+      });
+    }
+
+    expect(response?.statusCode).toBe(200);
+    expect(response?.json()).toMatchObject({
+      eventId,
+      complete: true,
+      refundValueComplete: true,
+      historicalConversionCount: 1,
+      historicalRsvpConversionCount: 0,
+      activeRsvpCount: 0,
+      capturedTicketCount: 2,
+      attributedTicketCount: 2,
+      attributedTicketValuePaise: 40_000,
+      grossAttributedTicketValuePaise: 40_000,
+      refundedAttributedTicketValuePaise: 5_000,
+      netAttributedTicketValuePaise: 35_000,
+      recordedCommissionPaise: 4_000,
+      reversedCommissionPaise: 1_000,
+      netAttributedValuePaise: 36_000,
+      commissionPayableBalancePaise: 2_000,
+      liabilityComplete: true,
+      liabilityReadModel: 'financial_journal_v2',
+      items: [
+        {
+          promoterOrganizationId,
+          reversedCommissionPaise: 1_000,
+          grossAttributedTicketValuePaise: 40_000,
+          refundedAttributedTicketValuePaise: 5_000,
+          netAttributedTicketValuePaise: 35_000,
+          recordedCommissionPaise: 4_000,
+          commissionPayableBalancePaise: 2_000,
+          liabilityReadModel: 'financial_journal_v2',
+        },
+      ],
+    });
+    await server.close();
+  });
+
+  it('does not count unscanned tickets as no-shows before an event ends', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+    const venue = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/venues`,
+      headers: { ...read(org), 'idempotency-key': `venue-${++keySeq}` },
+      payload: { name: 'Sky Bar', slug: `sky-bar-${keySeq}` },
+    });
+    const event = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/events`,
+      headers: { ...read(org), 'idempotency-key': `event-${++keySeq}` },
+      payload: {
+        title: 'Future night',
+        venueId: venue.json().id,
+        startAt: '2099-09-01T18:00:00Z',
+      },
+    });
+    const eventId: string = event.json().id;
+    const tier = createTicketTier({
+      id: `tier_${keySeq}`,
+      eventId,
+      organizationId: org,
+      name: 'General',
+      priceInPaise: 10_000,
+      quantity: 10,
+      now: new Date('2026-01-01T00:00:00Z'),
+    });
+    const pricing = calculatePricing({ lines: [{ tier, quantity: 1 }] });
+    const services = createV2Services();
+    let order = createOrder({
+      id: `ord_future_${keySeq}`,
+      eventId,
+      organizationId: org,
+      userId: `user_future_${keySeq}`,
+      contact: { name: 'Test Guest', email: 'guest@example.test', phone: '' },
+      pricing,
+      now: new Date('2026-01-01T00:00:00Z'),
+    });
+    await services.repos().orders.save(order);
+    order = attachPaymentIntent(
+      order,
+      `order_provider_${keySeq}`,
+      new Date('2026-01-01T00:00:00Z'),
+    );
+    await services.repos().orders.save(order);
+    order = markPaid(order, `pay_future_${keySeq}`, new Date('2026-01-01T00:00:00Z'));
+    await services.repos().orders.save(order);
+    await Promise.all(
+      issueEntitlements({ order, now: new Date('2026-01-01T00:00:00Z') }).map((entitlement) =>
+        services.repos().entitlements.save(entitlement),
+      ),
+    );
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/events/${eventId}/analytics`,
+      headers: read(org),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ ticketsSold: 1, totalCheckIns: 0, noShowRate: null });
+    await server.close();
+  });
+
+  it('recomputes source-backed metrics instead of trusting a stale read model', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+    const venue = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/venues`,
+      headers: { ...read(org), 'idempotency-key': `venue-${++keySeq}` },
+      payload: { name: 'Unconfigured venue', slug: `unconfigured-${keySeq}` },
+    });
+    const event = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/events`,
+      headers: { ...read(org), 'idempotency-key': `event-${++keySeq}` },
+      payload: {
+        title: 'Future event with old projection',
+        venueId: venue.json().id,
+        startAt: '2099-09-01T18:00:00Z',
+      },
+    });
+    const eventId: string = event.json().id;
+    const analytics = createV2Services().repos().analytics as MemoryAnalyticsReadModelRepository;
+    analytics.eventAnalytics.set(eventId, {
+      eventId,
+      totalRevenuePaise: 0,
+      ticketsSold: 0,
+      totalCheckIns: 0,
+      totalTicketInventory: 0,
+      capacity: 0,
+      views: 17,
+      guestlistSignups: 3,
+      avgTicketPricePaise: 0,
+      occupancyRate: 0,
+      sellThroughRate: 0,
+      refundAmountPaise: 0,
+      refundRate: 0,
+      noShowRate: 1,
+      repeatGuests: 0,
+      conversionRate: 0.25,
+    });
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/events/${eventId}/analytics`,
+      headers: read(org),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      eventId,
+      capacity: null,
+      occupancyRate: null,
+      sellThroughRate: null,
+      noShowRate: null,
+      views: 17,
+      guestlistSignups: 3,
+      conversionRate: 0.25,
+    });
     await server.close();
   });
 });
@@ -167,7 +1013,17 @@ describe('GET /organizations/:organizationId/analytics/trends', () => {
       '2026-09-07',
     ]);
     expect(body.buckets.every((b: { tickets: number }) => b.tickets === 0)).toBe(true);
-    expect(body.totals).toEqual({ revenuePaise: 0, tickets: 0, checkIns: 0 });
+    expect(body.totals).toEqual({
+      revenuePaise: 0,
+      tickets: 0,
+      checkIns: 0,
+      totalTicketsIssued: 0,
+      paidTickets: 0,
+      freeRsvpTickets: 0,
+      paidOrderCount: 0,
+      guestGrossCollectedPaise: 0,
+      ticketRevenuePaise: 0,
+    });
     await server.close();
   });
 

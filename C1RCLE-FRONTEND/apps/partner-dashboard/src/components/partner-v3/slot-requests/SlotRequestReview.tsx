@@ -1,3 +1,5 @@
+import { useState } from 'react';
+
 import {
   CalendarIcon,
   CloseIcon,
@@ -10,8 +12,10 @@ import {
 import { Button } from '@/components/partner-v3/Button';
 import { EventPoster } from '@/components/partner-v3/events/EventPoster';
 
+import { slotRequestArtwork } from './slot-request-artwork';
 import styles from './slot-requests.module.css';
 import { SlotRequestStatusBadge } from './SlotRequestStatusBadge';
+import { VenueBookingCancellation } from './VenueBookingCancellation';
 
 import type { SlotRequest, SlotRequestActionKind } from '@/data/partner-data-source';
 
@@ -23,11 +27,13 @@ export interface SlotRequestReviewProps {
   readonly panel: ReviewPanel;
   readonly previewMode: PreviewMode;
   readonly busy?: boolean;
+  readonly busyAction?: SlotRequestActionKind | null;
   readonly actionError?: string | null;
   readonly onPanelChange: (panel: ReviewPanel) => void;
   readonly onPreviewModeChange: (mode: PreviewMode) => void;
   readonly onClose: () => void;
-  readonly onAction?: (id: string, kind: SlotRequestActionKind) => void;
+  readonly onBookingCancelled?: () => void;
+  readonly onAction?: (id: string, kind: SlotRequestActionKind, reason?: string) => void;
 }
 
 export function SlotRequestReview({
@@ -35,14 +41,23 @@ export function SlotRequestReview({
   panel,
   previewMode,
   busy,
+  busyAction,
   actionError,
   onPanelChange,
   onPreviewModeChange,
   onClose,
   onAction,
+  onBookingCancelled,
 }: SlotRequestReviewProps) {
+  const [rejectionOpen, setRejectionOpen] = useState(false);
+  const [rejectionReason, setRejectionReason] = useState('');
   const isIncoming = request.direction === 'incoming';
   const canDecide = isIncoming && request.status === 'pending';
+  const canRetryPublish =
+    isIncoming &&
+    request.status === 'approved' &&
+    request.hasEventDraft === true &&
+    request.linkedEventStatus !== 'published';
   const canCancel = !isIncoming && request.status === 'approved';
   return (
     <div className={styles['reviewRoot']} role="presentation">
@@ -60,17 +75,7 @@ export function SlotRequestReview({
       >
         <header className={styles['reviewHeader']}>
           <div className={styles['reviewArtwork']}>
-            <EventPoster
-              artwork={{
-                type: 'gradient',
-                value: request.id.includes('retro')
-                  ? 'mystery'
-                  : request.id.includes('sunday')
-                    ? 'sunset'
-                    : 'eclipse',
-              }}
-              sizes="88px"
-            />
+            <EventPoster artwork={slotRequestArtwork(request)} sizes="88px" />
           </div>
           <div className={styles['reviewIdentity']}>
             <SlotRequestStatusBadge status={request.status} />
@@ -121,27 +126,48 @@ export function SlotRequestReview({
             />
           )}
         </div>
+        {!isIncoming && request.status === 'rejected' && request.rejectionReason ? (
+          <p className={styles['actionError']}>Venue response: {request.rejectionReason}</p>
+        ) : null}
+        {isIncoming && request.status === 'approved' ? (
+          <VenueBookingCancellation
+            requestId={request.id}
+            {...(onBookingCancelled ? { onCancelled: onBookingCancelled } : {})}
+          />
+        ) : null}
         <footer className={styles['reviewFooter']}>
           <Button type="button" variant="secondary" onClick={onClose}>
             Close
           </Button>
-          {canDecide ? (
+          {canDecide || canRetryPublish ? (
             <>
-              <Button
-                type="button"
-                variant="secondary"
-                disabled={busy}
-                onClick={() => onAction?.(request.id, 'reject')}
-              >
-                Decline
-              </Button>
+              {canDecide ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={busy}
+                  onClick={() => {
+                    setRejectionOpen(true);
+                  }}
+                >
+                  Decline
+                </Button>
+              ) : null}
               <Button
                 type="button"
                 variant="primary"
                 disabled={busy}
-                onClick={() => onAction?.(request.id, 'accept')}
+                onClick={() => {
+                  onAction?.(request.id, 'accept');
+                }}
               >
-                Accept
+                {busy && busyAction === 'accept'
+                  ? canRetryPublish
+                    ? 'Publishing…'
+                    : 'Accepting…'
+                  : canRetryPublish
+                    ? 'Retry publish'
+                    : 'Accept'}
               </Button>
             </>
           ) : null}
@@ -150,12 +176,45 @@ export function SlotRequestReview({
               type="button"
               variant="secondary"
               disabled={busy}
-              onClick={() => onAction?.(request.id, 'cancel')}
+              onClick={() => {
+                onAction?.(request.id, 'cancel');
+              }}
             >
               Cancel request
             </Button>
           ) : null}
         </footer>
+        {rejectionOpen && canDecide ? (
+          <form
+            className={styles['rejectionForm']}
+            onSubmit={(event) => {
+              event.preventDefault();
+              const reason = rejectionReason.trim();
+              if (reason.length > 0 && reason.length <= 1000) {
+                onAction?.(request.id, 'reject', reason);
+              }
+            }}
+          >
+            <label htmlFor="slot-request-rejection-reason">Reason for declining</label>
+            <textarea
+              id="slot-request-rejection-reason"
+              value={rejectionReason}
+              maxLength={1000}
+              required
+              disabled={busy}
+              onChange={(event) => {
+                setRejectionReason(event.target.value);
+              }}
+            />
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={busy ? true : rejectionReason.trim().length === 0}
+            >
+              {busy && busyAction === 'reject' ? 'Declining…' : 'Confirm decline'}
+            </Button>
+          </form>
+        ) : null}
         {actionError ? (
           <p className={styles['actionError']} role="alert">
             {actionError}
@@ -291,14 +350,7 @@ function LivePreview({
         </div>
         <EventPoster
           className={styles['previewPoster']}
-          artwork={{
-            type: 'gradient',
-            value: request.id.includes('retro')
-              ? 'mystery'
-              : request.id.includes('sunday')
-                ? 'sunset'
-                : 'eclipse',
-          }}
+          artwork={slotRequestArtwork(request)}
           sizes="400px"
         />
         <div className={styles['previewCopy']}>

@@ -3,7 +3,9 @@
 import { useRouter } from 'next/navigation';
 import { useEffect, type ReactNode } from 'react';
 
-import { logout, markAnonymous, markHydrated, refresh, setSession } from '@c1rcle/auth';
+import { hydrateSession, logout, markAnonymous, markHydrated, setSession } from '@c1rcle/auth';
+
+import { OnboardingGuard } from '@/features/onboarding/OnboardingGuard';
 
 import type { getServerSession } from '@c1rcle/auth/server-session';
 
@@ -20,9 +22,9 @@ export interface SessionProviderProps {
 }
 
 /**
- * Thin session bootstrap provider. Hydrates the in-memory session store from
- * the server bootstrap, obtains a fresh access token, and runs the idle
- * timeout + focus-refresh. Everything else reads `useSession()` directly.
+ * Thin session bootstrap provider. Hydrates the in-memory user/expiry state
+ * from the server bootstrap, confirms the cookie session through the BFF, and
+ * runs the idle timeout + focus-refresh. Everything else reads `useSession()`.
  */
 export function SessionProvider({ initialUser, children }: SessionProviderProps) {
   const router = useRouter();
@@ -30,13 +32,12 @@ export function SessionProvider({ initialUser, children }: SessionProviderProps)
   useEffect(() => {
     if (initialUser !== null) {
       /*
-       * The server bootstrap only proves an httpOnly session exists — the
-       * access token is not readable server-side, so it starts null and one
-       * refresh is performed to obtain it (the BFF exchanges the refresh
-       * cookie same-origin).
+       * The server bootstrap only proves an httpOnly session exists. The BFF
+       * establishes this app's namespaced CSRF cookie and confirms the cookie
+       * session; the Gateway bearer token stays server-side.
        */
       setSession(initialUser, null, 0);
-      void refresh().then((recovered) => {
+      void hydrateSession().then((recovered) => {
         if (!recovered) {
           markAnonymous();
         }
@@ -79,5 +80,5 @@ export function SessionProvider({ initialUser, children }: SessionProviderProps)
     };
   }, [router]);
 
-  return <>{children}</>;
+  return <OnboardingGuard>{children}</OnboardingGuard>;
 }

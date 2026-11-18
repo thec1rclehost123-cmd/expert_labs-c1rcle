@@ -9,6 +9,8 @@ export function EventFilterBar({
   status,
   party,
   partyLabel = 'Event ownership',
+  showAllPartyFilter = false,
+  showDrafts = true,
   showViewToggle = true,
   view,
   counts,
@@ -18,14 +20,16 @@ export function EventFilterBar({
   onViewChange,
 }: {
   readonly query: string;
-  readonly status: 'all' | 'Live' | 'Draft';
+  readonly status: 'all' | 'Live' | 'Draft' | 'Completed';
   readonly party: PartnerEventParty;
   readonly partyLabel?: string;
+  readonly showAllPartyFilter?: boolean;
+  readonly showDrafts?: boolean;
   readonly showViewToggle?: boolean;
   readonly view: 'list' | 'grid';
-  readonly counts: Readonly<{ all: number; live: number; drafts: number }>;
+  readonly counts: Readonly<{ all: number; live: number; drafts: number; completed: number }>;
   readonly onQueryChange: (value: string) => void;
-  readonly onStatusChange: (value: 'all' | 'Live' | 'Draft') => void;
+  readonly onStatusChange: (value: 'all' | 'Live' | 'Draft' | 'Completed') => void;
   readonly onPartyChange: (value: PartnerEventParty) => void;
   readonly onViewChange: (value: 'list' | 'grid') => void;
 }) {
@@ -51,29 +55,43 @@ export function EventFilterBar({
               ['all', 'All', counts.all],
               ['Live', 'Live', counts.live],
               ['Draft', 'Drafts', counts.drafts],
+              ['Completed', 'Completed', counts.completed],
             ] as const
-          ).map(([value, label]) => (
-            <button
-              key={value}
-              type="button"
-              aria-pressed={status === value}
-              onClick={() => {
-                onStatusChange(value);
-              }}
-            >
-              {label}
-              <span className={styles['filterCount']}>
-                {value === 'all' ? counts.all : value === 'Live' ? counts.live : counts.drafts}
-              </span>
-            </button>
-          ))}
+          )
+            .filter(([value]) => value !== 'Draft' || showDrafts)
+            .map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                aria-pressed={status === value}
+                onClick={() => {
+                  onStatusChange(value);
+                }}
+              >
+                {label}
+                <span className={styles['filterCount']}>
+                  {value === 'all'
+                    ? counts.all
+                    : value === 'Live'
+                      ? counts.live
+                      : value === 'Draft'
+                        ? counts.drafts
+                        : counts.completed}
+                </span>
+              </button>
+            ))}
         </div>
         <div className={styles['controlGroup']} aria-label={partyLabel}>
-          {(
-            [
-              ['hosts', 'Hosts'],
-              ['venue', 'Venue'],
-            ] as const
+          {(showAllPartyFilter
+            ? ([
+                ['all', 'All'],
+                ['hosts', 'Hosts'],
+                ['venue', 'Venue'],
+              ] as const)
+            : ([
+                ['hosts', 'Hosts'],
+                ['venue', 'Venue'],
+              ] as const)
           ).map(([value, label]) => (
             <button
               key={value}

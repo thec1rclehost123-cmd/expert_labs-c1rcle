@@ -1,9 +1,11 @@
+import { currentPromoterAgreement } from '../../config/index.js';
 import {
   ForbiddenError,
   InvalidOperationError,
   NotFoundError,
   OnboardingRequestNotFoundError,
 } from '../../domain/errors.js';
+import { domainEvent } from '../../domain/events.js';
 import {
   addOnboardingDocument,
   allRequiredDocumentsVerified,
@@ -22,7 +24,9 @@ import {
   verifyOnboardingDocument,
 } from '../../domain/models/onboarding.js';
 import { createOrganization } from '../../domain/models/organization.js';
+import { recordPromoterAgreementAcceptance } from '../../domain/models/promoter-agreement.js';
 import { createVenue } from '../../domain/models/venue.js';
+import { createGuestProfileService } from '../guest-profile/guest-profile-service.js';
 
 import type { EntityId } from '../../domain/identity.js';
 import type { PlatformAdmin } from '../../domain/models/admin-authority.js';
@@ -126,6 +130,20 @@ export class OnboardingService {
    * would leave admins deciding which of two drafts is real.
    */
   async start(userId: EntityId, command: StartApplicationCommand): Promise<OnboardingRequest> {
+    const account = await this.deps.repositories.users.getById(userId);
+    if (!account?.emailVerified) {
+      throw new InvalidOperationError('Verify your email before starting partner onboarding');
+    }
+    const contactProfile = await this.deps.repositories.guestProfiles.getByUserId(userId);
+    if (!contactProfile?.phoneVerifiedAt || !contactProfile.phoneNumber) {
+      throw new InvalidOperationError('Verify your phone before starting partner onboarding');
+    }
+    if (
+      !command.profile.phone ||
+      normalizePhone(contactProfile.phoneNumber) !== normalizePhone(command.profile.phone)
+    ) {
+      throw new InvalidOperationError('Use the phone number verified for this account');
+    }
     const open = await this.repo.findOpenForUser(userId);
     if (open) {
       throw new InvalidOperationError('You already have an onboarding application in progress');
@@ -147,12 +165,53 @@ export class OnboardingService {
   }
 
   /** The applicant's own application, if any. `null` rather than a 404. */
-  async getMine(userId: EntityId): Promise<OnboardingRequest | null> {
-    return this.repo.findOpenForUser(userId);
+  async getMine(
+    userId: EntityId,
+    requestedType?: OnboardingRequest['requestedType'],
+  ): Promise<OnboardingRequest | null> {
+    if (requestedType) return this.repo.findForUserAndType(userId, requestedType);
+    const open = await this.repo.findOpenForUser(userId);
+    if (open) return open;
+    const latest = await this.repo.listForUser(userId, { limit: 1, cursor: null });
+    return latest.items[0] ?? null;
   }
 
   async listMine(userId: EntityId, query: PaginationQuery) {
     return this.repo.listForUser(userId, query);
+  }
+
+  getCurrentPromoterAgreement() {
+    return currentPromoterAgreement(this.deps.config);
+  }
+
+  async acceptPromoterAgreement(
+    userId: EntityId,
+    requestId: EntityId,
+    version: string,
+  ): Promise<OnboardingRequest> {
+    const artifact = this.getCurrentPromoterAgreement();
+    if (!artifact) {
+      throw new InvalidOperationError(
+        'No approved Promoter agreement is available; campaign activation remains blocked',
+      );
+    }
+    if (artifact.version !== version) {
+      throw new InvalidOperationError('The Promoter agreement version is no longer current');
+    }
+    const request = await this.requireOwn(userId, requestId);
+    const updated = recordPromoterAgreementAcceptance(
+      request,
+      artifact,
+      userId,
+      this.deps.config.clock.now(),
+      this.testAgreementFixtureAllowed(),
+    );
+    if (updated !== request) await this.repo.save(updated);
+    return updated;
+  }
+
+  private testAgreementFixtureAllowed(): boolean {
+    return this.deps.config.features.m4PromoterAgreementFixture === true;
   }
 
   /** Autosave. Everything that is not a profile field is dropped, not merged. */
@@ -187,20 +246,21 @@ export class OnboardingService {
   ): Promise<UploadUrlGrant> {
     const request = await this.requireOwn(userId, command.requestId);
 
+    if (request.status !== 'draft' && request.status !== 'changes_requested') {
+      throw new InvalidOperationError(
+        'Documents can only be uploaded while editing an application',
+      );
+    }
+
     // Validated against both entity-type label sets, not just this applicant's:
     // `entityType` can still change while the request is a draft, and minting
     // an upload URL has no side effect worth gating more tightly than "is this
     // a real KYC label". Business applicants need the registration/signatory set.
-    if (!ALL_DOCUMENT_LABELS.includes(command.label)) {
-      throw new InvalidOperationError(
-        `Unknown document label — expected one of ${ALL_DOCUMENT_LABELS.join(', ')}`,
-      );
-    }
+    const key = kycObjectKey(request, command.label);
     if (!ALLOWED_UPLOAD_CONTENT_TYPES.includes(command.contentType)) {
       throw new InvalidOperationError('Document must be a JPEG, PNG, or WebP image');
     }
 
-    const key = `kyc/${userId}/${request.id}/${command.label}`;
     const expiresAt = this.deps.config.clock.now().getTime() + UPLOAD_URL_TTL_MS;
     const grant = await this.deps.objectStorage.issueUploadUrl({
       key,
@@ -218,6 +278,7 @@ export class OnboardingService {
 
   async addDocument(userId: EntityId, command: AddDocumentCommand): Promise<OnboardingRequest> {
     const request = await this.requireOwn(userId, command.requestId);
+    assertKycObjectPath(request, command.label, command.storagePath);
     const updated = addOnboardingDocument(
       request,
       {
@@ -232,8 +293,24 @@ export class OnboardingService {
 
   async submit(userId: EntityId, requestId: EntityId): Promise<OnboardingRequest> {
     const request = await this.requireOwn(userId, requestId);
-    const submitted = submitOnboardingRequest(request, this.deps.config.clock.now());
+    const now = this.deps.config.clock.now();
+    const submitted = submitOnboardingRequest(request, now);
     await this.repo.save(submitted);
+    {
+      await this.deps.outbox.append(
+        domainEvent({
+          id: this.deps.config.ids(),
+          type: 'promoter.onboarding.submitted',
+          aggregateId: request.id,
+          // Before approval, the applicant is the only available owner scope.
+          organizationId: request.userId,
+          actorId: userId,
+          payload: { requestId: request.id },
+          occurredAt: now.getTime(),
+        }),
+      );
+    }
+    await this.enqueueApplicantEmail(submitted, 'submitted', userId, now);
     this.deps.logger.info('onboarding.submitted', { requestId });
     return submitted;
   }
@@ -255,6 +332,9 @@ export class OnboardingService {
     userId: EntityId,
     command: VerifyDocumentCommand,
   ): Promise<VerificationResult> {
+    if (command.documentType === 'phone') {
+      throw new InvalidOperationError('Use the phone verification flow for phone numbers');
+    }
     const now = this.deps.config.clock.now();
     const since = now.getTime() - VERIFICATION_WINDOW_MS;
     const attempts = await this.deps.repositories.verificationAttempts.countSince(userId, since);
@@ -278,6 +358,31 @@ export class OnboardingService {
       result.provider,
     );
     return result;
+  }
+
+  async verifyPhone(
+    userId: EntityId,
+    phoneNumber: string,
+    idToken: string,
+  ): Promise<VerificationResult> {
+    const now = this.deps.config.clock.now();
+    const since = now.getTime() - VERIFICATION_WINDOW_MS;
+    const attempts = await this.deps.repositories.verificationAttempts.countSince(userId, since);
+    if (attempts >= VERIFICATION_ATTEMPT_LIMIT) {
+      throw new ForbiddenError('Too many verification attempts — try again tomorrow');
+    }
+
+    try {
+      await createGuestProfileService({
+        guestProfiles: this.deps.repositories.guestProfiles,
+        config: this.deps.config,
+      }).verifyPhone(userId, phoneNumber, idToken, this.deps.verification);
+    } catch (error) {
+      await this.recordAttempt(userId, 'phone', 'error', this.deps.verification.name);
+      throw error;
+    }
+    await this.recordAttempt(userId, 'phone', 'passed', 'firebase-phone');
+    return { passed: true, provider: 'firebase-phone', reason: 'phone_verified' };
   }
 
   private async recordAttempt(
@@ -311,10 +416,8 @@ export class OnboardingService {
   /**
    * Mints a short-lived signed GET URL so an admin can actually view an
    * uploaded KYC image before deciding on the application — v1 had this
-   * (`kyc/[uid]/route.js`'s signed-URL helper, prefix-allowlisted since it
-   * took an arbitrary key); v2 doesn't need a separate allowlist because the
-   * key is derived from a document already attached to a request this
-   * method loaded, never from caller input.
+   * (`kyc/[uid]/route.js`'s signed-URL helper). Revalidate persisted paths
+   * before signing, including records attached before ownership validation.
    *
    * Any admin may view (matches v1's broader view-vs-decide role split —
    * approval itself stays ONBOARDING_APPROVE/TIER2, viewing isn't a decision).
@@ -328,6 +431,7 @@ export class OnboardingService {
     const request = await this.requireRequest(requestId);
     const document = request.documents.find((doc) => doc.label === label);
     if (!document) throw new NotFoundError('onboarding_document', label);
+    assertKycObjectPath(request, document.label, document.storagePath);
 
     const expiresAt = this.deps.config.clock.now().getTime() + READ_URL_TTL_MS;
     const grant = await this.deps.objectStorage.issueReadUrl({
@@ -408,10 +512,9 @@ export class OnboardingService {
   /**
    * Approves an application and provisions the organization it asked for.
    *
-   * The two writes are ordered organization-first: a failure after the
-   * organization exists leaves the request still `submitted`, which an admin
-   * can retry — the opposite order would leave an approved request pointing at
-   * an organization that was never created, which nothing can repair.
+   * Persist the approval before granting membership. A deterministic workspace
+   * id lets an authorized retry repair provisioning after a storage failure,
+   * without ever granting operational access to a still-pending applicant.
    *
    * Note what is *not* here: no automatic approval on a passing verification.
    * The provider is advisory (see `ports/verification.ts`); a human at TIER2
@@ -424,7 +527,7 @@ export class OnboardingService {
   ): Promise<{ request: OnboardingRequest; organization: Organization }> {
     const admin = await this.authority.authorize(adminUserId, 'ONBOARDING_APPROVE');
     const request = await this.requireRequest(command.requestId);
-    if (request.status !== 'submitted') {
+    if (request.status !== 'submitted' && request.status !== 'approved') {
       throw new InvalidOperationError(`Only a submitted application can be approved`);
     }
     // Enforce the KYC gate BEFORE provisioning: `approveOnboardingRequest`
@@ -437,8 +540,24 @@ export class OnboardingService {
     }
 
     const now = this.deps.config.clock.now();
+    const organizationId = request.provisionedOrganizationId ?? `onboarding_${request.id}`;
+    if (request.status === 'approved') {
+      const existing = await this.deps.repositories.organizations.getById(organizationId);
+      if (existing) return { request, organization: existing };
+    }
+    const approved =
+      request.status === 'approved'
+        ? request
+        : approveOnboardingRequest(request, {
+            reviewedBy: admin.id,
+            note: command.note,
+            provisionedOrganizationId: organizationId,
+            now,
+          });
+    if (request.status !== 'approved') await this.repo.save(approved);
+
     const organization = createOrganization({
-      id: this.deps.config.ids(),
+      id: organizationId,
       name: request.profile.legalName,
       slug: slugFor(request.profile.legalName, request.id),
       ownerId: request.userId,
@@ -449,11 +568,9 @@ export class OnboardingService {
       settings: { name: request.profile.legalName, timezone: 'Asia/Kolkata' },
       now,
     });
-    await this.deps.repositories.organizations.save(organization);
-
     if (request.requestedType === 'venue' && this.deps.repositories.venues) {
       const venue = createVenue({
-        id: this.deps.config.ids(),
+        id: `onboarding_venue_${request.id}`,
         organizationId: organization.id,
         ownerId: request.userId,
         name: request.profile.legalName,
@@ -463,16 +580,11 @@ export class OnboardingService {
         city: request.profile.city ?? null,
         now,
       });
-      await this.deps.repositories.venues.save(venue);
+      if (!(await this.deps.repositories.venues.getById(venue.id))) {
+        await this.deps.repositories.venues.save(venue);
+      }
     }
-
-    const approved = approveOnboardingRequest(request, {
-      reviewedBy: admin.id,
-      note: command.note,
-      provisionedOrganizationId: organization.id,
-      now,
-    });
-    await this.repo.save(approved);
+    await this.deps.repositories.organizations.save(organization);
 
     await this.authority.record(admin, {
       action: 'ONBOARDING_APPROVE',
@@ -484,6 +596,20 @@ export class OnboardingService {
       ipAddress: meta?.ipAddress,
       userAgent: meta?.userAgent,
     });
+    if (request.requestedType === 'promoter') {
+      await this.deps.outbox.append(
+        domainEvent({
+          id: this.deps.config.ids(),
+          type: 'promoter.onboarding.approved',
+          aggregateId: request.id,
+          organizationId: organization.id,
+          actorId: adminUserId,
+          payload: { requestId: request.id, promoterId: organization.id },
+          occurredAt: now.getTime(),
+        }),
+      );
+    }
+    await this.enqueueApplicantEmail(approved, 'approved', adminUserId, now);
     this.deps.logger.info('onboarding.approved', {
       requestId: request.id,
       organizationId: organization.id,
@@ -520,30 +646,6 @@ export class OnboardingService {
       meta,
     );
 
-    // Best-effort notification. The decision is already persisted and audited:
-    // an email-provider outage (or no resolvable email, e.g. memory/test
-    // driver) must not roll it back or block the admin. Every failure is
-    // logged, never silently swallowed.
-    try {
-      const email = await this.deps.userDirectory.getEmailById(updated.userId);
-      if (email) {
-        await this.deps.emailSender.sendOnboardingChangesRequestedEmail(email, {
-          legalName: updated.profile.legalName,
-          note: updated.reviewNote ?? '',
-        });
-      } else {
-        this.deps.logger.info('onboarding.changes_requested_email_skipped', {
-          requestId: updated.id,
-          reason: 'no_email_on_file',
-        });
-      }
-    } catch (error) {
-      this.deps.logger.error('onboarding.changes_requested_email_failed', {
-        requestId: updated.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-
     return updated;
   }
 
@@ -558,7 +660,8 @@ export class OnboardingService {
     // whether a business gets onto the platform.
     const admin = await this.authority.authorize(adminUserId, 'ONBOARDING_APPROVE');
     const request = await this.requireRequest(command.requestId);
-    const updated = apply(request, admin, this.deps.config.clock.now());
+    const now = this.deps.config.clock.now();
+    const updated = apply(request, admin, now);
     await this.repo.save(updated);
     await this.authority.record(admin, {
       action: auditAction,
@@ -570,7 +673,47 @@ export class OnboardingService {
       ipAddress: meta?.ipAddress,
       userAgent: meta?.userAgent,
     });
+    if (updated.status === 'rejected' && request.requestedType === 'promoter') {
+      await this.deps.outbox.append(
+        domainEvent({
+          id: this.deps.config.ids(),
+          type: 'promoter.onboarding.rejected',
+          aggregateId: request.id,
+          // Before approval, the applicant is the only available owner scope.
+          organizationId: request.userId,
+          actorId: adminUserId,
+          payload: { requestId: request.id },
+          occurredAt: now.getTime(),
+        }),
+      );
+    }
+    const emailStatus =
+      updated.status === 'rejected'
+        ? 'rejected'
+        : auditAction === 'onboarding.request_changes'
+          ? 'changes_requested'
+          : null;
+    if (emailStatus) await this.enqueueApplicantEmail(updated, emailStatus, adminUserId, now);
     return updated;
+  }
+
+  private async enqueueApplicantEmail(
+    request: OnboardingRequest,
+    status: 'submitted' | 'changes_requested' | 'approved' | 'rejected',
+    actorId: EntityId,
+    occurredAt: Date,
+  ): Promise<void> {
+    await this.deps.outbox.append(
+      domainEvent({
+        id: this.deps.config.ids(),
+        type: 'partner.onboarding.email_requested',
+        aggregateId: request.id,
+        organizationId: request.userId,
+        actorId,
+        payload: { requestId: request.id, status },
+        occurredAt: occurredAt.getTime(),
+      }),
+    );
   }
 
   /* ─── Lookups ────────────────────────────────────────────────────────────── */
@@ -591,6 +734,25 @@ export class OnboardingService {
       throw new OnboardingRequestNotFoundError(requestId);
     }
     return request;
+  }
+}
+
+function normalizePhone(phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  return digits.length === 10 ? `91${digits}` : digits;
+}
+
+function kycObjectKey(request: OnboardingRequest, label: string): string {
+  if (!ALL_DOCUMENT_LABELS.includes(label)) {
+    throw new InvalidOperationError('Unknown KYC document label');
+  }
+  return `kyc/${request.userId}/${request.id}/${label}`;
+}
+
+function assertKycObjectPath(request: OnboardingRequest, label: string, storagePath: string): void {
+  // Exact equality: do not normalize or decode caller-supplied object keys.
+  if (storagePath !== kycObjectKey(request, label)) {
+    throw new InvalidOperationError('Document path does not belong to this application and label');
   }
 }
 

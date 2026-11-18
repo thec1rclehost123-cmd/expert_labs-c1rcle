@@ -1,13 +1,16 @@
 import Image from 'next/image';
 import Link from 'next/link';
 
+import { getOrderStatusPresentation } from '@/features/booking/status-presentation';
 import { getEventAccentClasses } from '@/features/event-detail/eventDetailPalette';
+import { EventArtworkFallback } from '@/features/explore/components/EventArtworkFallback';
 
 import type { BookingConfirmationFixture, BookingEventFixture } from '../types/booking.types';
 
 const moneyFormatter = new Intl.NumberFormat('en-IN', {
   currency: 'INR',
-  maximumFractionDigits: 0,
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 2,
   style: 'currency',
 });
 
@@ -25,6 +28,17 @@ export function ConfirmationView({
   event: BookingEventFixture;
 }) {
   const accent = getEventAccentClasses(event.accentTone);
+  const status = getOrderStatusPresentation(
+    confirmation.status,
+    confirmation.fulfillmentState,
+    confirmation.admissionRefundState,
+  );
+  const statusTone = {
+    success: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400',
+    warning: 'border-amber-500/20 bg-amber-500/10 text-amber-300',
+    danger: 'border-red-500/20 bg-red-500/10 text-red-300',
+    neutral: 'border-white/15 bg-white/[0.06] text-white/65',
+  }[status.tone];
 
   return (
     <div className="relative z-10 min-h-screen overflow-hidden pb-28 pt-20 text-white sm:pt-24 lg:pb-8 lg:pt-20">
@@ -39,10 +53,10 @@ export function ConfirmationView({
             aria-hidden="true"
             className={`mx-auto flex size-14 items-center justify-center rounded-full border text-2xl font-black lg:size-12 lg:text-xl ${accent.borderStrong} ${accent.panel}`}
           >
-            ✓
+            {status.tone === 'success' ? '✓' : '•'}
           </div>
           <h1 className="mt-3 text-5xl font-black uppercase leading-[0.86] tracking-[-0.06em] sm:text-6xl lg:text-6xl">
-            You&apos;re on the list.
+            {status.heading}
           </h1>
         </header>
 
@@ -52,14 +66,18 @@ export function ConfirmationView({
         >
           <div className="relative flex flex-col items-center justify-center p-6 text-center md:p-8">
             <div className="relative aspect-[3/4] w-full max-w-[240px] overflow-hidden rounded-2xl border border-white/10 shadow-2xl">
-              <Image
-                src={event.image}
-                alt={event.title}
-                fill
-                unoptimized
-                priority
-                className="object-cover"
-              />
+              {event.image ? (
+                <Image
+                  src={event.image}
+                  alt={event.title}
+                  fill
+                  unoptimized
+                  priority
+                  className="object-cover"
+                />
+              ) : (
+                <EventArtworkFallback startsAt={event.startsAt} category={event.category} hero />
+              )}
             </div>
             <p className="mt-4 text-[10px] font-black uppercase tracking-[0.2em] text-white/50">
               {event.category}
@@ -70,10 +88,12 @@ export function ConfirmationView({
             <div>
               <div className="flex items-center justify-between border-b border-white/10 pb-4">
                 <span className="text-[10px] font-black uppercase tracking-[0.2em] text-white/50">
-                  Confirmation #{confirmation.id}
+                  Booking {confirmation.bookingReference}
                 </span>
-                <span className="rounded-full bg-emerald-500/10 px-3 py-1 text-[10px] font-black uppercase tracking-widest text-emerald-400 border border-emerald-500/20">
-                  Confirmed
+                <span
+                  className={`rounded-full border px-3 py-1 text-[10px] font-black uppercase tracking-widest ${statusTone}`}
+                >
+                  {status.label}
                 </span>
               </div>
 
@@ -85,24 +105,39 @@ export function ConfirmationView({
               </h2>
 
               <div className="mt-6 space-y-4">
-                <div>
-                  <p className="text-[10px] font-black uppercase tracking-[0.2em] text-white/40">
-                    Date & Time
-                  </p>
-                  <p className="mt-1 text-sm font-bold text-white">
-                    {dateFormatter.format(new Date(event.startsAt))}
-                  </p>
-                </div>
+                {event.detailsAvailable === false ? (
+                  <div>
+                    <p className="text-[10px] font-black uppercase tracking-[0.2em] text-white/40">
+                      Event update
+                    </p>
+                    <p className="mt-1 text-sm font-bold text-white">
+                      {confirmation.status === 'cancelled'
+                        ? 'This event was cancelled. Contact support if you need help with this booking.'
+                        : 'Event details are unavailable. Contact support if you need help with this booking.'}
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-[0.2em] text-white/40">
+                        Date & Time
+                      </p>
+                      <p className="mt-1 text-sm font-bold text-white">
+                        {dateFormatter.format(new Date(event.startsAt))}
+                      </p>
+                    </div>
 
-                <div>
-                  <p className="text-[10px] font-black uppercase tracking-[0.2em] text-white/40">
-                    Venue
-                  </p>
-                  <p className="mt-1 text-sm font-bold text-white">{event.venue}</p>
-                  <p className="text-xs text-white/60">
-                    {event.address}, {event.city}
-                  </p>
-                </div>
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-[0.2em] text-white/40">
+                        Venue
+                      </p>
+                      <p className="mt-1 text-sm font-bold text-white">{event.venue}</p>
+                      <p className="text-xs text-white/60">
+                        {event.address}, {event.city}
+                      </p>
+                    </div>
+                  </>
+                )}
 
                 <div>
                   <p className="text-[10px] font-black uppercase tracking-[0.2em] text-white/40">
@@ -118,25 +153,117 @@ export function ConfirmationView({
             <div className="mt-8 border-t border-white/10 pt-6">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold uppercase tracking-widest text-white/60">
-                  Total Paid
+                  {status.amountLabel}
                 </span>
                 <span className="text-xl font-black text-white">
                   {moneyFormatter.format(confirmation.total.amountPaise / 100)}
                 </span>
               </div>
 
-              <div className="mt-6 flex flex-col gap-3 sm:flex-row">
-                <Link
-                  href="/tickets"
-                  className="flex-1 rounded-full bg-white px-6 py-3 text-center text-xs font-black uppercase tracking-widest text-black hover:bg-white/90 transition-all"
+              {confirmation.status === 'paid' && confirmation.admissionRefundState === 'all' ? (
+                <p role="status" className="mt-4 text-sm text-white/70">
+                  All original admissions have been refunded and cannot be used.
+                </p>
+              ) : confirmation.status === 'paid' &&
+                confirmation.admissionRefundState === 'partial' ? (
+                <p role="status" className="mt-4 text-sm text-amber-200">
+                  Unrefunded admissions remain available in My Tickets. Refunded admissions cannot
+                  be used.
+                </p>
+              ) : null}
+              {confirmation.refundedPaise !== undefined && confirmation.refundedPaise > 0 ? (
+                <dl aria-label="Refund totals" className="mt-4 space-y-2 text-sm text-white/70">
+                  <div className="flex justify-between gap-4">
+                    <dt>Refunded to date</dt>
+                    <dd>{moneyFormatter.format(confirmation.refundedPaise / 100)}</dd>
+                  </div>
+                  <div className="flex justify-between gap-4">
+                    <dt>Amount retained</dt>
+                    <dd>
+                      {moneyFormatter.format(
+                        (confirmation.total.amountPaise - confirmation.refundedPaise) / 100,
+                      )}
+                    </dd>
+                  </div>
+                </dl>
+              ) : null}
+              {confirmation.status === 'paid' && confirmation.fulfillmentState === 'pending' ? (
+                <p role="status" className="mt-4 text-sm text-amber-200">
+                  Payment received. Your booking is still processing; admission and QR access will
+                  become available after fulfillment completes.
+                </p>
+              ) : null}
+              {confirmation.status === 'refund_requested' ? (
+                <p role="status" className="mt-4 text-sm text-amber-200">
+                  Your refund request is awaiting review or provider settlement. A requested refund
+                  is not a completed refund.
+                </p>
+              ) : null}
+              {confirmation.receiptFacts ? (
+                <section
+                  aria-label="Original payment receipt"
+                  className="mt-5 space-y-2 text-sm text-white/70"
                 >
-                  View in My Tickets
-                </Link>
+                  <h3 className="font-bold text-white">Original payment receipt</h3>
+                  {(
+                    [
+                      ['Admission after discount', confirmation.receiptFacts.admissionPaise],
+                      ['Cover', confirmation.receiptFacts.coverPaise],
+                      ['Add-ons', confirmation.receiptFacts.addOnPaise],
+                      [
+                        'Discount applied (included above)',
+                        confirmation.receiptFacts.discountPaise,
+                      ],
+                      ['Platform fee', confirmation.receiptFacts.platformFeePaise],
+                      ['Payment fee', confirmation.receiptFacts.paymentFeePaise],
+                      ['Tax on fees', confirmation.receiptFacts.feeTaxPaise],
+                      ['Original total paid', confirmation.receiptFacts.grandTotalPaise],
+                    ] as const
+                  ).map(([label, amount]) => (
+                    <p key={label} className="flex justify-between gap-4">
+                      <span>{label}</span>
+                      <span>{moneyFormatter.format(amount / 100)}</span>
+                    </p>
+                  ))}
+                  {confirmation.receiptFacts.providerPaymentId ? (
+                    <p className="break-all text-xs">
+                      Payment reference: {confirmation.receiptFacts.providerPaymentId}
+                    </p>
+                  ) : null}
+                  {confirmation.receiptFacts.bookingFeePolicyVersion ? (
+                    <p className="text-xs">
+                      Original fee policy: {confirmation.receiptFacts.bookingFeePolicyVersion}
+                    </p>
+                  ) : null}
+                </section>
+              ) : null}
+              <div className="mt-6 flex flex-col gap-3 sm:flex-row">
+                {status.ticketAccess ? (
+                  <Link
+                    href="/tickets"
+                    className="flex-1 rounded-full bg-white px-6 py-3 text-center text-xs font-black uppercase tracking-widest text-black hover:bg-white/90 transition-all"
+                  >
+                    View in My Tickets
+                  </Link>
+                ) : null}
                 <Link
                   href="/explore"
                   className="flex-1 rounded-full border border-white/20 px-6 py-3 text-center text-xs font-black uppercase tracking-widest text-white hover:bg-white/10 transition-all"
                 >
                   Explore More Events
+                </Link>
+              </div>
+              <div className="mt-4 flex flex-wrap justify-center gap-x-5 gap-y-2 text-xs text-white/50">
+                {confirmation.status === 'paid' &&
+                confirmation.fulfillmentState !== 'pending' &&
+                confirmation.admissionRefundState !== 'all' ? (
+                  <span>Your booking details are available in My Tickets.</span>
+                ) : null}
+                <Link
+                  href={`/help?booking=${encodeURIComponent(confirmation.bookingReference)}`}
+                  className="underline underline-offset-4 hover:text-white"
+                >
+                  Need help with this booking?
                 </Link>
               </div>
             </div>

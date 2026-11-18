@@ -89,7 +89,7 @@ export function errorHandler(
     // sent directly) — wrapping in `{ error: body }` here only, as this file
     // used to, meant the frontend's ApiClientError parser saw two different
     // shapes depending on which code path produced the error. Independently
-    // found and fixed by both this session and an earlier contributor's parallel B10 work
+    // found and fixed by both this session and a teammate's parallel B10 work
     // (their D-011) — see docs/architecture/decisions.md.
     void reply.status(mapped.status).send(body);
     return;

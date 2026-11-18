@@ -4,7 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 /**
  * ─── Response cache (B10 / T17) ──────────────────────────────────────────────
- * Ported from an earlier contributor's parallel B10 work (origin/main 80cca2c) — this repo had
+ * Ported from a teammate's parallel B10 work (origin/main 80cca2c) — this repo had
  * deferred a cache plugin entirely; this one was more complete.
  *
  * Deliberate TTLs, and nothing sensitive is ever stored.
@@ -75,6 +75,19 @@ export default fp<CacheOptions>(
     });
 
     fastify.addHook('onSend', async (request, reply, payload) => {
+      // Organization-scoped read models can change for both sides of a
+      // partnership or after an event write. The in-memory cache has no shared
+      // invalidation bus, so flush this class after any authenticated success
+      // rather than leave another tenant's relationship view stale.
+      if (request.method !== 'GET') {
+        if (reply.statusCode >= 200 && reply.statusCode < 300 && request.actor) {
+          for (const key of entries.keys()) {
+            if (key.startsWith('ORGANIZATION|')) entries.delete(key);
+          }
+        }
+        return payload;
+      }
+
       const pending = request.cacheKey;
       if (pending === undefined) return payload;
       request.cacheKey = undefined;

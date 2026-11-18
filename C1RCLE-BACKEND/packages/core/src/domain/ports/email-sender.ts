@@ -15,7 +15,7 @@ export interface StaffInvitationEmail {
   to: string;
   /** Inviting organization display name. */
   orgName: string;
-  /** Role the invitee gets on accept (`admin`|`manager`|`member`). */
+  /** Role the invitee gets on accept (an `OrganizationRole` id, e.g. `gate_staff`). */
   role: string;
   /** Capabilities the invite grants (may be empty). */
   capabilities: readonly string[];
@@ -30,11 +30,42 @@ export interface StaffInvitationEmail {
    * and receive no credentials — the template omits the credentials box.
    */
   temporaryPassword?: string | undefined;
+  /**
+   * When the temporary password stops working (ISO datetime). Set together
+   * with `temporaryPassword`; after it the manager must resend the invite.
+   */
+  temporaryPasswordExpiresAt?: string | undefined;
 }
 
 export interface OnboardingChangesRequestedEmailParams {
   legalName: string;
   note: string;
+}
+
+export interface TransactionalEmail {
+  /** Durable delivery-intent ID used to correlate local capture evidence. */
+  deliveryIntentId?: string;
+  to: string;
+  subject: string;
+  preheader?: string;
+  html: string;
+  text?: string;
+  templateType?: string;
+  /** Stable per logical message; passed through to the provider on retries. */
+  idempotencyKey: string;
+}
+
+export interface EmailSendResult {
+  outcome?: 'accepted_by_provider' | 'captured_locally';
+  providerMessageId: string | null;
+}
+
+/** Provider rejected a message permanently; retries will not fix its request. */
+export class PermanentEmailDeliveryError extends Error {
+  constructor() {
+    super('Email provider permanently rejected the message');
+    this.name = 'PermanentEmailDeliveryError';
+  }
 }
 
 export interface EmailSender {
@@ -48,6 +79,7 @@ export interface EmailSender {
     recipient: string,
     params: OnboardingChangesRequestedEmailParams,
   ): Promise<void>;
+  sendTransactionalEmail?(message: TransactionalEmail): Promise<EmailSendResult>;
 }
 
 /**
@@ -61,27 +93,30 @@ export class LoggingEmailSender implements EmailSender {
 
   constructor(private readonly logger: Logger) {}
 
-  async sendOtpEmail(recipient: string, code: string): Promise<void> {
-    this.logger.info('dev_email_otp', { recipient, code });
+  async sendOtpEmail(_recipient: string, _code: string): Promise<void> {
+    this.logger.info('dev_email_otp', { delivery: 'suppressed' });
   }
 
-  async sendStaffInvitationEmail(invitation: StaffInvitationEmail): Promise<void> {
-    this.logger.info('dev_email_staff_invitation', { ...invitation });
+  async sendStaffInvitationEmail(_invitation: StaffInvitationEmail): Promise<void> {
+    this.logger.info('dev_email_staff_invitation', { delivery: 'suppressed' });
   }
 
-  async sendPasswordResetEmail(recipient: string, resetUrl: string): Promise<void> {
-    this.logger.info('dev_email_password_reset', { recipient, resetUrl });
+  async sendPasswordResetEmail(_recipient: string, _resetUrl: string): Promise<void> {
+    this.logger.info('dev_email_password_reset', { delivery: 'suppressed' });
   }
 
   async sendOnboardingChangesRequestedEmail(
-    recipient: string,
-    params: OnboardingChangesRequestedEmailParams,
+    _recipient: string,
+    _params: OnboardingChangesRequestedEmailParams,
   ): Promise<void> {
-    // Note text is admin-authored review feedback: log its length, not content.
-    this.logger.info('dev_email_onboarding_changes_requested', {
-      recipient,
-      legalName: params.legalName,
-      noteLength: params.note.length,
+    this.logger.info('dev_email_onboarding_changes_requested', { delivery: 'suppressed' });
+  }
+
+  async sendTransactionalEmail(message: TransactionalEmail): Promise<EmailSendResult> {
+    this.logger.info('dev_email_transactional', {
+      delivery: 'captured_locally',
+      template: message.templateType ?? 'transactional',
     });
+    return { outcome: 'captured_locally', providerMessageId: null };
   }
 }

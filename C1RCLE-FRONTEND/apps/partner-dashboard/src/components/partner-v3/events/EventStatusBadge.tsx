@@ -5,7 +5,13 @@ import type { PartnerEventStatus } from '@/data/partner-data-source';
 const toneClasses: Readonly<Record<PartnerEventStatus, string>> = {
   Live: styles['statusLive'] ?? '',
   Draft: styles['statusDraft'] ?? '',
+  Review: styles['statusDraft'] ?? '',
+  Scheduled: styles['statusDraft'] ?? '',
+  Paused: styles['statusDraft'] ?? '',
+  Postponed: styles['statusDraft'] ?? '',
   Past: styles['statusPast'] ?? '',
+  Completed: styles['statusPast'] ?? '',
+  Archived: styles['statusPast'] ?? '',
   Cancelled: styles['statusCancelled'] ?? '',
 };
 

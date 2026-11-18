@@ -186,7 +186,7 @@ graph TD
 | Idempotency | ⚠️ In-memory only | `Idempotency-Key` header preserved by Nginx, but Fastify stores in-memory |
 | Health probing | ⚠️ Endpoint exists, no probing | `/api/v2/internal/health` works, Nginx doesn't probe it |
 | Capacity data | ❌ No load tests run | No production traffic data |
-| Multiple services | ❌ Not configured on Render | Single `circle-v2-backend` service |
+| Multiple services | ❌ Not configured on Render | Single `c1rcle-api` service |
 
 ---
 

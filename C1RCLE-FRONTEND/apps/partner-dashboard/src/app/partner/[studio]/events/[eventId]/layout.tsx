@@ -1,0 +1,152 @@
+import { notFound } from 'next/navigation';
+
+import { eventTabs } from '@/components/partner-v3/event-detail/event-workspace-navigation';
+import {
+  formatEventBasePrice,
+  formatEventStartingPrice,
+} from '@/components/partner-v3/event-detail/event-workspace-pricing';
+import { EventWorkspaceChrome } from '@/components/partner-v3/event-detail/EventWorkspaceChrome';
+import { VenueEventDetailLayout } from '@/components/venue/event-detail/VenueAssociatedEventLayout';
+import { formatProductDateTime } from '@/lib/events/event-time';
+import { loadPartnerEvent } from '@/lib/events/load-partner-event';
+import { loadPromoterEvents } from '@/lib/events/load-promoter-events';
+
+import type {
+  EventWorkspaceModel,
+  EventWorkspaceTab,
+} from '@/components/partner-v3/event-detail/EventWorkspaceChrome';
+import type { PromoterLinkedEvent } from '@/data/partner-data-source';
+import type { ReactNode } from 'react';
+
+function promoterTabs(eventId: string): EventWorkspaceTab[] {
+  const base = `/partner/promoter/events/${encodeURIComponent(eventId)}`;
+  return [
+    { label: 'Overview', href: base },
+    { label: 'Performance', href: `${base}/analytics` },
+    { label: 'Referral links', href: `${base}/referrals` },
+    { label: 'Assignment terms', href: `${base}/terms` },
+  ];
+}
+
+function promoterEventModel(event: PromoterLinkedEvent): EventWorkspaceModel {
+  return {
+    id: event.id,
+    title: event.name,
+    venue: event.venue,
+    dateTime: event.eventDateTime ?? 'Event date unavailable',
+    statusLabel: event.eventStatus ?? 'Event status unavailable',
+    contextLabel: `Assignment: ${event.assignmentStatus ?? 'status unavailable'}`,
+    artwork: event.artwork,
+    metrics: [
+      { label: 'Referral clicks', value: event.clicks?.toLocaleString('en-IN') ?? '—' },
+      { label: 'Attributed sales', value: event.sales?.toLocaleString('en-IN') ?? '—' },
+      { label: 'Commission', value: event.commissionLabel ?? 'Terms unavailable' },
+    ],
+  };
+}
+
+export default async function EventWorkspaceLayout({
+  children,
+  params,
+}: {
+  readonly children: ReactNode;
+  readonly params: Promise<{ studio: string; eventId: string }>;
+}) {
+  const { studio, eventId } = await params;
+
+  if (studio === 'venue')
+    return VenueEventDetailLayout({ children, params: Promise.resolve({ eventId }) });
+
+  if (studio === 'promoter') {
+    const data = await loadPromoterEvents();
+    const assignment = [...data.linkedEvents, ...data.invitations].find(
+      (item) => item.id === eventId,
+    );
+    if (assignment) {
+      return (
+        <EventWorkspaceChrome
+          studio="promoter"
+          event={promoterEventModel(assignment)}
+          tabs={promoterTabs(eventId)}
+        >
+          {children}
+        </EventWorkspaceChrome>
+      );
+    }
+    const publicEvent = data.discoverEvents.find((item) => item.id === eventId);
+    if (!publicEvent) notFound();
+    const event: EventWorkspaceModel = {
+      id: publicEvent.id,
+      title: publicEvent.name,
+      venue: publicEvent.venue,
+      dateTime: `${publicEvent.dateLabel} · ${publicEvent.timeLabel} IST`,
+      statusLabel: publicEvent.eventStatus ?? 'Public listing',
+      artwork: publicEvent.artwork,
+      metrics: [{ label: 'Listing', value: 'Public event' }],
+    };
+    return (
+      <EventWorkspaceChrome
+        studio="promoter"
+        event={event}
+        tabs={[
+          { label: 'Overview', href: `/partner/promoter/events/${encodeURIComponent(eventId)}` },
+        ]}
+      >
+        {children}
+      </EventWorkspaceChrome>
+    );
+  }
+
+  if (studio !== 'host' && studio !== 'venue') notFound();
+  const event = await loadPartnerEvent(eventId);
+  const workspaceEvent: EventWorkspaceModel = {
+    id: event.id,
+    title: event.title,
+    venue: event.venueName ?? (event.venueId ? 'Venue name unavailable' : 'Venue not specified'),
+    dateTime:
+      event.status === 'postponed'
+        ? 'New date to be announced'
+        : formatProductDateTime(event.startAt),
+    statusLabel:
+      event.status === 'published' || event.status === 'started'
+        ? 'Live'
+        : event.status === 'draft'
+          ? 'Draft'
+          : event.status === 'review'
+            ? 'Review'
+            : event.status === 'scheduled'
+              ? 'Scheduled'
+              : event.status === 'postponed'
+                ? 'Postponed'
+                : event.status === 'sales_paused'
+                  ? 'Paused'
+                  : event.status === 'ended'
+                    ? 'Past'
+                    : event.status === 'archived'
+                      ? 'Archived'
+                      : 'Cancelled',
+    artwork: event.imageUrl
+      ? { type: 'image', value: event.imageUrl, alt: event.title }
+      : { type: 'gradient', value: 'placeholder' },
+    metrics: [
+      {
+        label: 'Tickets sold',
+        value: event.salesCountComplete
+          ? event.ticketsSold.toLocaleString('en-IN')
+          : `At least ${event.ticketsSold.toLocaleString('en-IN')}`,
+      },
+      { label: 'Capacity', value: event.capacity?.toLocaleString('en-IN') ?? 'Not set' },
+      {
+        label: 'Current starting price',
+        value: formatEventStartingPrice(event),
+      },
+      { label: 'Base price', value: formatEventBasePrice(event) },
+    ],
+  };
+
+  return (
+    <EventWorkspaceChrome studio={studio} event={workspaceEvent} tabs={eventTabs(studio, eventId)}>
+      {children}
+    </EventWorkspaceChrome>
+  );
+}

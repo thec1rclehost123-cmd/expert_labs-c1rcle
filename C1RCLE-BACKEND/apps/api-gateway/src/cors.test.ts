@@ -13,7 +13,7 @@ import { getGatewayConfig } from './config/index.js';
  * same request made server-side (curl, tests) returned 200.
  */
 
-const ADMIN_ORIGIN = 'https://admin.example.com';
+const ADMIN_ORIGIN = 'https://app.example.com';
 const QUEUE_URL = '/api/v2/admin/onboarding/applications?status=submitted&limit=100';
 
 async function appAllowing(origins: string) {

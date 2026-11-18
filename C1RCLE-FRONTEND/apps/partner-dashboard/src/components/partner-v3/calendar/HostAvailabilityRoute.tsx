@@ -1,6 +1,10 @@
 'use client';
 
+import { useRef } from 'react';
+
+import { PartnerDashboardSkeleton } from '@/components/partner-v3/PartnerDashboardSkeleton';
 import { EmptyState, ErrorState } from '@/components/partner-v3/States';
+import { requestHostAvailabilitySlot } from '@/lib/calendar/host-availability-repository';
 import { useHostAvailability } from '@/lib/calendar/use-host-availability';
 import { currentMonthKey } from '@/lib/calendar/venue-calendar-repository';
 
@@ -12,13 +16,16 @@ export function HostAvailabilityRoute({
   initialDate,
   initialVenue,
   initialSlot,
+  initialEventId,
 }: {
   readonly organizationId: string | null;
   readonly initialMonth?: string;
   readonly initialDate?: string;
   readonly initialVenue?: string;
   readonly initialSlot?: string;
+  readonly initialEventId?: string;
 }) {
+  const requestKeys = useRef(new Map<string, string>());
   const state = useHostAvailability({
     organizationId,
     anchorMonth: initialMonth ?? currentMonthKey(),
@@ -34,7 +41,9 @@ export function HostAvailabilityRoute({
       />
     );
   }
-  if (state.loading) return null;
+  if (state.loading) {
+    return <PartnerDashboardSkeleton label="Loading host availability…" />;
+  }
   if (state.error) {
     return (
       <ErrorState
@@ -60,6 +69,22 @@ export function HostAvailabilityRoute({
       {...(initialDate ? { initialDate } : {})}
       {...(initialVenue ? { initialVenue } : {})}
       {...(initialSlot ? { initialSlot } : {})}
+      onRequestSlot={async (venueId, slotId) => {
+        let idempotencyKey = requestKeys.current.get(slotId);
+        if (!idempotencyKey) {
+          idempotencyKey = crypto.randomUUID();
+          requestKeys.current.set(slotId, idempotencyKey);
+        }
+        await requestHostAvailabilitySlot({
+          organizationId,
+          venueId,
+          slotId,
+          idempotencyKey,
+          ...(initialEventId ? { eventId: initialEventId } : {}),
+        });
+        requestKeys.current.delete(slotId);
+        state.retry();
+      }}
     />
   );
 }

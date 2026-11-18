@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { buildRotatingQr, deriveTicketKey } from '@c1rcle/core/application';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ActorContext } from '@c1rcle/core/application';
 import type { Entitlement } from '@c1rcle/core/domain';
@@ -132,19 +133,22 @@ async function seedEntitlement(
   return entitlement;
 }
 
-async function createDoorCode(): Promise<string> {
+async function createDoorCode(gate: string | null = null): Promise<string> {
   const response = await server.inject({
     method: 'POST',
     url: `/events/${EVENT_ID}/door-codes`,
     headers: HEADERS,
-    payload: { type: 'full', gate: null, expiresAt: null },
+    payload: { type: 'full', gate, expiresAt: null },
   });
   expect(response.statusCode, response.body).toBe(201);
   return response.json().code;
 }
 
-async function startShift(deviceId = DEVICE_ID): Promise<{ token: string; body: unknown }> {
-  const code = await createDoorCode();
+async function startShift(
+  deviceId = DEVICE_ID,
+  gate: string | null = null,
+): Promise<{ token: string; body: unknown }> {
+  const code = await createDoorCode(gate);
   const response = await server.inject({
     method: 'POST',
     url: '/door/sessions',
@@ -161,7 +165,19 @@ async function startShift(deviceId = DEVICE_ID): Promise<{ token: string; body: 
   return { token: response.json().sessionToken, body: response.json() };
 }
 
-function scan(token: string, qrPayload: string) {
+async function signedPayload(ticketId: string) {
+  const ticket = await services.repos().entitlements.findById(ticketId);
+  const version = ticket?.credentialVersion ?? 1;
+  return buildRotatingQr(
+    deriveTicketKey(services.config().magicTicketSecret, ticketId, version),
+    ticketId,
+    services.config().clock.now().getTime(),
+    version,
+  );
+}
+
+async function scan(token: string, qrPayload: string) {
+  if (!qrPayload.includes(':')) qrPayload = await signedPayload(qrPayload);
   return server.inject({
     method: 'POST',
     url: '/door/check-ins',
@@ -454,7 +470,11 @@ describe('POST /door/staff-deny', () => {
       method: 'POST',
       url: '/door/staff-deny',
       headers: { ...HEADERS, 'x-scanner-session-token': token },
-      payload: { eventId: EVENT_ID, qrPayload: entitlement.id, reason: 'intoxicated' },
+      payload: {
+        eventId: EVENT_ID,
+        qrPayload: await signedPayload(entitlement.id),
+        reason: 'intoxicated',
+      },
     });
     expect(response.statusCode, response.body).toBe(201);
     expect(response.json()).toMatchObject({
@@ -488,6 +508,54 @@ describe('GET /door/guests', () => {
     expect(items.every((g) => g.source === 'online')).toBe(true);
   });
 
+  it('shows current ticket custody without exposing purchaser or holder account IDs', async () => {
+    await seedEntitlement('ENT-custody-purchaser', {
+      currentHolderUserId: 'guest_1',
+      holderName: 'Purchaser Guest',
+    });
+    await seedEntitlement('ENT-custody-assigned', {
+      currentHolderUserId: 'attendee_2',
+      holderName: 'Assigned Guest',
+    });
+    await seedEntitlement('ENT-custody-unassigned', {
+      currentHolderUserId: null,
+      holderName: '',
+    });
+    await seedEntitlement('ENT-custody-legacy', { holderName: 'Legacy Purchaser' });
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/door/guests?eventId=${EVENT_ID}`,
+      headers: HEADERS,
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.headers['cache-control']).toContain('no-store');
+    const items = response.json().items as {
+      id: string;
+      name: string;
+      ownershipStatus?: string | null;
+    }[];
+    expect(items.find((guest) => guest.id === 'ENT-custody-purchaser')).toMatchObject({
+      name: 'Purchaser Guest',
+      ownershipStatus: 'purchaser',
+    });
+    expect(items.find((guest) => guest.id === 'ENT-custody-assigned')).toMatchObject({
+      name: 'Assigned Guest',
+      ownershipStatus: 'assigned',
+    });
+    expect(items.find((guest) => guest.id === 'ENT-custody-unassigned')).toMatchObject({
+      name: '',
+      ownershipStatus: 'unassigned',
+    });
+    expect(items.find((guest) => guest.id === 'ENT-custody-legacy')).toMatchObject({
+      name: 'Legacy Purchaser',
+      ownershipStatus: 'purchaser',
+    });
+    expect(response.body).not.toContain('attendee_2');
+    expect(response.body).not.toContain('guest_1');
+  });
+
   it('refuses another organization’s roster', async () => {
     const response = await server.inject({
       method: 'GET',
@@ -495,6 +563,21 @@ describe('GET /door/guests', () => {
       headers: HEADERS,
     });
     expect(response.statusCode).toBe(404);
+  });
+
+  it('marks a bounded roster as truncated when matching records remain', async () => {
+    await seedEntitlement('ENT-truncated-a', { holderName: 'First Guest' });
+    await seedEntitlement('ENT-truncated-b', { holderName: 'Second Guest' });
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/door/guests?eventId=${EVENT_ID}&limit=1`,
+      headers: HEADERS,
+    });
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({ truncated: true });
+    expect(response.json().items).toHaveLength(1);
   });
 });
 
@@ -592,13 +675,13 @@ describe('GET /door/attendance-report', () => {
 
 describe('POST /door/guests/check-in', () => {
   it('admits a guest whose QR will not scan', async () => {
-    await startShift();
+    const { token } = await startShift();
     const entitlement = await seedEntitlement('ENT-ops-manual');
 
     const response = await server.inject({
       method: 'POST',
       url: '/door/guests/check-in',
-      headers: HEADERS,
+      headers: { ...HEADERS, 'x-scanner-session-token': token },
       payload: { eventId: EVENT_ID, entitlementId: entitlement.id },
     });
     expect(response.statusCode, response.body).toBe(201);
@@ -608,9 +691,9 @@ describe('POST /door/guests/check-in', () => {
     });
     expect((await services.repos().entitlements.findById(entitlement.id))?.scanCount).toBe(1);
 
-    // The ledger says a human did this, rather than borrowing a device's name.
+    // Manual admission retains the actual authorized device and operator.
     const scanRow = await services.repos().scanLedger.findById(response.json().checkInId);
-    expect(scanRow).toMatchObject({ deviceId: null, deviceBound: false, admittedCount: 1 });
+    expect(scanRow).toMatchObject({ deviceId: DEVICE_ID, deviceBound: true, admittedCount: 1 });
   });
 
   it('cannot be used to walk past an already-spent ticket', async () => {
@@ -621,7 +704,7 @@ describe('POST /door/guests/check-in', () => {
     const response = await server.inject({
       method: 'POST',
       url: '/door/guests/check-in',
-      headers: HEADERS,
+      headers: { ...HEADERS, 'x-scanner-session-token': token },
       payload: { eventId: EVENT_ID, entitlementId: entitlement.id },
     });
     expect(response.statusCode).toBe(400);
@@ -629,12 +712,12 @@ describe('POST /door/guests/check-in', () => {
   });
 
   it('cannot be used to admit a voided ticket', async () => {
-    await startShift();
+    const { token } = await startShift();
     const entitlement = await seedEntitlement('ENT-ops-manual-void', { status: 'void' });
     const response = await server.inject({
       method: 'POST',
       url: '/door/guests/check-in',
-      headers: HEADERS,
+      headers: { ...HEADERS, 'x-scanner-session-token': token },
       payload: { eventId: EVENT_ID, entitlementId: entitlement.id },
     });
     expect(response.statusCode).toBe(400);
@@ -778,19 +861,38 @@ describe('production-shaped ids survive the round trip', () => {
 });
 
 describe('V2 door-ops RBAC', () => {
-  it('denies a read-only member device binding (door.manage) with 403', async () => {
-    currentActor = { ...currentActor, role: 'member' };
-    const response = await server.inject({
+  it('lets gate staff register their own handset (door.floor) but not list the venue devices', async () => {
+    // Pairing is the first thing the scanner app does; binding grants nothing
+    // by itself (a device still needs a door code and a session), and
+    // re-authorizing an unbound one stays a door.manage act.
+    currentActor = { ...currentActor, role: 'gate_staff' };
+    const bind = await server.inject({
       method: 'POST',
       url: '/door/devices',
       headers: { 'x-organization-id': ORG_ID },
-      payload: { deviceId: DEVICE_ID, deviceName: 'Blocked iPad' },
+      payload: { deviceId: DEVICE_ID, deviceName: 'Gate iPad' },
     });
-    expect(response.statusCode).toBe(403);
-    expect(response.json()).toMatchObject({ code: 'forbidden', status: 403 });
+    expect(bind.statusCode).toBe(201);
+    const list = await server.inject({
+      method: 'GET',
+      url: '/door/devices',
+      headers: { 'x-organization-id': ORG_ID },
+    });
+    expect(list.statusCode).toBe(403);
+    expect(list.json()).toMatchObject({ code: 'forbidden', status: 403 });
   });
 
-  it("still lets a read-only member list tonight's events (venue.read)", async () => {
+  it('keeps the attendance report for supervisors and above', async () => {
+    currentActor = { ...currentActor, role: 'gate_staff' };
+    const gate = await server.inject({
+      method: 'GET',
+      url: `/door/attendance-report?eventId=${EVENT_ID}`,
+      headers: { 'x-organization-id': ORG_ID },
+    });
+    expect(gate.statusCode).toBe(403);
+  });
+
+  it("still lets a read-only member list tonight's events (door.floor)", async () => {
     currentActor = { ...currentActor, role: 'member' };
     const response = await server.inject({
       method: 'GET',
@@ -798,5 +900,233 @@ describe('V2 door-ops RBAC', () => {
       headers: { 'x-organization-id': ORG_ID },
     });
     expect(response.statusCode).toBe(200);
+  });
+});
+
+describe('M3 manual admission parity', () => {
+  it('requires a bound scanner session instead of accepting a manager identity alone', async () => {
+    await startShift();
+    const ticket = await seedEntitlement('ENT-m3-manual-session');
+    const response = await server.inject({
+      method: 'POST',
+      url: '/door/guests/check-in',
+      headers: HEADERS,
+      payload: { eventId: EVENT_ID, entitlementId: ticket.id },
+    });
+    expect(response.statusCode).toBe(401);
+    expect((await services.repos().entitlements.findById(ticket.id))?.scanCount).toBe(0);
+  });
+  it('requires explicit eligibility for Male and never consumes rejection', async () => {
+    const { token } = await startShift();
+    const ticket = await seedEntitlement('ENT-m3-manual-male', {
+      eligibility: {
+        audienceType: 'MALE',
+        minAge: null,
+        maxAge: null,
+        attested: true,
+        attestedAt: new Date().toISOString(),
+      },
+    });
+    const headers = { ...HEADERS, 'x-scanner-session-token': token };
+    const refused = await server.inject({
+      method: 'POST',
+      url: '/door/guests/check-in',
+      headers,
+      payload: { eventId: EVENT_ID, entitlementId: ticket.id },
+    });
+    expect(refused.statusCode).toBe(400);
+    expect((await services.repos().entitlements.findById(ticket.id))?.scanCount).toBe(0);
+    const admitted = await server.inject({
+      method: 'POST',
+      url: '/door/guests/check-in',
+      headers,
+      payload: { eventId: EVENT_ID, entitlementId: ticket.id, eligibilityVerified: true },
+    });
+    expect(admitted.statusCode, admitted.body).toBe(201);
+  });
+  it('requires the complete Couple and records both admissions on one bound-device claim', async () => {
+    const { token } = await startShift();
+    const ticket = await seedEntitlement('ENT-m3-manual-couple', { scanCountAllowed: 2 });
+    const headers = { ...HEADERS, 'x-scanner-session-token': token };
+    const refused = await server.inject({
+      method: 'POST',
+      url: '/door/guests/check-in',
+      headers,
+      payload: { eventId: EVENT_ID, entitlementId: ticket.id, eligibilityVerified: true },
+    });
+    expect(refused.statusCode).toBe(409);
+    expect((await services.repos().entitlements.findById(ticket.id))?.scanCount).toBe(0);
+    const admitted = await server.inject({
+      method: 'POST',
+      url: '/door/guests/check-in',
+      headers,
+      payload: {
+        eventId: EVENT_ID,
+        entitlementId: ticket.id,
+        eligibilityVerified: true,
+        coupleConfirmed: true,
+      },
+    });
+    expect(admitted.statusCode, admitted.body).toBe(201);
+    const ledger = await services.repos().scanLedger.findById(admitted.json().checkInId);
+    expect(ledger).toMatchObject({
+      deviceId: DEVICE_ID,
+      deviceBound: true,
+      admittedCount: 2,
+      operatorUid: SEED_ACTOR.userId,
+    });
+    expect((await services.repos().entitlements.findById(ticket.id))?.scanCount).toBe(2);
+  });
+});
+
+describe('M3 Couple gate binding', () => {
+  async function gatedPair() {
+    const { token } = await startShift(DEVICE_ID, 'north');
+    const ticket = await seedEntitlement('ENT-m3-gated-pair', { scanCountAllowed: 2 });
+    const asked = await scan(token, ticket.id);
+    expect(asked.json()).toMatchObject({ status: 'confirmation_required' });
+    return { token, ticket, confirmationToken: asked.json().confirmation.token as string };
+  }
+  it('pins an omitted final-confirmation gate to the current door code', async () => {
+    const { token, confirmationToken } = await gatedPair();
+    const response = await server.inject({
+      method: 'POST',
+      url: '/door/check-ins/confirm',
+      headers: { ...HEADERS, 'x-scanner-session-token': token },
+      payload: { eventId: EVENT_ID, confirmationToken, confirmed: true },
+    });
+    expect(response.json()).toMatchObject({ status: 'consumed' });
+    const ledger = await services.repos().scanLedger.findById(response.json().checkInId);
+    expect(ledger?.gate).toBe('north');
+  });
+  it('rejects a final-confirmation gate mismatch without consuming the pair', async () => {
+    const { token, ticket, confirmationToken } = await gatedPair();
+    const response = await server.inject({
+      method: 'POST',
+      url: '/door/check-ins/confirm',
+      headers: { ...HEADERS, 'x-scanner-session-token': token },
+      payload: { eventId: EVENT_ID, confirmationToken, confirmed: true, gate: 'south' },
+    });
+    expect(response.statusCode).toBe(404);
+    expect((await services.repos().entitlements.findById(ticket.id))?.scanCount).toBe(0);
+  });
+});
+
+it('rejects the old Scanner venue session after a material venue move for scans and Couple confirmation', async () => {
+  const baseline = await services.repos().events.getById(EVENT_ID);
+  if (!baseline) throw new Error('Event fixture missing');
+  await services
+    .repos()
+    .events.save({ ...baseline, venueId: 'venue_m3_original', version: baseline.version + 1 });
+  const { token } = await startShift();
+  const ticket = await seedEntitlement('ENT-m3-old-venue', { scanCountAllowed: 2 });
+  const asked = await scan(token, ticket.id);
+  const original = await services.repos().events.getById(EVENT_ID);
+  if (!original) throw new Error('Event fixture missing');
+  await services
+    .repos()
+    .events.save({ ...original, venueId: 'venue_m3_moved', version: original.version + 1 });
+  try {
+    const confirmation = await server.inject({
+      method: 'POST',
+      url: '/door/check-ins/confirm',
+      headers: { ...HEADERS, 'x-scanner-session-token': token },
+      payload: {
+        eventId: EVENT_ID,
+        confirmationToken: asked.json().confirmation.token,
+        confirmed: true,
+      },
+    });
+    expect(confirmation.statusCode).toBe(403);
+    const scanned = await scan(token, ticket.id);
+    expect(scanned.statusCode).toBe(403);
+    expect((await services.repos().entitlements.findById(ticket.id))?.scanCount).toBe(0);
+  } finally {
+    const latest = await services.repos().events.getById(EVENT_ID);
+    if (latest) await services.repos().events.save({ ...baseline, version: latest.version + 1 });
+  }
+});
+
+describe('M3 manual and Couple auxiliary failure safety', () => {
+  it('returns successful manual admission when redundant admin audit storage is unavailable', async () => {
+    const { token } = await startShift();
+    const ticket = await seedEntitlement('ENT-m3-aux-manual');
+    const audit = vi
+      .spyOn(services.adminAudits(), 'write')
+      .mockRejectedValue(new Error('Synthetic audit outage'));
+    try {
+      const response = await server.inject({
+        method: 'POST',
+        url: '/door/guests/check-in',
+        headers: { ...HEADERS, 'x-scanner-session-token': token },
+        payload: { eventId: EVENT_ID, entitlementId: ticket.id },
+      });
+      expect(response.statusCode, response.body).toBe(201);
+      expect(response.json()).toMatchObject({
+        guest: { id: ticket.id, status: 'entered', scansUsed: 1 },
+      });
+      expect(
+        (await services.repos().scanLedger.findById(response.json().checkInId))?.admittedCount,
+      ).toBe(1);
+    } finally {
+      audit.mockRestore();
+    }
+  });
+  it('does not depend on a second ticket read after successful manual admission', async () => {
+    const { token } = await startShift();
+    const ticket = await seedEntitlement('ENT-m3-aux-manual-read');
+    const original = services.repos().entitlements.findById.bind(services.repos().entitlements);
+    const read = vi
+      .spyOn(services.repos().entitlements, 'findById')
+      .mockImplementation(async (id) => {
+        const value = await original(id);
+        if (value && value.scanCount > 0) throw new Error('Synthetic post-claim read outage');
+        return value;
+      });
+    try {
+      const response = await server.inject({
+        method: 'POST',
+        url: '/door/guests/check-in',
+        headers: { ...HEADERS, 'x-scanner-session-token': token },
+        payload: { eventId: EVENT_ID, entitlementId: ticket.id },
+      });
+      expect(response.statusCode, response.body).toBe(201);
+      expect(response.json()).toMatchObject({
+        guest: { id: ticket.id, status: 'entered', scansUsed: 1 },
+      });
+    } finally {
+      read.mockRestore();
+    }
+  });
+  it('returns canonical Couple success when liveness and redundant audit writers are unavailable', async () => {
+    const { token } = await startShift();
+    const ticket = await seedEntitlement('ENT-m3-aux-pair', { scanCountAllowed: 2 });
+    const asked = await scan(token, ticket.id);
+    const touch = vi
+      .spyOn(services.repos().scannerDevices, 'touch')
+      .mockRejectedValue(new Error('Synthetic touch outage'));
+    const audit = vi
+      .spyOn(services.adminAudits(), 'write')
+      .mockRejectedValue(new Error('Synthetic audit outage'));
+    try {
+      const response = await server.inject({
+        method: 'POST',
+        url: '/door/check-ins/confirm',
+        headers: { ...HEADERS, 'x-scanner-session-token': token },
+        payload: {
+          eventId: EVENT_ID,
+          confirmationToken: asked.json().confirmation.token,
+          confirmed: true,
+        },
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json()).toMatchObject({ status: 'consumed' });
+      expect(
+        (await services.repos().scanLedger.findById(response.json().checkInId))?.admittedCount,
+      ).toBe(2);
+    } finally {
+      touch.mockRestore();
+      audit.mockRestore();
+    }
   });
 });

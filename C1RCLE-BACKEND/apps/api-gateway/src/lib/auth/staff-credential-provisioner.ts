@@ -37,11 +37,10 @@ export class BetterAuthStaffCredentialProvisioner implements StaffCredentialProv
   async provisionLogin(email: string, displayName: string): Promise<StaffCredentialProvision> {
     const normalized = email.trim().toLowerCase();
     const existingId = await this.findUserId(normalized);
-    if (existingId) {
-      return { userId: existingId, created: false, temporaryPassword: null };
-    }
-
     const temporaryPassword = generateTemporaryPassword();
+
+    if (existingId) return { userId: existingId, created: false, temporaryPassword: null };
+
     try {
       await this.auth.api.signUpEmail({
         body: {
@@ -52,11 +51,9 @@ export class BetterAuthStaffCredentialProvisioner implements StaffCredentialProv
         },
       });
     } catch (error) {
-      // Lost a race with a concurrent signup/provision for the same address:
-      // whoever won owns the credentials — never overwrite them.
       if (isDuplicateAccountError(error)) {
         const racedId = await this.findUserId(normalized);
-        return { userId: racedId, created: false, temporaryPassword: null };
+        if (racedId) return { userId: racedId, created: false, temporaryPassword: null };
       }
       throw error;
     }
@@ -66,6 +63,18 @@ export class BetterAuthStaffCredentialProvisioner implements StaffCredentialProv
       throw new Error('Provisioned account could not be found after signup');
     }
     return { userId, created: true, temporaryPassword };
+  }
+
+  async reissueTemporaryPassword(userId: string): Promise<string> {
+    const temporaryPassword = generateTemporaryPassword();
+    // Same two calls Better Auth's own admin `setUserPassword` makes: hash with
+    // the instance's configured hasher, write the credential row, and drop any
+    // session opened with the previous temporary password.
+    const context = await this.auth.$context;
+    const hashed = await context.password.hash(temporaryPassword);
+    await context.internalAdapter.updatePassword(userId, hashed);
+    await context.internalAdapter.deleteUserSessions(userId);
+    return temporaryPassword;
   }
 
   private async findUserId(normalizedEmail: string): Promise<string | null> {

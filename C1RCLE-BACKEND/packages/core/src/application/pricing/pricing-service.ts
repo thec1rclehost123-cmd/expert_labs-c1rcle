@@ -1,11 +1,14 @@
 import { InvalidOperationError } from '../../domain/errors.js';
-import { assertPromoUsable } from '../../domain/models/event-catalog.js';
+import { activeTicketPricingPhase, assertPromoUsable } from '../../domain/models/event-catalog.js';
 import { calculatePricing } from '../../domain/models/pricing.js';
 
 import type { EntityId } from '../../domain/identity.js';
+import type { BookingFeePolicy } from '../../domain/models/booking-fee-policy.js';
 import type { PromoCode } from '../../domain/models/event-catalog.js';
 import type { PricingBreakdown } from '../../domain/models/pricing.js';
+import type { TicketAddonSelection } from '../../domain/models/ticket-addon.js';
 import type { EventCatalogRepository } from '../../domain/ports/repositories.js';
+import type { InventoryService } from '../inventory/inventory-service.js';
 
 /**
  * ─── PricingService (Phase 4) ──────────────────────────────────────────────────
@@ -14,7 +17,15 @@ import type { EventCatalogRepository } from '../../domain/ports/repositories.js'
  * repository access for promo code validation.
  */
 export class PricingService {
-  constructor(private readonly deps: { eventCatalog: EventCatalogRepository }) {}
+  constructor(
+    private readonly deps: {
+      eventCatalog: EventCatalogRepository;
+      inventory?: Pick<InventoryService, 'getAvailablePricingPhaseQuantity'>;
+      bookingFeePolicy?: () => Promise<BookingFeePolicy>;
+      /** One injected server clock shared by tier, phase and promo decisions. */
+      clock?: () => Date;
+    },
+  ) {}
 
   /**
    * Calculates pricing for a set of lines with optional promo code.
@@ -22,7 +33,11 @@ export class PricingService {
    */
   async calculate(input: {
     eventId: EntityId;
-    lines: { tierId: EntityId; quantity: number }[];
+    lines: {
+      tierId: EntityId;
+      quantity: number;
+      ticketAddons?: { addonId: EntityId; quantityPerEntitlement: number }[];
+    }[];
     promoCode?: string | null;
   }): Promise<PricingBreakdown> {
     const { eventId, lines, promoCode } = input;
@@ -30,50 +45,117 @@ export class PricingService {
     // Load event catalog (tiers + promos)
     const catalog = await this.deps.eventCatalog.listTiers(eventId);
     const tierMap = new Map(catalog.map((t) => [t.id, t]));
+    const addonCatalog = await this.deps.eventCatalog.listTicketAddons(eventId);
+    const addonMap = new Map(addonCatalog.map((addon) => [addon.id, addon]));
 
-    const now = Date.now();
-    const pricingLines = lines.map((l) => {
-      const tier = tierMap.get(l.tierId);
-      if (!tier) throw new InvalidOperationError(`Tier ${l.tierId} not found for event ${eventId}`);
-      if (tier.status !== 'active')
-        throw new InvalidOperationError(`Tier ${tier.name} is not available`);
-      if (tier.salesStartAt && Date.parse(tier.salesStartAt) > now)
-        throw new InvalidOperationError(`${tier.name} sales have not started`);
-      if (tier.salesEndAt && Date.parse(tier.salesEndAt) <= now)
-        throw new InvalidOperationError(`${tier.name} sales have ended`);
-      if (
-        tier.minPerOrder !== null &&
-        tier.minPerOrder !== undefined &&
-        l.quantity < tier.minPerOrder
-      ) {
-        throw new InvalidOperationError(
-          `${tier.name} requires at least ${tier.minPerOrder} ticket(s)`,
-        );
-      }
-      if (
-        tier.maxPerUser !== null &&
-        tier.maxPerUser !== undefined &&
-        l.quantity > tier.maxPerUser
-      ) {
-        throw new InvalidOperationError(
-          `${tier.name} allows at most ${tier.maxPerUser} ticket(s) per user`,
-        );
-      }
-      const phase = (tier.pricingPhases ?? []).find(
-        (candidate) => Date.parse(candidate.startsAt) <= now && Date.parse(candidate.endsAt) > now,
-      );
-      const resolvedTier = phase ? { ...tier, priceInPaise: phase.priceInPaise } : tier;
-      return { tier: resolvedTier, quantity: l.quantity };
-    });
+    const now = this.deps.clock?.() ?? new Date();
+    const seenTiers = new Set<EntityId>();
+    const pricingLines = await Promise.all(
+      lines.map(async (l) => {
+        if (seenTiers.has(l.tierId))
+          throw new InvalidOperationError('A tier may appear only once per order');
+        seenTiers.add(l.tierId);
+        const tier = tierMap.get(l.tierId);
+        if (!tier)
+          throw new InvalidOperationError(`Tier ${l.tierId} not found for event ${eventId}`);
+        if (tier.audienceType === 'STUDENT' || tier.audienceType === 'MEMBER')
+          throw new InvalidOperationError('This ticket category is not available in V1');
+        if (tier.status !== 'active')
+          throw new InvalidOperationError(`Tier ${tier.name} is not available`);
+        if (tier.salesStartAt && Date.parse(tier.salesStartAt) > now.getTime())
+          throw new InvalidOperationError(`${tier.name} sales have not started`);
+        if (tier.salesEndAt && Date.parse(tier.salesEndAt) <= now.getTime())
+          throw new InvalidOperationError(`${tier.name} sales have ended`);
+        if (
+          tier.minPerOrder !== null &&
+          tier.minPerOrder !== undefined &&
+          l.quantity < tier.minPerOrder
+        ) {
+          throw new InvalidOperationError(
+            `${tier.name} requires at least ${tier.minPerOrder} ticket(s)`,
+          );
+        }
+        if (
+          tier.maxPerUser !== null &&
+          tier.maxPerUser !== undefined &&
+          l.quantity > tier.maxPerUser
+        ) {
+          throw new InvalidOperationError(
+            `${tier.name} allows at most ${tier.maxPerUser} ticket(s) per user`,
+          );
+        }
+        let phase = activeTicketPricingPhase(tier.pricingPhases, now);
+        if (phase?.quantity != null) {
+          if (!this.deps.inventory)
+            throw new InvalidOperationError('Quantity-priced availability is unavailable');
+          const available = await this.deps.inventory.getAvailablePricingPhaseQuantity(
+            eventId,
+            tier.id,
+            phase.id,
+            now,
+          );
+          const units =
+            l.quantity * (tier.admissionMode === 'per_person' ? (tier.guestCount ?? 1) : 1);
+          if (available < units) phase = null;
+        }
+        const resolvedTier = phase ? { ...tier, priceInPaise: phase.priceInPaise } : tier;
+        const seenAddons = new Set<EntityId>();
+        const ticketAddons: TicketAddonSelection[] = (l.ticketAddons ?? []).map((requested) => {
+          if (seenAddons.has(requested.addonId)) {
+            throw new InvalidOperationError('An add-on may appear only once per ticket line');
+          }
+          seenAddons.add(requested.addonId);
+          const addon = addonMap.get(requested.addonId);
+          if (!addon || addon.eventId !== eventId || addon.organizationId !== tier.organizationId) {
+            throw new InvalidOperationError('Ticket add-on is not available for this event');
+          }
+          if (addon.status !== 'active') {
+            throw new InvalidOperationError(`${addon.name} is not available`);
+          }
+          if (
+            (addon.salesStartAt && Date.parse(addon.salesStartAt) > now.getTime()) ||
+            (addon.salesEndAt && Date.parse(addon.salesEndAt) <= now.getTime())
+          ) {
+            throw new InvalidOperationError(`${addon.name} is outside its sales window`);
+          }
+          if (
+            !Number.isSafeInteger(requested.quantityPerEntitlement) ||
+            requested.quantityPerEntitlement < 1 ||
+            requested.quantityPerEntitlement > addon.maxPerEntitlement
+          ) {
+            throw new InvalidOperationError(
+              `${addon.name} allows 1 to ${addon.maxPerEntitlement} per ticket`,
+            );
+          }
+          return {
+            addonId: addon.id,
+            name: addon.name,
+            kind: addon.kind,
+            unitPricePaise: addon.priceInPaise,
+            quantityPerEntitlement: requested.quantityPerEntitlement,
+          };
+        });
+        return {
+          tier: resolvedTier,
+          quantity: l.quantity,
+          baseAdmissionUnitPricePaise: tier.priceInPaise,
+          pricingPhaseName: phase?.name ?? null,
+          ticketAddons,
+          pricingPhaseId: phase?.id ?? null,
+        };
+      }),
+    );
 
     let promo: PromoCode | null = null;
-    if (promoCode) {
-      promo = await this.deps.eventCatalog.getPromoByCode(promoCode, eventId);
-      if (!promo) throw new InvalidOperationError(`Promo code ${promoCode} not found`);
-      assertPromoUsable(promo, new Date());
+    const normalizedPromoCode = promoCode?.trim().toUpperCase();
+    if (normalizedPromoCode) {
+      promo = await this.deps.eventCatalog.getPromoByCode(normalizedPromoCode, eventId);
+      if (!promo) throw new InvalidOperationError(`Promo code ${normalizedPromoCode} not found`);
+      assertPromoUsable(promo, now);
     }
 
     const pricing = calculatePricing({
+      ...(this.deps.bookingFeePolicy ? { feePolicy: await this.deps.bookingFeePolicy() } : {}),
       lines: pricingLines,
       promo: promo ?? undefined,
       currency: 'INR',

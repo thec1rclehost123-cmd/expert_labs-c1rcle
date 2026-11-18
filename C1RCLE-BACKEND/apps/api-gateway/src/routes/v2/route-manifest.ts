@@ -3,6 +3,8 @@ import { createV2Services } from '../../lib/v2-services.js';
 import authContextPlugin from '../../plugins/auth.js';
 
 import adminAnalyticsRoutes from './admin/analytics.js';
+import adminCommunicationRoutes from './admin/communications.js';
+import adminComplimentaryAllocationRoutes from './admin/complimentary-allocations.js';
 import adminDirectoryRoutes from './admin/directory.js';
 import adminDisputeRoutes from './admin/disputes.js';
 import adminEventActionRoutes from './admin/event-actions.js';
@@ -29,6 +31,7 @@ import doorOpsRoutes from './door/door-ops-routes.js';
 import phase5DoorSaleRoutes from './door/door-sale-routes.js';
 import doorCodeRoutes from './door/event-code-routes.js';
 import phase5ScannerRoutes from './door/scanner-routes.js';
+import eventCoverRedemptionRoutes from './event-cover/event-cover-redemption-routes.js';
 import financeRoutes from './finance/finance-routes.js';
 import leaderboardRoutes from './finance/leaderboard-routes.js';
 import { internalRoutes } from './internal/index.js';
@@ -38,11 +41,16 @@ import orderRoutes from './orders/orders-routes.js';
 import partnerAnalyticsRoutes from './partner/analytics.js';
 import partnerDiscoveryRoutes from './partner/discover.js';
 import partnerEventCatalogRoutes from './partner/event-catalog.js';
+import eventComparisonRoutes from './partner/event-comparison.js';
 import partnerEventRoutes from './partner/events.js';
+import partnerMarketingRoutes from './partner/marketing.js';
 import partnerOrganizationRoutes from './partner/organizations.js';
 import partnerPartnershipRoutes from './partner/partnerships.js';
+import partnerProfileRoutes from './partner/profiles.js';
 import promoterConnectionRoutes from './partner/promoter-connections.js';
 import partnerReferralLinkRoutes from './partner/referral-links.js';
+import partnerSearchRoutes from './partner/search.js';
+import partnerSettingsRoutes from './partner/settings.js';
 import partnerVenueRoutes from './partner/venues.js';
 import phase5Routes from './phase5-routes.js';
 import guestProfileRoutes from './profile.js';
@@ -51,6 +59,7 @@ import rsvpRoutes from './rsvp/rsvp-routes.js';
 import socialRoutes from './social/social-routes.js';
 import supportIntakeRoutes from './support/intake-routes.js';
 import ticketRoutes from './tickets/ticket-routes.js';
+import waitlistRoutes from './tickets/waitlist-routes.js';
 import walletRoutes from './wallet/wallet-routes.js';
 
 import type { GatewayRuntimeState } from '../../lib/runtime-state.js';
@@ -70,10 +79,10 @@ export interface RegisterV2RoutesOptions {
  * The single registration surface for all `/api/v2` routes. Phase 4's public
  * discovery slice (PR1, unauthenticated, under `/public`), checkout/
  * payments/webhook slice (PR2), and orders/tickets/wallet reads (PR3) are
- * all LIVE. Ticket transfer/claim/cancel-transfer stay unregistered — the
- * committed `Entitlement` model has no transfer state to wire against yet
- * (see `tickets/ticket-routes.ts`'s doc comment); they 404 by absence, never
- * by a 501 stub (D-006), same as any other genuinely-blocked slice.
+ * registered. V1 waitlist endpoints explicitly reject with 410; preserved
+ * transfer/claim, scanner, cover and controlled-admin
+ * routes are registered but remain protected by Core authorization and feature
+ * gates where policy or operational approval is still pending.
  */
 export async function registerV2Routes(
   app: FastifyInstance,
@@ -89,6 +98,7 @@ export async function registerV2Routes(
   await app.register(authContextPlugin, {
     auth,
     organizations: services.repos().organizations,
+    userBans: services.repos().userBans,
     rotationStore: services.rotationStore,
   });
 
@@ -120,17 +130,25 @@ export async function registerV2Routes(
       // nested under the org-scoped/authenticated route group above.
       await v2.register(publicDiscoveryRoutes, { prefix: '/public' });
       await partnerOrganizationRoutes(v2);
+      await partnerSettingsRoutes(v2);
+      await partnerProfileRoutes(v2);
+      await partnerSearchRoutes(v2);
       await partnerVenueRoutes(v2);
       await partnerEventRoutes(v2);
+      await eventComparisonRoutes(v2);
       await partnerEventCatalogRoutes(v2);
       await partnerPartnershipRoutes(v2);
       await partnerDiscoveryRoutes(v2);
       await partnerAnalyticsRoutes(v2);
+      await partnerMarketingRoutes(v2);
       await partnerReferralLinkRoutes(v2);
       await promoterConnectionRoutes(v2);
       // Phase 2: not org-scoped — an applicant has no organization yet, and a
       // platform admin acts across all of them.
-      await onboardingRoutes(v2);
+      // Onboarding has an applicant-specific verification preHandler. Keep its
+      // hooks encapsulated so they cannot gate unrelated routes such as
+      // internal health/readiness or public Guest endpoints.
+      await v2.register(onboardingRoutes);
       // Guest profile: session-scoped like onboarding — a guest belongs to no org.
       await guestProfileRoutes(v2);
       await adminRoutes(v2);
@@ -141,9 +159,11 @@ export async function registerV2Routes(
       await adminDirectoryRoutes(v2);
       // Phase 7: support desk over the ticket aggregate.
       await adminSupportRoutes(v2);
+      await adminCommunicationRoutes(v2);
       await adminOrderRoutes(v2);
       await adminAnalyticsRoutes(v2);
       await adminTicketRoutes(v2);
+      await adminComplimentaryAllocationRoutes(v2);
       await adminPromotionsRoutes(v2);
       await adminPromotersRoutes(v2);
       await adminVenueActionRoutes(v2);
@@ -160,7 +180,9 @@ export async function registerV2Routes(
       // Phase 4 PR3: guest order/ticket reads + wallet.
       await orderRoutes(v2);
       await ticketRoutes(v2);
+      await waitlistRoutes(v2);
       await walletRoutes(v2);
+      await eventCoverRedemptionRoutes(v2);
       // Phase 5: Door / Scanner / Cover-wallet
       await doorCodeRoutes(v2);
       await doorOpsRoutes(v2);

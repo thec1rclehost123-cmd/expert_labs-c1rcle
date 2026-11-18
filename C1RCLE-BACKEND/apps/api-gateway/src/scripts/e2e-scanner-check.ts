@@ -21,7 +21,7 @@ import { getGatewayConfig } from '../config/index.js';
  */
 
 const GATEWAY_URL = 'http://localhost:8080';
-const OWNER_EMAIL = process.env.SEED_E2E_OWNER_EMAIL ?? 'seed_e2e_owner@c1rcle.test';
+const OWNER_EMAIL = 'seed_e2e_owner@c1rcle.test';
 const OWNER_PASSWORD = process.env.SEED_E2E_OWNER_PASSWORD;
 if (OWNER_PASSWORD === undefined) {
   throw new Error('SEED_E2E_OWNER_PASSWORD must be set to run the scanner e2e check.');

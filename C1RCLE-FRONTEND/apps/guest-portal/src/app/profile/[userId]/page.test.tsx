@@ -1,80 +1,78 @@
 import { render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-
-import { resetEnvCacheForTests } from '@c1rcle/config';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import PublicProfilePage, { dynamic, generateMetadata } from './page';
 
+const mocks = vi.hoisted(() => ({ get: vi.fn(), session: vi.fn() }));
 vi.mock('next/image', () => ({
-  default: ({ alt, fill: _fill, ...props }: React.ComponentProps<'img'> & { fill?: boolean }) => (
+  default: ({
+    fill: _fill,
+    unoptimized: _unoptimized,
+    ...props
+  }: React.ComponentProps<'img'> & { fill?: boolean; unoptimized?: boolean }) => (
     // eslint-disable-next-line @next/next/no-img-element
-    <img alt={alt} {...props} />
+    <img {...props} alt={props.alt ?? ''} />
   ),
 }));
-
+vi.mock('next/headers', () => ({
+  cookies: () => Promise.resolve({ toString: () => 'better-auth.session_token=synthetic' }),
+}));
 vi.mock('next/navigation', () => ({
   notFound: () => {
     throw new Error('NEXT_NOT_FOUND');
   },
+  useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
 }));
+vi.mock('@/lib/auth/require-session', () => ({ requireGuestSession: mocks.session }));
+vi.mock('@c1rcle/api-client', () => ({
+  createApiClient: () => ({ get: mocks.get }),
+  isApiClientError: (error: unknown) =>
+    typeof error === 'object' && error !== null && 'status' in error,
+}));
+const profile = {
+  identity: {
+    id: 'guest-b',
+    displayName: 'Synthetic Guest B',
+    avatarUrl: null,
+    interests: ['House'],
+  },
+  upcomingEvents: [],
+};
 
-afterEach(() => {
-  vi.unstubAllEnvs();
-  resetEnvCacheForTests();
+beforeEach(() => {
+  vi.resetAllMocks();
+  mocks.session.mockResolvedValue({ user: { id: 'guest-a' } });
+  mocks.get.mockResolvedValue(profile);
 });
-
-describe('PublicProfilePage', () => {
-  it('renders non-indexable development profiles on demand', () => {
+describe('founder-approved Guest social profile', () => {
+  it('requires the viewer session and loads only the dedicated social projection', async () => {
+    render(await PublicProfilePage({ params: Promise.resolve({ userId: 'guest-b' }) }));
+    expect(mocks.session).toHaveBeenCalledWith('/profile/guest-b');
+    expect(mocks.get).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/api/v2/social/profiles/guest-b' }),
+    );
+    expect(screen.getByRole('heading', { name: 'Synthetic Guest B' })).toBeInTheDocument();
+    expect(screen.getByText('House')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Block Guest' })).toBeInTheDocument();
+  });
+  it.each(['private', 'blocked', 'missing'])(
+    'uses the same unavailable response for a %s profile',
+    async () => {
+      mocks.get.mockRejectedValue({ status: 404 });
+      await expect(
+        PublicProfilePage({ params: Promise.resolve({ userId: 'guest-b' }) }),
+      ).rejects.toThrow('NEXT_NOT_FOUND');
+    },
+  );
+  it('keeps metadata generic, private and free of identity fields', () => {
     expect(dynamic).toBe('force-dynamic');
+    expect(generateMetadata().robots).toMatchObject({ index: false });
+    expect(JSON.stringify(generateMetadata())).not.toContain('Synthetic Guest B');
   });
-
-  it('renders public member identity and upcoming events without private account data', async () => {
-    render(await PublicProfilePage({ params: Promise.resolve({ userId: 'riya' }) }));
-
-    expect(screen.getByRole('heading', { level: 1, name: 'Riya Kapoor' })).toBeInTheDocument();
-    expect(screen.getByText(/Always looking for intimate live sets/i)).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Rooftop Jazz' })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'View Rooftop Jazz' })).toHaveAttribute(
-      'href',
-      '/event/rooftop-jazz',
-    );
-    expect(screen.queryByText('riya@example.com')).not.toBeInTheDocument();
-    expect(screen.queryByText('98765 43210')).not.toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: 'Edit profile' })).not.toBeInTheDocument();
-  });
-
-  it('renders the attended event filter from URL state', async () => {
-    render(
-      await PublicProfilePage({
-        params: Promise.resolve({ userId: 'riya' }),
-        searchParams: Promise.resolve({ filter: 'attended' }),
-      }),
-    );
-
-    expect(screen.getByRole('heading', { name: 'Neon Nights' })).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: 'Rooftop Jazz' })).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'attended' })).toHaveAttribute('aria-current', 'page');
-  });
-
-  it('returns real not-found behavior for an unknown fixture member', async () => {
-    await expect(
-      PublicProfilePage({ params: Promise.resolve({ userId: 'missing-member' }) }),
-    ).rejects.toThrow('NEXT_NOT_FOUND');
-  });
-
-  it('does not expose fixture member profiles in production', async () => {
-    vi.stubEnv('NEXT_PUBLIC_ENVIRONMENT', 'production');
-    resetEnvCacheForTests();
-
-    await expect(
-      PublicProfilePage({ params: Promise.resolve({ userId: 'riya' }) }),
-    ).rejects.toThrow('NEXT_NOT_FOUND');
-  });
-
-  it('generates member-specific metadata without indexing fixture profiles', async () => {
-    const metadata = await generateMetadata({ params: Promise.resolve({ userId: 'riya' }) });
-
-    expect(metadata.title).toEqual({ absolute: 'Member profile | THE C1RCLE' });
-    expect(metadata.robots).toMatchObject({ follow: true, index: false, noarchive: true });
+  it('does not substitute fixture identities when the service is unavailable', async () => {
+    mocks.get.mockRejectedValue({ status: 503 });
+    render(await PublicProfilePage({ params: Promise.resolve({ userId: 'guest-b' }) }));
+    expect(screen.getByRole('heading', { name: 'Profile unavailable' })).toBeInTheDocument();
+    expect(screen.queryByText('Synthetic Guest B')).not.toBeInTheDocument();
   });
 });

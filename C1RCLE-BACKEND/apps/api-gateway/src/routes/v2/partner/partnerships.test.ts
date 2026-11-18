@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
+import { createV2Services } from '../../../lib/v2-services.js';
+import { seedApprovedPartnerOrganization } from '../../../test-utils/approved-partner-organization.js';
 import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
 
 import partnerEventRoutes from './events.js';
@@ -39,27 +41,19 @@ const read = (org: string) => ({ 'x-organization-id': org });
 async function seedHostAndVenue(
   server: Server,
 ): Promise<{ host: string; venue: string; venueOrg: string }> {
-  const hostCreated = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: {
-      'x-organization-id': 'org_host_seed',
-      'idempotency-key': `seed-${++keySeq}`,
-    },
-    payload: { name: 'Host Co', slug: `host-co-${keySeq}` },
+  ++keySeq;
+  const hostCreated = await seedApprovedPartnerOrganization({
+    name: 'Host Co',
+    slug: `host-co-${keySeq}`,
   });
-  const host: string = hostCreated.json().id;
+  const host: string = hostCreated.id;
 
-  const venueOrgCreated = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: {
-      'x-organization-id': 'org_venue_seed',
-      'idempotency-key': `seed-${++keySeq}`,
-    },
-    payload: { name: 'Venue Co', slug: `venue-co-${keySeq}` },
+  ++keySeq;
+  const venueOrgCreated = await seedApprovedPartnerOrganization({
+    name: 'Venue Co',
+    slug: `venue-co-${keySeq}`,
   });
-  const venueOrg: string = venueOrgCreated.json().id;
+  const venueOrg: string = venueOrgCreated.id;
 
   const venueCreated = await server.inject({
     method: 'POST',
@@ -290,6 +284,15 @@ describe('answering a request', () => {
   it('lets the venue (the counterparty) approve', async () => {
     const server = await buildServer();
     const { venueOrg, partnershipId } = await pendingRequest(server);
+    const notifications = createV2Services().repos().notifications;
+    const before = await notifications.listUnreadByRecipient(venueOrg, {
+      limit: 100,
+      cursor: null,
+    });
+    const requestNotification = before.items.find(
+      (notification) => notification.action?.resourceId === partnershipId,
+    );
+    expect(requestNotification).toBeDefined();
 
     const response = await server.inject({
       method: 'POST',
@@ -299,6 +302,11 @@ describe('answering a request', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ status: 'active' });
+    if (!requestNotification) throw new Error('partnership request notification was not created');
+    await expect(notifications.getById(requestNotification.id)).resolves.toMatchObject({
+      read: true,
+      action: null,
+    });
     await server.close();
   });
 
@@ -321,6 +329,14 @@ describe('answering a request', () => {
   it('records a rejection reason', async () => {
     const server = await buildServer();
     const { venueOrg, partnershipId } = await pendingRequest(server);
+    const notifications = createV2Services().repos().notifications;
+    const before = await notifications.listUnreadByRecipient(venueOrg, {
+      limit: 100,
+      cursor: null,
+    });
+    const requestNotification = before.items.find(
+      (notification) => notification.action?.resourceId === partnershipId,
+    );
 
     const response = await server.inject({
       method: 'POST',
@@ -333,12 +349,25 @@ describe('answering a request', () => {
       status: 'rejected',
       resolutionReason: 'Fully booked',
     });
+    if (!requestNotification) throw new Error('partnership request notification was not created');
+    await expect(notifications.getById(requestNotification.id)).resolves.toMatchObject({
+      read: true,
+      action: null,
+    });
     await server.close();
   });
 
   it('lets the requester withdraw a pending request', async () => {
     const server = await buildServer();
-    const { host, partnershipId } = await pendingHostRequest(server);
+    const { host, venueOrg, partnershipId } = await pendingHostRequest(server);
+    const notifications = createV2Services().repos().notifications;
+    const before = await notifications.listUnreadByRecipient(venueOrg, {
+      limit: 100,
+      cursor: null,
+    });
+    const requestNotification = before.items.find(
+      (notification) => notification.action?.resourceId === partnershipId,
+    );
 
     // The legacy Sent tab offers "Cancel request", which posts to `end`.
     const response = await server.inject({
@@ -350,6 +379,11 @@ describe('answering a request', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ status: 'ended' });
+    if (!requestNotification) throw new Error('partnership request notification was not created');
+    await expect(notifications.getById(requestNotification.id)).resolves.toMatchObject({
+      read: true,
+      action: null,
+    });
     await server.close();
   });
 
@@ -422,13 +456,12 @@ describe('answering a request', () => {
   it('hides a partnership between two other organizations', async () => {
     const server = await buildServer();
     const { partnershipId } = await pendingRequest(server);
-    const strangerCreated = await server.inject({
-      method: 'POST',
-      url: '/organizations',
-      headers: { 'x-organization-id': 'org_stranger_seed', 'idempotency-key': `seed-${++keySeq}` },
-      payload: { name: 'Stranger Org', slug: `stranger-${keySeq}` },
+    ++keySeq;
+    const strangerCreated = await seedApprovedPartnerOrganization({
+      name: 'Stranger Org',
+      slug: `stranger-${keySeq}`,
     });
-    const stranger: string = strangerCreated.json().id;
+    const stranger: string = strangerCreated.id;
 
     const response = await server.inject({
       method: 'POST',

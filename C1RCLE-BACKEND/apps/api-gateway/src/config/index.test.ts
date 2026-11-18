@@ -12,6 +12,7 @@ function productionEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.Proces
   return {
     NODE_ENV: 'production',
     STORAGE_DRIVER: 'firestore',
+    FIRESTORE_PROJECT_ID: 'c1rcle-v2',
     FIREBASE_CLIENT_EMAIL: 'firebase@example.test',
     FIREBASE_PRIVATE_KEY: 'private-key',
     BETTER_AUTH_SECRET: 'a'.repeat(64),
@@ -28,6 +29,77 @@ function productionEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.Proces
 }
 
 describe('gateway configuration', () => {
+  it('allows Firebase Auth Emulator only on loopback outside production', () => {
+    expect(
+      getGatewayConfig({
+        NODE_ENV: 'test',
+        FIREBASE_AUTH_EMULATOR_HOST: '127.0.0.1:9099',
+      }).FIREBASE_AUTH_EMULATOR_HOST,
+    ).toBe('127.0.0.1:9099');
+    expect(() =>
+      getGatewayConfig({
+        NODE_ENV: 'test',
+        FIREBASE_AUTH_EMULATOR_HOST: 'auth-emulator.internal:9099',
+      }),
+    ).toThrow(/FIREBASE_AUTH_EMULATOR_HOST/);
+    expect(() =>
+      getGatewayConfig({
+        ...productionEnvironment(),
+        FIREBASE_AUTH_EMULATOR_HOST: '127.0.0.1:9099',
+      }),
+    ).toThrow(/FIREBASE_AUTH_EMULATOR_HOST/);
+  });
+
+  it('keeps process-wide workers off unless explicitly enabled', () => {
+    expect(getGatewayConfig(productionEnvironment()).BACKGROUND_WORKERS_ENABLED).toBe(false);
+    expect(
+      getGatewayConfig(productionEnvironment({ BACKGROUND_WORKERS_ENABLED: 'false' }))
+        .BACKGROUND_WORKERS_ENABLED,
+    ).toBe(false);
+  });
+
+  it('keeps M5 private access disabled in production unless explicitly enabled', () => {
+    expect(getGatewayConfig(productionEnvironment()).M5_PRIVATE_ACCESS_ENABLED).toBe(false);
+    expect(
+      getGatewayConfig(productionEnvironment({ M5_PRIVATE_ACCESS_ENABLED: 'true' }))
+        .M5_PRIVATE_ACCESS_ENABLED,
+    ).toBe(true);
+  });
+
+  it('keeps restricted eligibility sales disabled until explicitly approved', () => {
+    expect(getGatewayConfig(productionEnvironment()).M5_ELIGIBILITY_RULES_ENABLED).toBe(false);
+    expect(
+      getGatewayConfig(productionEnvironment({ M5_ELIGIBILITY_RULES_ENABLED: 'true' }))
+        .M5_ELIGIBILITY_RULES_ENABLED,
+    ).toBe(true);
+  });
+
+  it('keeps ticket add-on sales disabled until accounting and tax treatment is approved', () => {
+    expect(getGatewayConfig(productionEnvironment()).M5_TICKET_ADDONS_ENABLED).toBe(false);
+    expect(
+      getGatewayConfig(productionEnvironment({ M5_TICKET_ADDONS_ENABLED: 'true' }))
+        .M5_TICKET_ADDONS_ENABLED,
+    ).toBe(true);
+  });
+
+  it('keeps ticket transfers disabled until offline issuance is disabled and drained', () => {
+    const defaults = getGatewayConfig(productionEnvironment());
+    expect(defaults.M5_TICKET_TRANSFERS_ENABLED).toBe(false);
+    expect(defaults.M5_OFFLINE_TICKET_MANIFESTS_ENABLED).toBe(true);
+    expect(defaults.M5_OFFLINE_MANIFEST_DRAIN_COMPLETE).toBe(false);
+
+    const drain = getGatewayConfig(
+      productionEnvironment({
+        M5_TICKET_TRANSFERS_ENABLED: 'true',
+        M5_OFFLINE_TICKET_MANIFESTS_ENABLED: 'false',
+        M5_OFFLINE_MANIFEST_DRAIN_COMPLETE: 'true',
+      }),
+    );
+    expect(drain.M5_TICKET_TRANSFERS_ENABLED).toBe(true);
+    expect(drain.M5_OFFLINE_TICKET_MANIFESTS_ENABLED).toBe(false);
+    expect(drain.M5_OFFLINE_MANIFEST_DRAIN_COMPLETE).toBe(true);
+  });
+
   it('uses the documented Render deploy SHA when BUILD_SHA is not explicit', () => {
     const config = getGatewayConfig(
       productionEnvironment({ BUILD_SHA: undefined, RENDER_GIT_COMMIT: 'a'.repeat(40) }),
@@ -120,8 +192,38 @@ describe('gateway configuration', () => {
   });
 });
 
+describe('strict Resend test-recipient configuration', () => {
+  it('enables a single allowlisted recipient even under production-shaped configuration', () => {
+    const config = getGatewayConfig(
+      productionEnvironment({
+        RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST: 'true',
+        RESEND_NON_PROD_TEST_RECIPIENT: 'test-recipient@example.com',
+      }),
+    );
+    expect(config.RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST).toBe(true);
+    expect(config.RESEND_NON_PROD_TEST_RECIPIENT).toBe('test-recipient@example.com');
+  });
+
+  it('requires the exact allowlist recipient when strict enforcement is enabled', () => {
+    expect(() =>
+      getGatewayConfig(productionEnvironment({ RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST: 'true' })),
+    ).toThrow(/strict Resend test-recipient guard requires an exact allowlist recipient/i);
+  });
+
+  it('rejects a broader or alternate address for the strict founder guard', () => {
+    expect(() =>
+      getGatewayConfig(
+        productionEnvironment({
+          RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST: 'true',
+          RESEND_NON_PROD_TEST_RECIPIENT: 'other@example.test',
+        }),
+      ),
+    ).toThrow(/allows only the approved founder address/i);
+  });
+});
+
 describe('allowedBrowserOrigins (CORS_ALLOWED_ORIGINS)', () => {
-  const ADMIN = 'https://admin.example.com';
+  const ADMIN = 'https://app.example.com';
 
   /**
    * `getGatewayConfig` caches the first successful parse, so each case re-imports
@@ -217,5 +319,162 @@ describe('origin allow-lists', () => {
         productionEnvironment({ ALLOWED_ORIGINS: value, BETTER_AUTH_TRUSTED_ORIGINS: value }),
       ),
     ).toThrow(/ALLOWED_ORIGINS/);
+  });
+});
+
+it('accepts only an HTTP(S) Guest deployment origin for invitation links', () => {
+  expect(
+    getGatewayConfig({ GUEST_PORTAL_URL: 'https://guest-staging.example.test' }).GUEST_PORTAL_URL,
+  ).toBe('https://guest-staging.example.test');
+  expect(() =>
+    getGatewayConfig({ GUEST_PORTAL_URL: 'https://guest-staging.example.test/invite' }),
+  ).toThrow();
+  expect(() => getGatewayConfig({ GUEST_PORTAL_URL: 'javascript:alert(1)' })).toThrow();
+});
+
+describe('M4 non-production configuration safety', () => {
+  const provider = {
+    RAZORPAY_KEY_ID: 'rzp_test_syntheticConfig123',
+    RAZORPAY_KEY_SECRET: 'synthetic-test-key-secret',
+    RAZORPAY_WEBHOOK_SECRET: 'synthetic-test-webhook-secret',
+  };
+  it.each(['development', 'test', 'production'])(
+    'defaults workers and payouts OFF in %s',
+    (NODE_ENV) => {
+      const config = getGatewayConfig(
+        NODE_ENV === 'production' ? productionEnvironment() : { NODE_ENV },
+      );
+      expect(config.BACKGROUND_WORKERS_ENABLED).toBe(false);
+      expect(config.PAYOUTS_ENABLED).toBe(false);
+    },
+  );
+  it('permits intentional explicit worker configuration without changing M5 defaults', () => {
+    expect(
+      getGatewayConfig({ BACKGROUND_WORKERS_ENABLED: 'true' }).BACKGROUND_WORKERS_ENABLED,
+    ).toBe(true);
+  });
+  it.each(['RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'RAZORPAY_WEBHOOK_SECRET'] as const)(
+    'rejects incomplete provider credentials missing %s',
+    (missing) => {
+      expect(() => getGatewayConfig({ ...provider, [missing]: undefined })).toThrow(/RAZORPAY/);
+    },
+  );
+  it.each(['arbitrary-nonempty', 'rzp_live_synthetic123', 'rzp_test_', 'rzp_test_bad/fragment'])(
+    'rejects unsupported or Live Mode key IDs: %s',
+    (RAZORPAY_KEY_ID) => {
+      expect(() => getGatewayConfig({ ...provider, RAZORPAY_KEY_ID })).toThrow(
+        /Razorpay Test Mode/,
+      );
+    },
+  );
+  it('accepts a complete synthetic Test Mode tuple without exposing secrets in errors', () => {
+    expect(getGatewayConfig(provider).RAZORPAY_KEY_ID).toBe(provider.RAZORPAY_KEY_ID);
+    try {
+      getGatewayConfig({ ...provider, RAZORPAY_KEY_ID: 'rzp_live_synthetic123' });
+    } catch (error) {
+      expect(String(error)).not.toContain(provider.RAZORPAY_KEY_SECRET);
+      expect(String(error)).not.toContain(provider.RAZORPAY_WEBHOOK_SECRET);
+    }
+  });
+  it('requires the approved real Firestore project without constraining memory units', () => {
+    expect(() =>
+      getGatewayConfig(productionEnvironment({ FIRESTORE_PROJECT_ID: 'unapproved-project' })),
+    ).toThrow(/c1rcle-v2/);
+    expect(
+      getGatewayConfig({ STORAGE_DRIVER: 'memory', FIRESTORE_PROJECT_ID: 'unit-project' })
+        .FIRESTORE_PROJECT_ID,
+    ).toBe('unit-project');
+  });
+  it.each(['127.0.0.1:8089', 'localhost:8089', '[::1]:8089'])(
+    'allows explicit loopback Emulator synthetic projects: %s',
+    (FIRESTORE_EMULATOR_HOST) => {
+      expect(
+        getGatewayConfig({
+          STORAGE_DRIVER: 'firestore',
+          FIRESTORE_PROJECT_ID: 'demo-m4-synthetic',
+          FIRESTORE_EMULATOR_HOST,
+          FIREBASE_CLIENT_EMAIL: 'synthetic@example.test',
+          FIREBASE_PRIVATE_KEY: 'synthetic-key',
+        }).FIRESTORE_PROJECT_ID,
+      ).toBe('demo-m4-synthetic');
+    },
+  );
+  it.each([
+    'example.test:8089',
+    '127.0.0.1.example.test:8089',
+    '127.0.0.1:0',
+    '127.0.0.1:65536',
+    '127.0.0.1:8089/remote',
+  ])('rejects non-loopback or malformed Emulator endpoints: %s', (FIRESTORE_EMULATOR_HOST) => {
+    expect(() =>
+      getGatewayConfig({
+        STORAGE_DRIVER: 'firestore',
+        FIRESTORE_PROJECT_ID: 'demo-m4-synthetic',
+        FIRESTORE_EMULATOR_HOST,
+        FIREBASE_CLIENT_EMAIL: 'synthetic@example.test',
+        FIREBASE_PRIVATE_KEY: 'synthetic-key',
+      }),
+    ).toThrow(/FIRESTORE_EMULATOR_HOST/);
+  });
+});
+
+describe('hosted agreement environment parsing', () => {
+  const artifact = {
+    version: 'staging-v1',
+    status: 'staging_only',
+    text: 'C1RCLE STAGING PROMOTER AGREEMENT — FOR TESTING ONLY',
+    textSha256: 'a'.repeat(64),
+  };
+  it('keeps hosted environment and configured artifact explicit even with production Node mode', () => {
+    const config = getGatewayConfig(
+      productionEnvironment({
+        DEPLOYMENT_ENVIRONMENT: 'staging',
+        RENDER_SERVICE_ID: 'srv-REDACTED',
+        RENDER_GIT_BRANCH: 'staging',
+        RENDER_EXTERNAL_URL: 'https://api.example.com',
+        PUBLIC_API_URL: 'https://api.example.com',
+        BETTER_AUTH_URL: 'https://api.example.com',
+        PROMOTER_AGREEMENT_ARTIFACT: JSON.stringify(artifact),
+      }),
+    );
+    expect(config.NODE_ENV).toBe('production');
+    expect(config.DEPLOYMENT_ENVIRONMENT).toBe('staging');
+    expect(config.PROMOTER_AGREEMENT_ARTIFACT).toEqual(artifact);
+    expect(getGatewayConfig(productionEnvironment()).PROMOTER_AGREEMENT_ARTIFACT).toBeUndefined();
+  });
+  it('rejects a staging flag without the independently identified staging service', () => {
+    expect(() =>
+      getGatewayConfig(
+        productionEnvironment({
+          DEPLOYMENT_ENVIRONMENT: 'staging',
+          PROMOTER_AGREEMENT_ARTIFACT: JSON.stringify(artifact),
+        }),
+      ),
+    ).toThrow();
+  });
+  it('rejects a production branch even with other staging settings', () => {
+    expect(() =>
+      getGatewayConfig(
+        productionEnvironment({
+          DEPLOYMENT_ENVIRONMENT: 'staging',
+          RENDER_SERVICE_ID: 'srv-REDACTED',
+          RENDER_GIT_BRANCH: 'main',
+          RENDER_EXTERNAL_URL: 'https://api.example.com',
+          PUBLIC_API_URL: 'https://api.example.com',
+          BETTER_AUTH_URL: 'https://api.example.com',
+          PROMOTER_AGREEMENT_ARTIFACT: JSON.stringify(artifact),
+        }),
+      ),
+    ).toThrow();
+  });
+  it('rejects fixture status, malformed documents, and undeclared artifact properties', () => {
+    for (const value of [
+      '{',
+      JSON.stringify({ ...artifact, status: 'test_fixture' }),
+      JSON.stringify({ ...artifact, extra: 'forged' }),
+    ])
+      expect(() =>
+        getGatewayConfig(productionEnvironment({ PROMOTER_AGREEMENT_ARTIFACT: value })),
+      ).toThrow();
   });
 });

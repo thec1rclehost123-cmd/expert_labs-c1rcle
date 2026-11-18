@@ -57,7 +57,7 @@ it as a past finding, not a guaranteed-current state.
 
 ## Execution plan
 
-The original v1 wiring plan is not included in this handoff (historical — itself fully superseded; this file's session log is the current record). (An older pre-implementation
+The original wiring plan is `docs/PHASE_5_HTTP_WIRING_PLAN.md` (historical — itself fully superseded; this file's session log is the current record). (An older pre-implementation
 "Execution Plan (Agent-driven)" section lived here inline; it had been duplicated
 into the file as a line-number-prefixed paste and was removed 2026-09-01.)
 
@@ -102,7 +102,7 @@ uncommitted tree; see the 2026-09-01 entry, it is now 232/232.**
 > cover-wallet freeze/unfreeze (`53727c8`). See the 2026-09-28 session-log entry
 > at the foot of this file. The original text is kept for history.
 
-Still open, by design (see the original v1 wiring plan): live door stats
+Still open, by design (see `docs/PHASE_5_HTTP_WIRING_PLAN.md`): live door stats
 + WebSocket, `/door/override` (FSM has no `denied → overridden` transition),
 `/door/offline-manifest` (nothing signs one), cover-wallet freeze/unfreeze (no
 service method), a real scanner-device bearer-token auth layer (routes currently
@@ -142,8 +142,9 @@ Phase 5 now has 2 honest 501s by design:
 ### 2026-09-11 — Scanner hardening: the door is now safe for multiple clubs
 
 Phase 5 was wired but not deployable in front of real venues. Six findings,
-all closed this session; full reasoning is in `docs/architecture/decisions.md`
-D-025.
+all closed this session; full reasoning in `docs/architecture/decisions.md`
+D-025, and a plain-language account in
+`docs/Sagar_code_Changes/WORK-DONE-BY-SAGAR-2026-09-11.md`.
 
 **What was wrong, and what it now does:**
 
@@ -193,8 +194,9 @@ build.
 ### 2026-09-15 — Scanner-app backend: devices, shift start, couple flow, roster
 
 Built the rest of the dedicated door app's backend (the 11 Sep entry covered
-the admission path's security). Full reasoning is in
-`docs/architecture/decisions.md` D-026.
+the admission path's security). Full reasoning in
+`docs/architecture/decisions.md` D-026; plain-language account in
+`docs/Sagar_code_Changes/WORK-DONE-BY-SAGAR-2026-09-15.md`.
 
 **Built:**
 - **Bound devices** — `ScannerDevice` aggregate (`v2_scanner_devices`, keyed
@@ -323,7 +325,7 @@ Re-verified against the working tree rather than against these notes.
     `routes/v2/door/` — worth knowing, since the 501 it replaced also lived in
     `phase5-routes.ts`. The WebSocket path is now *absent* rather than stubbed,
     per D-006. The roadmap's "Week 3 Gate" wording ("WebSocket connects") was
-    met by a different mechanism; the original v1 wiring plan (not included in this handoff) is
+    met by a different mechanism; `docs/PHASE_5_HTTP_WIRING_PLAN.md` is
     banner-marked accordingly.
 - A stale comment at `routes/v2/door/door-sale-routes.ts` that described `/door/stats` + `/door/stats/ws` as honest stubs has since been rewritten as a historical note.
 

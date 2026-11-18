@@ -8,7 +8,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 /**
  * ─── RBAC + ABAC (B10 / T15) ─────────────────────────────────────────────────
- * Ported from an earlier contributor's parallel B10 work (origin/main 80cca2c), adapted to read
+ * Ported from a teammate's parallel B10 work (origin/main 80cca2c), adapted to read
  * `request.actor` as populated by `plugins/auth.ts`'s onRequest hook (that
  * hook is this repo's, unchanged from this session's own B10 — only this
  * plugin's decorator is new).
@@ -25,9 +25,17 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 export type Permission =
   | 'organization.read'
   | 'organization.update'
+  | 'partner.profile.update'
   | 'organization.create'
   | 'staff.manage'
   | 'venue.read'
+  /**
+   * What working the gate needs and nothing more: today's events, the guest
+   * list, this event's door sales, and registering the handset. Deliberately
+   * narrower than `venue.read`, which also opens the attendance report and
+   * cover-wallet records (supervisor and above).
+   */
+  | 'door.floor'
   | 'venue.create'
   | 'venue.manage'
   /** Resolve a slot request (accept/reject) — the venue owns its calendar. */
@@ -85,18 +93,34 @@ const FINANCE_MANAGER: readonly Permission[] = [
 const READ_ONLY: readonly Permission[] = [
   'organization.read',
   'venue.read',
+  'door.floor',
   'event.read',
   'slot-request.list',
 ];
 
 /**
- * Role → permissions. Owner and admin run the tenant; manager operates it;
- * member can look but not touch.
+ * What a person standing at the door needs, and nothing else: today's events,
+ * the guest list and door sales read routes. Admission, door sales and wallet
+ * charges are authorized by the scanner session (door code), not by this role,
+ * so one gate person can scan AND sell without holding any management right.
+ * Deliberately no `organization.read`, no finance, no event authoring.
+ */
+const DOOR_FLOOR: readonly Permission[] = ['door.floor', 'event.read'];
+
+/**
+ * Role → permissions. Owner and admin (ops lead) run the tenant; manager
+ * (venue manager) operates the venue and its door team; door_supervisor
+ * oversees a night at the door; gate_staff works the gate; member can look
+ * but not touch. `staff.manage` is held down to manager, but the service layer
+ * only lets a holder assign or change roles strictly BELOW their own
+ * (`assignableRoles` in the organization domain model).
  */
 export const ROLE_PERMISSIONS: Readonly<Record<OrganizationRole, readonly Permission[]>> = {
   owner: [
     'organization.read',
+    'door.floor',
     'organization.update',
+    'partner.profile.update',
     'organization.create',
     'staff.manage',
     'venue.read',
@@ -116,7 +140,9 @@ export const ROLE_PERMISSIONS: Readonly<Record<OrganizationRole, readonly Permis
   ],
   admin: [
     'organization.read',
+    'door.floor',
     'organization.update',
+    'partner.profile.update',
     'staff.manage',
     'venue.read',
     'venue.create',
@@ -135,6 +161,8 @@ export const ROLE_PERMISSIONS: Readonly<Record<OrganizationRole, readonly Permis
   ],
   manager: [
     'organization.read',
+    'door.floor',
+    'partner.profile.update',
     'venue.read',
     'venue.manage',
     'venue.schedule',
@@ -146,8 +174,13 @@ export const ROLE_PERMISSIONS: Readonly<Record<OrganizationRole, readonly Permis
     'slot-request.list',
     'ticket.override',
     'door.manage',
+    'staff.manage',
     ...FINANCE_MANAGER,
   ],
+  // Watches the door: sees the floor, can override a denied scan, mints door
+  // codes, binds and unbinds devices. Cannot manage people, events or money.
+  door_supervisor: [...DOOR_FLOOR, 'venue.read', 'ticket.override', 'door.manage'],
+  gate_staff: DOOR_FLOOR,
   member: READ_ONLY,
 };
 

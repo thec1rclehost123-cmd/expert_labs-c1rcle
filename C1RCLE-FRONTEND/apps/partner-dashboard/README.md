@@ -77,7 +77,7 @@ Create the project against the repository root, then set:
 Everything else comes from `vercel.json`, which runs the build through Turbo
 from the workspace root so the shared packages are built first.
 
-Set `NEXT_PUBLIC_API_BASE_URL` (see `.env.example`; validated by `@c1rcle/config`) to the gateway, for example `http://localhost:8080` in development.
+Set `NEXT_PUBLIC_API_BASE_URL` (see `.env.example`; validated by `@c1rcle/config`) to the gateway, for example `https://api.example.com`.
 
 Two things worth knowing:
 
@@ -89,4 +89,4 @@ Two things worth knowing:
 
 ### Current data status
 
-Auth, organization selection and onboarding run against the `/api/v2` gateway through `src/app/api/auth/*` and `src/app/api/bff/*`. Firebase is used only for client phone OTP (`src/lib/firebase/phone-auth.ts`). Many dashboard pages still read fixtures through `partnerRepositories` (`src/lib/partner/repositories.ts`); migration state is tracked in the original frontend sprint plan (not included in this handoff).
+Auth, organization selection and onboarding run against the `/api/v2` gateway through `src/app/api/auth/*` and `src/app/api/bff/*`. Firebase is used only for client phone OTP (`src/lib/firebase/phone-auth.ts`). Many dashboard pages still read fixtures through `partnerRepositories` (`src/lib/partner/repositories.ts`); see `docs/superpowers/SPRINT-2026-08-31.md` "Status as of 2026-10-02" for the migration state.

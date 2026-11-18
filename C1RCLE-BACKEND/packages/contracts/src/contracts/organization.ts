@@ -1,14 +1,85 @@
 import { z } from 'zod';
 
-import { eventDtoSchema } from './event.js';
+import {
+  assignPromoterSchema,
+  createEventBaseSchema,
+  createPromoCodeSchema,
+  createTicketTierSchema,
+  eventDtoSchema,
+} from './event.js';
 import { opaqueIdSchema, paginatedSchema } from './shared.js';
 
 /**
  * ─── Organization + Venue + Member Contracts ─────────────────────────────────
  */
 
-export const organizationRoleSchema = z.enum(['owner', 'admin', 'manager', 'member']);
+/**
+ * Roles, highest first. Display names (what the Pune door teams say):
+ * owner = Owner, admin = Ops lead, manager = Venue manager,
+ * door_supervisor = Door supervisor, gate_staff = Gate staff (scans AND sells),
+ * member = legacy read-only.
+ */
+export const organizationRoleSchema = z.enum([
+  'owner',
+  'admin',
+  'manager',
+  'door_supervisor',
+  'gate_staff',
+  'member',
+]);
 export type OrganizationRoleDto = z.infer<typeof organizationRoleSchema>;
+
+/** Roles a person can be given. `owner` is set at creation, never granted. */
+export const assignableRoleSchema = z.enum([
+  'admin',
+  'manager',
+  'door_supervisor',
+  'gate_staff',
+  'member',
+]);
+export type AssignableRoleDto = z.infer<typeof assignableRoleSchema>;
+
+const ROLE_RANK_DTO: Readonly<Record<OrganizationRoleDto, number>> = {
+  owner: 50,
+  admin: 40,
+  manager: 30,
+  door_supervisor: 20,
+  gate_staff: 10,
+  member: 0,
+};
+
+export const ROLE_LABELS_DTO: Readonly<Record<OrganizationRoleDto, string>> = {
+  owner: 'Owner',
+  admin: 'Ops lead',
+  manager: 'Venue manager',
+  door_supervisor: 'Door supervisor',
+  gate_staff: 'Gate staff',
+  member: 'Member',
+};
+
+/**
+ * The roles `actorRole` may assign or change people to: strictly below its own
+ * rank and never `owner`. The server enforces the same rule; clients use this
+ * only to avoid offering choices that would be refused.
+ */
+export function assignableRolesFor(actorRole: OrganizationRoleDto): AssignableRoleDto[] {
+  // Managing people is a venue-manager-and-above duty (door roles manage no one).
+  if (ROLE_RANK_DTO[actorRole] < ROLE_RANK_DTO.manager) return [];
+  return assignableRoleSchema.options.filter(
+    (role) => ROLE_RANK_DTO[role] < ROLE_RANK_DTO[actorRole],
+  );
+}
+
+/** May `actorRole` change, remove, revoke or resend for someone holding `targetRole`? */
+export function canManageRoleDto(
+  actorRole: OrganizationRoleDto,
+  targetRole: OrganizationRoleDto,
+): boolean {
+  return (
+    ROLE_RANK_DTO[actorRole] >= ROLE_RANK_DTO.manager &&
+    ROLE_RANK_DTO[actorRole] > ROLE_RANK_DTO[targetRole]
+  );
+}
 
 export const organizationStatusSchema = z.enum(['active', 'suspended', 'archived']);
 export type OrganizationStatusDto = z.infer<typeof organizationStatusSchema>;
@@ -89,7 +160,7 @@ export type OrganizationMemberDto = z.infer<typeof organizationMemberDtoSchema>;
 
 export const updateMemberRoleSchema = z
   .object({
-    role: z.enum(['admin', 'manager', 'member']),
+    role: assignableRoleSchema,
   })
   .strict();
 export type UpdateMemberRoleRequest = z.infer<typeof updateMemberRoleSchema>;
@@ -97,7 +168,7 @@ export type UpdateMemberRoleRequest = z.infer<typeof updateMemberRoleSchema>;
 export const inviteMemberSchema = z
   .object({
     userId: opaqueIdSchema,
-    role: organizationRoleSchema,
+    role: assignableRoleSchema,
     capabilities: z.array(z.enum(['host', 'venue', 'promoter'])).optional(),
   })
   .strict();
@@ -122,6 +193,8 @@ export const venuePublicProfileSchema = z.object({
   description: z.string().max(2000),
   shortDescription: z.string().max(200).optional(),
   photoUrl: z.url().nullable(),
+  coverUrl: z.url().nullable().optional(),
+  genres: z.array(z.string().min(1).max(60)).max(20).optional(),
   address: venueAddressSchema,
   facilities: z.array(z.string().min(1).max(60)),
   capacity: z.number().int().nonnegative().nullable(),
@@ -153,8 +226,13 @@ export const venueSlotDtoSchema = z.object({
   startTime: z.iso.datetime(),
   endTime: z.iso.datetime(),
   recurring: z.boolean(),
-  status: z.enum(['open', 'booked', 'blocked', 'cancelled']),
+  status: z.enum(['open', 'pending', 'booked', 'blocked', 'cancelled']),
   capacityFor: z.number().int().nonnegative().nullable(),
+  timezone: z.string().min(1).max(100).nullable().optional(),
+  notes: z.string().max(2000).nullable().optional(),
+  visibleToHostIds: z.array(opaqueIdSchema).nullable().optional(),
+  slotRequestId: opaqueIdSchema.nullable().optional(),
+  requestingHostId: opaqueIdSchema.nullable().optional(),
   version: z.number().int().positive(),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
@@ -174,13 +252,49 @@ export const createVenueBlockSchema = z
   });
 export type CreateVenueBlockInput = z.infer<typeof createVenueBlockSchema>;
 
+export const publishVenueAvailabilitySchema = z
+  .object({
+    label: z.string().trim().min(1).max(200),
+    startTime: z.iso.datetime(),
+    endTime: z.iso.datetime(),
+    timezone: z.string().trim().min(1).max(100),
+    notes: z.string().trim().max(2000).nullable().optional(),
+    visibleToHostIds: z.array(opaqueIdSchema).max(100).nullable().optional(),
+  })
+  .strict()
+  .refine((value) => new Date(value.endTime) > new Date(value.startTime), {
+    message: 'End time must be after its start time',
+    path: ['endTime'],
+  });
+export type PublishVenueAvailabilityInput = z.infer<typeof publishVenueAvailabilitySchema>;
+
+export const slotRequestEventDraftSchema = z
+  .object({
+    event: createEventBaseSchema
+      .extend({ venueId: opaqueIdSchema })
+      .omit({ slotRequestId: true, externalLocation: true }),
+    tiers: z
+      .array(z.object({ localId: opaqueIdSchema, command: createTicketTierSchema }).strict())
+      .max(100),
+    promotions: z.array(createPromoCodeSchema).max(100),
+    promoters: z.array(assignPromoterSchema).max(100),
+  })
+  .strict();
+export type SlotRequestEventDraft = z.infer<typeof slotRequestEventDraftSchema>;
+
 export const slotRequestDtoSchema = z.object({
   id: opaqueIdSchema,
   venueId: opaqueIdSchema,
+  slotId: opaqueIdSchema.nullable().optional(),
+  slotStartTime: z.iso.datetime().nullable().optional(),
+  slotEndTime: z.iso.datetime().nullable().optional(),
+  timezone: z.string().max(100).nullable().optional(),
   eventId: opaqueIdSchema.nullable(),
   hostId: opaqueIdSchema,
   status: z.enum(['pending', 'accepted', 'rejected', 'cancelled']),
   message: z.string().max(2000).optional(),
+  rejectionReason: z.string().max(1000).nullable().optional(),
+  eventDraft: slotRequestEventDraftSchema.optional(),
   version: z.number().int().positive(),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
@@ -189,11 +303,18 @@ export type SlotRequestDto = z.infer<typeof slotRequestDtoSchema>;
 
 export const createSlotRequestSchema = z
   .object({
+    slotId: opaqueIdSchema,
     eventId: opaqueIdSchema.nullable().optional(),
     message: z.string().max(2000).optional(),
+    eventDraft: slotRequestEventDraftSchema.optional(),
   })
   .strict();
 export type CreateSlotRequestInput = z.infer<typeof createSlotRequestSchema>;
+
+export const rejectSlotRequestSchema = z
+  .object({ reason: z.string().trim().min(1).max(1000) })
+  .strict();
+export type RejectSlotRequestInput = z.infer<typeof rejectSlotRequestSchema>;
 
 /** `GET /venues/:venueId/slot-requests` and `GET /organizations/:organizationId/slot-requests`. */
 export const slotRequestListResponseSchema = paginatedSchema(slotRequestDtoSchema);
@@ -247,7 +368,7 @@ export type InvitationDto = z.infer<typeof invitationDtoSchema>;
 export const createInvitationSchema = z
   .object({
     email: z.email(),
-    role: z.enum(['admin', 'manager', 'member']),
+    role: assignableRoleSchema,
     capabilities: z.array(z.enum(['host', 'venue', 'promoter'])).optional(),
   })
   .strict();
@@ -260,8 +381,11 @@ export const venueAvailabilitySlotSchema = z.object({
   label: z.string(),
   startTime: z.iso.datetime(),
   endTime: z.iso.datetime(),
-  status: z.enum(['open', 'booked', 'blocked', 'cancelled']),
+  status: z.enum(['open', 'pending', 'booked', 'blocked', 'cancelled']),
   capacityFor: z.number().int().nonnegative().nullable(),
+  timezone: z.string().min(1).max(100).nullable().optional(),
+  notes: z.string().max(2000).nullable().optional(),
+  requestable: z.boolean().optional(),
 });
 
 export const venueAvailabilityDtoSchema = z.object({
@@ -269,6 +393,7 @@ export const venueAvailabilityDtoSchema = z.object({
   from: z.iso.datetime(),
   to: z.iso.datetime(),
   openSlots: z.number().int().nonnegative(),
+  pendingRequests: z.number().int().nonnegative().default(0),
   bookedSlots: z.number().int().nonnegative(),
   blockedSlots: z.number().int().nonnegative(),
   openMinutes: z.number().int().nonnegative(),

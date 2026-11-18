@@ -22,7 +22,8 @@ export function formatPaise(paise: number): string {
   return new Intl.NumberFormat('en-IN', {
     style: 'currency',
     currency: 'INR',
-    maximumFractionDigits: 0,
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
   }).format(paise / 100);
 }
 
@@ -71,6 +72,7 @@ export const ADMIN_ACTION_LABELS: Record<AdminAction, string> = {
   FINANCIAL_ADJUSTMENT: 'Post financial adjustment',
   PROMOTER_SUSPEND: 'Suspend promoter',
   PROMOTER_REINSTATE: 'Reinstate promoter',
+  PROMOTER_LINK_DEACTIVATE: 'Deactivate promoter link',
 };
 
 /**
@@ -81,6 +83,9 @@ export const ADMIN_ACTION_LABELS: Record<AdminAction, string> = {
 export const AUDIT_ACTION_LABELS: Record<string, string> = {
   ...ADMIN_ACTION_LABELS,
   ADMIN_EXPORT: 'Export audit CSV',
+  'TAX_RULE.create': 'Draft tax rule',
+  'TAX_RULE.enable': 'Enable tax rule',
+  'TAX_RULE.retire': 'Retire tax rule',
 };
 
 export const PAYOUT_STATUS_LABELS: Record<AdminPayoutStatus, string> = {
@@ -102,6 +107,7 @@ export const EVENT_STATUS_LABELS: Record<EventStatus, string> = {
   scheduled: 'Scheduled',
   published: 'Published',
   sales_paused: 'Sales paused',
+  postponed: 'Postponed',
   started: 'Started',
   ended: 'Ended',
   archived: 'Archived',
@@ -246,6 +252,7 @@ export function eventStatusTone(status: EventStatus): Tone {
       return 'muted';
     case 'review':
     case 'sales_paused':
+    case 'postponed':
       return 'warning';
     case 'cancelled':
       return 'destructive';
@@ -354,6 +361,11 @@ export function ticketStatusTone(status: TicketStatus): Tone {
 }
 
 export const PROMOTER_ASSIGNMENT_STATUS_LABELS: Record<PromoterAssignmentStatus, string> = {
+  invited: 'Invitation pending',
+  accepted: 'Accepted',
+  rejected: 'Rejected',
+  revoked: 'Revoked',
+  expired: 'Expired',
   active: 'Active',
   ended: 'Ended',
   suspended: 'Suspended',
@@ -361,10 +373,17 @@ export const PROMOTER_ASSIGNMENT_STATUS_LABELS: Record<PromoterAssignmentStatus,
 
 export function promoterAssignmentStatusTone(status: PromoterAssignmentStatus): Tone {
   switch (status) {
+    case 'invited':
+      return 'warning';
+    case 'accepted':
     case 'active':
       return 'success';
+    case 'rejected':
+      return 'destructive';
     case 'suspended':
       return 'warning';
+    case 'revoked':
+    case 'expired':
     case 'ended':
       return 'muted';
   }

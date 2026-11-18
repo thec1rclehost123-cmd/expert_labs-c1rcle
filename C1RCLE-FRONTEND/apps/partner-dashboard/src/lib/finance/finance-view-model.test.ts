@@ -76,10 +76,9 @@ describe('formatPaiseCompact', () => {
 /* ─── Small helpers ────────────────────────────────────────────────────────── */
 
 describe('formatDate', () => {
-  it('formats an ISO instant in UTC so the server and client agree', () => {
-    // A naive local-time format would render 31 Aug here in IST and 1 Sep in
-    // UTC, and the two would disagree between the server render and hydration.
-    expect(formatDate('2026-09-01T10:00:00.000Z')).toBe('1 Sep 2026');
+  it('formats an ISO instant in IST deterministically on server and client', () => {
+    expect(formatDate('2026-09-01T10:00:00.000Z')).toBe('1 Sept 2026');
+    expect(formatDate('2026-08-31T20:00:00.000Z')).toBe('1 Sept 2026');
   });
 
   it('returns a placeholder for an unparseable instant', () => {
@@ -155,7 +154,7 @@ describe('toFinanceOrder', () => {
   });
 
   it('prefers the payment date, falling back to creation for unpaid orders', () => {
-    expect(toFinanceOrder(order).date).toBe('1 Sep 2026');
+    expect(toFinanceOrder(order).date).toBe('1 Sept 2026');
     const unpaid = toFinanceOrder({
       ...order,
       status: 'pending',
@@ -327,6 +326,15 @@ describe('toBalanceTrend', () => {
     expect(trend.reduce((sum, value) => sum + value, 0)).toBe(30_000);
   });
 
+  it('uses IST calendar days at the UTC date boundary', () => {
+    const trend = toBalanceTrend(
+      [inflow({ amountPaise: 50_000, createdAt: '2026-09-09T20:00:00.000Z' })],
+      now,
+    );
+    // 20:00 UTC on 9 Sep is 01:30 IST on 10 Sep: it belongs to today.
+    expect(trend[7]).toBe(50_000);
+  });
+
   it('pads the gap so a quiet week reads flat instead of compressing the axis', () => {
     // Activity in the current week and three weeks ago, nothing between. If
     // empty buckets were omitted, the sparkline would show two adjacent points
@@ -455,6 +463,41 @@ const balances: BalanceSummaryResponse = {
 };
 
 describe('toPartnerFinanceData', () => {
+  it('retains server settlement and hold categories without calculating client release amounts', () => {
+    const data = toPartnerFinanceData({
+      organizationId: 'org_1',
+      accent: 'lavender',
+      balances: {
+        ...balances,
+        availablePaise: 123_456,
+        pendingPaise: 987_654,
+        heldPaise: 100_001,
+        payoutsEnabled: false,
+        settlementUnavailableReason: 'Historical balance review required',
+        holds: {
+          ...balances.holds,
+          refundPaise: 11,
+          disputePaise: 22,
+          providerUncertaintyPaise: 33,
+          reconciliationPaise: 44,
+        },
+      },
+      ledger: [],
+      payouts: [],
+      bankAccounts: [bank],
+      orders: [],
+    });
+    expect(data.availableBalance).toBe('₹1,234.56');
+    expect(data.pendingBalance.value).toBe('₹9,876.54');
+    expect(data.heldBalance.value).toBe('₹1,000.01');
+    expect(data.heldBalance.detail).toContain('pending refunds');
+    expect(data.heldBalance.detail).toContain('disputes');
+    expect(data.heldBalance.detail).toContain('provider verification');
+    expect(data.heldBalance.detail).toContain('reconciliation');
+    expect(data.settlementUnavailableReason).toBe('Historical balance review required');
+    expect(data.payoutRequest?.payoutsEnabled).toBe(false);
+  });
+
   it('marks the result as API-backed', () => {
     const data = toPartnerFinanceData({
       organizationId: 'org_1',
@@ -467,10 +510,28 @@ describe('toPartnerFinanceData', () => {
     });
     expect(data.dataStatus).toBe('api');
     expect(data.payoutRequest).toEqual({
+      payoutsEnabled: false,
+      settlementUnavailableReason: null,
       organizationId: 'org_1',
       availablePaise: balances.availablePaise,
       bankAccountId: bank.id,
     });
+  });
+
+  it('does not derive journal-backed balance trends from legacy ledger entries', () => {
+    const data = toPartnerFinanceData({
+      organizationId: 'org_1',
+      accent: 'orange',
+      balances: { ...balances, readModel: 'financial_journal_v2' },
+      ledger: [inflow({ amountPaise: 10_000 }), inflow({ amountPaise: 20_000 })],
+      payouts: [],
+      bankAccounts: [],
+      orders: [],
+    });
+
+    expect(data.balanceDelta).toBe('—');
+    expect(data.balanceTrend).toEqual([]);
+    expect(data.readModel).toBe('financial_journal_v2');
   });
 
   it('omits paymentCard entirely — no card is stored, so none is invented', () => {
@@ -590,5 +651,28 @@ describe('toPartnerFinanceData', () => {
     expect(data.orders).toHaveLength(2);
     expect(data.payouts).toHaveLength(1);
     expect(data.accent).toBe('lavender');
+  });
+
+  it('preserves bounded page coverage and the declared IST read time', () => {
+    const data = toPartnerFinanceData({
+      accent: 'orange',
+      balances,
+      ledger: [],
+      payouts: [],
+      bankAccounts: [],
+      orders: [],
+      asOf: '2026-10-20T12:00:00.000Z',
+      coverage: {
+        ledger: { loaded: 50, total: 215, hasMore: true },
+        payouts: { loaded: 3, total: 3, hasMore: false },
+        orders: { loaded: 50, total: 121, hasMore: true },
+      },
+    });
+
+    expect(data.freshness).toEqual({
+      asOf: '2026-10-20T12:00:00.000Z',
+      timezone: 'Asia/Kolkata',
+    });
+    expect(data.coverage.orders).toEqual({ loaded: 50, total: 121, hasMore: true });
   });
 });

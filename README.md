@@ -2,7 +2,7 @@
 
 Single-repository handoff snapshot of the C1RCLE ticketing and nightlife-operations platform. It combines the former `C1RCLE-FRONTEND` and `C1RCLE-BACKEND` repositories into one tree while keeping each side's pnpm workspace, lockfile and tooling intact.
 
-Prepared for third-party application development on **2026-10-26**.
+Prepared for third-party application development on **2026-10-26**; application code refreshed from `staging` on **2026-11-18** (see `HANDOFF.md`).
 
 ## Layout
 

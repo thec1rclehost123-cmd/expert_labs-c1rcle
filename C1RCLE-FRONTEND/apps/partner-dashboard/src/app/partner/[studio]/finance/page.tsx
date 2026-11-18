@@ -7,7 +7,6 @@ import { VenueFinanceScreen } from '@/components/partner-v3/finance/VenueFinance
 import { FinanceLoadError, loadFinanceData } from '@/lib/finance/load-finance-data';
 
 import type {
-  FinanceDateRange,
   FinanceOrderStatus,
   FinanceView,
   PartnerFinanceData,
@@ -29,8 +28,10 @@ export default async function StudioFinancePage({
   const getValue = (value: string | string[] | undefined) =>
     Array.isArray(value) ? value[0] : value;
   const viewValue = getValue(query['view']);
-  const view: FinanceView = viewValue === 'orders' || viewValue === 'bank' ? viewValue : 'payouts';
-  const range: FinanceDateRange = getValue(query['range']) === 'all' ? 'all' : 'current';
+  const view: FinanceView =
+    viewValue === 'bank' || (studio !== 'promoter' && viewValue === 'orders')
+      ? viewValue
+      : 'payouts';
   const statusValue = getValue(query['status']);
   const status: 'All' | FinanceOrderStatus =
     statusValue === 'confirmed'
@@ -58,7 +59,10 @@ export default async function StudioFinancePage({
   // here keeps `reason` intact and lets each case offer the right next step.
   let data: PartnerFinanceData;
   try {
-    data = await loadFinanceData({ accent: studio === 'host' ? 'lavender' : 'orange' });
+    data = await loadFinanceData({
+      accent: studio === 'host' ? 'lavender' : 'orange',
+      promoterScope: studio === 'promoter',
+    });
   } catch (cause) {
     if (cause instanceof FinanceLoadError) {
       return <FinanceLoadFailureState reason={cause.reason} />;
@@ -71,7 +75,6 @@ export default async function StudioFinancePage({
     data,
     view,
     search: getValue(query['search']) ?? '',
-    range,
     status,
     sort,
     direction,
@@ -80,7 +83,7 @@ export default async function StudioFinancePage({
   return studio === 'host' ? (
     <HostFinanceScreen {...props} />
   ) : studio === 'promoter' ? (
-    <PartnerFinanceScreen {...props} baseHref="/partner/promoter/finance" />
+    <PartnerFinanceScreen {...props} baseHref="/partner/promoter/finance" promoterScope />
   ) : (
     <VenueFinanceScreen {...props} />
   );

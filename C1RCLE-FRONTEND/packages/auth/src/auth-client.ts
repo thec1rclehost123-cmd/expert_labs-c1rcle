@@ -12,7 +12,15 @@ import {
   signupRequestSchema,
 } from '@c1rcle/contracts';
 
-import { clearSession, getAccessToken, markAnonymous, setSession } from './session-store.js';
+import {
+  clearSession,
+  getAccessToken,
+  markAnonymous,
+  setSession,
+  useSessionStore,
+} from './session-store.js';
+
+import type { User } from '@c1rcle/contracts';
 
 interface SignupInput {
   readonly email: string;
@@ -109,7 +117,7 @@ export async function signup(input: SignupInput): Promise<void> {
   });
 
   clearActiveOrgHint();
-  setSession({ user: response.user }, response.accessToken, response.expiresAt);
+  setSession({ user: response.user }, response.accessToken ?? null, response.expiresAt);
 }
 
 /**
@@ -117,7 +125,7 @@ export async function signup(input: SignupInput): Promise<void> {
  * single generic message so the UI cannot be used as an account-existence
  * oracle; other failures (network, 5xx) propagate unchanged.
  */
-export async function login(input: LoginInput): Promise<void> {
+export async function login(input: LoginInput): Promise<User> {
   const body = loginRequestSchema.parse({
     email: input.email,
     password: input.password,
@@ -131,7 +139,8 @@ export async function login(input: LoginInput): Promise<void> {
     });
 
     clearActiveOrgHint();
-    setSession({ user: response.user }, response.accessToken, response.expiresAt);
+    setSession({ user: response.user }, response.accessToken ?? null, response.expiresAt);
+    return response.user;
   } catch (error) {
     if (isApiClientError(error) && (error.status === 400 || error.status === 401)) {
       throw new Error(GENERIC_AUTH_FAILURE);
@@ -141,7 +150,7 @@ export async function login(input: LoginInput): Promise<void> {
 }
 
 /**
- * Exchange the httpOnly refresh cookie for a fresh in-memory access token.
+ * Exchange the httpOnly refresh cookie for a refreshed cookie session.
  * Concurrent callers share one in-flight request (stampede guard). Resolves
  * `true` on success; on any failure the session is cleared and it resolves
  * `false`.
@@ -160,7 +169,7 @@ export async function refresh(): Promise<boolean> {
         headers: csrfHeaders(),
       });
 
-      setSession({ user: response.user }, response.accessToken, response.expiresAt);
+      setSession({ user: response.user }, response.accessToken ?? null, response.expiresAt);
       return true;
     } catch {
       clearSession();
@@ -215,7 +224,7 @@ export async function changePassword(input: ChangePasswordInput): Promise<void> 
     headers: csrfHeaders(),
   });
 
-  setSession({ user: response.user }, response.accessToken, response.expiresAt);
+  setSession({ user: response.user }, response.accessToken ?? null, response.expiresAt);
 }
 
 /**
@@ -234,6 +243,19 @@ export async function fetchSession(): Promise<void> {
   } catch {
     markAnonymous();
   }
+}
+
+/**
+ * Hydrate a session that was discovered by a Server Component. The read is
+ * deliberate: when a user arrives from a
+ * different C1RCLE app on the same localhost host, the httpOnly session cookie
+ * can exist while this app's namespaced CSRF cookie does not. The BFF session
+ * route mints that app-scoped token before the CSRF-protected refresh runs.
+ */
+export async function hydrateSession(): Promise<boolean> {
+  await fetchSession();
+  if (useSessionStore.getState().status !== 'authenticated') return false;
+  return refresh();
 }
 
 /**

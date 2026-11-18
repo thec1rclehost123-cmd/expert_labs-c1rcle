@@ -217,7 +217,7 @@ export const INDIAN_CITIES: readonly CityEntry[] = [
   { name: 'Gwalior', state: 'Madhya Pradesh', tier: 2 },
   { name: 'Ujjain', state: 'Madhya Pradesh', tier: 3 },
   { name: 'Rewa', state: 'Madhya Pradesh', tier: 3 },
-  { name: 'Sagar', state: 'Madhya Pradesh', tier: 3 },
+  { name: 'a teammate', state: 'Madhya Pradesh', tier: 3 },
 
   /* ── North-East ── */
   { name: 'Guwahati', state: 'Assam', tier: 2 },

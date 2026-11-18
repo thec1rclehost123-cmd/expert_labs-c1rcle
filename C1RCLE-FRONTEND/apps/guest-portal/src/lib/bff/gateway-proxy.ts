@@ -13,6 +13,7 @@
  */
 import { NextResponse } from 'next/server';
 
+import { withGatewayCookieName } from '@c1rcle/auth/server-session';
 import { getClientEnv } from '@c1rcle/config';
 
 import type { NextRequest } from 'next/server';
@@ -43,13 +44,19 @@ export function assertSameOrigin(req: NextRequest): NextResponse | null {
 
 /** Flat error envelope, matching the gateway's shape (`{ code, message, status, requestId }`). */
 export function errorEnvelope(code: string, message: string, status: number): NextResponse {
-  return NextResponse.json({ code, message, status, requestId: newRequestId() }, { status });
+  const response = NextResponse.json(
+    { code, message, status, requestId: newRequestId() },
+    { status },
+  );
+  response.headers.set('Cache-Control', 'private, no-store');
+  return response;
 }
 
 interface ForwardInit {
   readonly method: 'GET' | 'POST';
   readonly body?: unknown;
   readonly cookie?: string | null;
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -62,8 +69,9 @@ export async function forwardToGateway(path: string, init: ForwardInit): Promise
   if (init.body !== undefined) {
     headers['content-type'] = 'application/json';
   }
+  for (const [name, value] of Object.entries(init.headers ?? {})) headers[name] = value;
   if (init.cookie !== undefined && init.cookie !== null && init.cookie.length > 0) {
-    headers['cookie'] = init.cookie;
+    headers['cookie'] = withGatewayCookieName(init.cookie);
   }
   if (init.method === 'POST') {
     headers['idempotency-key'] = crypto.randomUUID();

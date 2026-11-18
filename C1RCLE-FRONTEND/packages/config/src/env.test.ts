@@ -91,7 +91,7 @@ describe('getServerEnv', () => {
   it('reads the optional server-only values when present', () => {
     process.env.SITE_URL = 'https://c1rcle.app';
     process.env.VERCEL_ENV = 'preview';
-    process.env.VERCEL_URL = 'c1rcle-app-git-main.vercel.app';
+    process.env.VERCEL_URL = 'app.example.com';
     process.env.GATEWAY_READINESS_TOKEN = 'readiness-secret';
     resetEnvCacheForTests();
 
@@ -99,7 +99,7 @@ describe('getServerEnv', () => {
 
     expect(env.SITE_URL).toBe('https://c1rcle.app');
     expect(env.VERCEL_ENV).toBe('preview');
-    expect(env.VERCEL_URL).toBe('c1rcle-app-git-main.vercel.app');
+    expect(env.VERCEL_URL).toBe('app.example.com');
     expect(env.GATEWAY_READINESS_TOKEN).toBe('readiness-secret');
   });
 

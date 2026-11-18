@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { seedApprovedPartnerOrganization } from '../../../test-utils/approved-partner-organization.js';
 import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
 import partnerOrganizationRoutes from '../partner/organizations.js';
 import partnerPartnershipRoutes from '../partner/partnerships.js';
@@ -32,14 +33,9 @@ type Server = Awaited<ReturnType<typeof buildServer>>;
 const read = (org: string) => ({ 'x-organization-id': org });
 const write = (org: string) => ({ ...read(org), 'idempotency-key': `n-key-${++keySeq}` });
 
-async function createOrganization(server: Server): Promise<string> {
-  const created = await server.inject({
-    method: 'POST',
-    url: '/organizations',
-    headers: write('org_seed'),
-    payload: { name: 'Org', slug: `n-org-${++keySeq}` },
-  });
-  const id: string = created.json().id;
+async function createOrganization(_server: Server): Promise<string> {
+  const created = await seedApprovedPartnerOrganization({ name: 'Org', slug: `n-org-${++keySeq}` });
+  const id: string = created.id;
   return id;
 }
 
@@ -78,10 +74,10 @@ async function partnershipRequest(server: Server, hostOrg: string, venueId: stri
   return response.json();
 }
 
-async function inbox(server: Server, org: string) {
+async function inbox(server: Server, org: string, query = '') {
   const response = await server.inject({
     method: 'GET',
-    url: `/organizations/${org}/notifications`,
+    url: `/organizations/${org}/notifications${query}`,
     headers: read(org),
   });
   expect(response.statusCode).toBe(200);
@@ -157,6 +153,32 @@ describe('producers', () => {
 });
 
 describe('inbox access', () => {
+  it('returns and consumes the next opaque cursor for bounded inbox pages', async () => {
+    const server = await buildServer();
+    const target = await createOrganization(server);
+    const promoterA = await createOrganization(server);
+    const promoterB = await createOrganization(server);
+    await connectionRequest(server, promoterA, target);
+    await connectionRequest(server, promoterB, target);
+
+    const first = await inbox(server, target, '?limit=1');
+    expect(first.items).toHaveLength(1);
+    expect(first.pageInfo.hasNextPage).toBe(true);
+    expect(first.nextCursor).toEqual(expect.any(String));
+
+    const second = await inbox(
+      server,
+      target,
+      `?limit=1&cursor=${encodeURIComponent(first.nextCursor)}`,
+    );
+    expect(second.items).toHaveLength(1);
+    expect(second.items[0].id).not.toBe(first.items[0].id);
+    expect(second.pageInfo.hasNextPage).toBe(false);
+    expect(second.nextCursor).toBeNull();
+    expect(second.unreadCount).toBe(2);
+    await server.close();
+  });
+
   it('only the recipient org can read the inbox', async () => {
     const server = await buildServer();
     const promoter = await createOrganization(server);
@@ -234,7 +256,7 @@ describe('marking read', () => {
     const response = await server.inject({
       method: 'PATCH',
       url: `/organizations/${venueOrg}/notifications/read-all`,
-      headers: write(venueOrg),
+      headers: read(venueOrg),
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ selected: 2 });
@@ -264,7 +286,7 @@ describe('quick actions', () => {
     expect(respond.json()).toMatchObject({
       id,
       read: true,
-      action: { resourceType: 'promoter_connection' },
+      action: null,
     });
 
     const listed = await server.inject({

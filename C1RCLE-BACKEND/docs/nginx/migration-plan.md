@@ -58,9 +58,9 @@ graph LR
   B -->|"partner.<domain>"| N2
   B -->|"admin.<domain>"| N2
   N2 --> GB2 & PB2 & AB2 & F2
-  GB2 -->|"http://circle-v2-backend-staging:8080"| F2
-  PB2 -->|"http://circle-v2-backend-staging:8080"| F2
-  AB2 -->|"http://circle-v2-backend-staging:8080"| F2
+  GB2 -->|"http://c1rcle-api-staging:8080"| F2
+  PB2 -->|"http://c1rcle-api-staging:8080"| F2
+  AB2 -->|"http://c1rcle-api-staging:8080"| F2
 ```
 
 Differences from today: three more server blocks in the Nginx edge, three BFF
@@ -76,7 +76,7 @@ Applied per app in `C1RCLE-FRONTEND/apps/{guest-portal,partner-dashboard,admin-c
 ```mermaid
 flowchart LR
   Pub["NEXT_PUBLIC_API_BASE_URL<br/>https://staging-api.circle1.com"] --> S1["Browser fetch / SSE<br/>CSP connect-src (proxy.ts)"]
-  Int["INTERNAL_API_BASE_URL<br/>http://circle-v2-backend-staging:8080"] --> S2["forwardToGateway / server proxy routes<br/>never in client bundle"]
+  Int["INTERNAL_API_BASE_URL<br/>http://c1rcle-api-staging:8080"] --> S2["forwardToGateway / server proxy routes<br/>never in client bundle"]
 ```
 
 ### Server-side call sites to repoint
@@ -90,7 +90,7 @@ flowchart LR
 Rule: any URL that ends up in an HTML/JS bundle or CSP directive **must** be
 `NEXT_PUBLIC_*` (public); anything read only by the Node server may use
 `INTERNAL_API_BASE_URL` (private). Validate with a post-build grep that no
-`circle-v2-backend-*` or `localhost` private strings appear in client output.
+`c1rcle-api-*` or `localhost` private strings appear in client output.
 
 ---
 
@@ -114,7 +114,7 @@ Each phase is independently releasable and reversible.
 - Repoint server-side proxies to `INTERNAL_API_BASE_URL`.
 - `NEXT_PUBLIC_API_BASE_URL` keeps its current public value (also still used by
   the browser `connect-src`).
-- **Exit:** `rg "circle-v2-backend|localhost:8080" apps/*/.next` finds nothing in
+- **Exit:** `rg "c1rcle-api|localhost:8080" apps/*/.next` finds nothing in
   production build output; auth + ticket flows pass against staging.
 
 ### Phase 2 — Move BFFs behind Nginx (backend repo + DNS)

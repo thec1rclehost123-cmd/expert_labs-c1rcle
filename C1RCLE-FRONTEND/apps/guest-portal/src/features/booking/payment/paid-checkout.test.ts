@@ -38,7 +38,7 @@ function deps(overrides: Partial<PaidCheckoutDeps> = {}): PaidCheckoutDeps {
       .fn()
       .mockResolvedValue({ paymentIntentId: 'order_1', amountPaise: 118_000, keyId: 'rzp_test_x' }),
     openCheckout: vi.fn().mockResolvedValue(paid),
-    verify: vi.fn().mockResolvedValue({ order: { id: 'ord_9' }, entitlements: [] }),
+    verify: vi.fn().mockResolvedValue({ order: { id: 'ord_9', status: 'paid' }, entitlements: [] }),
     waitForTickets: vi.fn().mockResolvedValue(false),
     ...overrides,
   };
@@ -53,6 +53,17 @@ const input: PaidCheckoutInput = {
 };
 
 describe('runPaidCheckout', () => {
+  it('continues when referral attribution is omitted from the public hold response', async () => {
+    const d = deps({
+      createHold: vi.fn().mockResolvedValue(hold()),
+    });
+
+    const result = await runPaidCheckout(d, input);
+
+    expect(result).toEqual({ kind: 'confirmed', orderId: 'ord_9' });
+    expect(d.openCheckout).toHaveBeenCalledOnce();
+  });
+
   it('holds, creates the order, opens the widget, verifies, and returns the order id', async () => {
     const d = deps();
 
@@ -75,6 +86,39 @@ describe('runPaidCheckout', () => {
       title: 'C1RCLE',
       description: 'Sky Night',
     });
+  });
+
+  it('passes the source entitlement to the server when creating an upgrade hold', async () => {
+    const d = deps();
+
+    const result = await runPaidCheckout(d, {
+      ...input,
+      lines: [{ tierId: 'tier_upgrade', quantity: 1 }],
+      upgradeFromEntitlementId: 'ent_source',
+    });
+
+    expect(result).toEqual({ kind: 'confirmed', orderId: 'ord_9' });
+    expect(d.createHold).toHaveBeenCalledWith({
+      eventId: 'evt_1',
+      lines: [{ tierId: 'tier_upgrade', quantity: 1 }],
+      idempotencyKey: 'attempt-key-hold',
+      upgradeFromEntitlementId: 'ent_source',
+    });
+  });
+
+  it('uses an accepted waitlist reservation without creating a duplicate inventory hold', async () => {
+    const reservedHold = hold();
+    const d = deps();
+
+    const result = await runPaidCheckout(d, { ...input, reservedHold });
+
+    expect(result).toEqual({ kind: 'confirmed', orderId: 'ord_9' });
+    expect(d.createHold).not.toHaveBeenCalled();
+    expect(d.createAttempt).toHaveBeenCalledWith({
+      holdId: reservedHold.holdId,
+      idempotencyKey: 'attempt-key-attempt',
+    });
+    expect(d.verify).toHaveBeenCalledWith(expect.objectContaining({ holdId: reservedHold.holdId }));
   });
 
   it('verifies with the ids the widget returned, not ones the client invented', async () => {
@@ -106,6 +150,66 @@ describe('runPaidCheckout', () => {
     expect(result).toEqual({ kind: 'price_changed', grandTotalPaise: 130_000 });
     expect(d.createAttempt).not.toHaveBeenCalled();
     expect(d.openCheckout).not.toHaveBeenCalled();
+  });
+
+  it('requires re-confirmation when the server fee-policy version changes even if the total stays the same', async () => {
+    const held = hold();
+    const d = deps({
+      createHold: vi.fn().mockResolvedValue({
+        ...held,
+        pricing: { ...held.pricing, feePolicy: { version: 'test-policy-two' } },
+      }),
+    });
+    const result = await runPaidCheckout(d, {
+      ...input,
+      expectedFeePolicyVersion: 'test-policy-one',
+    });
+    expect(result).toEqual({
+      kind: 'price_changed',
+      grandTotalPaise: input.expectedTotalPaise,
+      feePolicyChanged: true,
+    });
+    expect(d.createAttempt).not.toHaveBeenCalled();
+    expect(d.openCheckout).not.toHaveBeenCalled();
+    expect(d.verify).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { quoted: undefined, held: 'new-test-policy' },
+    { quoted: 'test-policy-one', held: undefined },
+  ])(
+    'rejects adding or removing the disclosed fee-policy snapshot ($quoted -> $held)',
+    async ({ quoted, held }) => {
+      const reserved = hold();
+      const d = deps({
+        createHold: vi.fn().mockResolvedValue({
+          ...reserved,
+          pricing: { ...reserved.pricing, ...(held ? { feePolicy: { version: held } } : {}) },
+        }),
+      });
+      expect(
+        await runPaidCheckout(d, {
+          ...input,
+          ...(quoted ? { expectedFeePolicyVersion: quoted } : {}),
+        }),
+      ).toMatchObject({ kind: 'price_changed', feePolicyChanged: true });
+      expect(d.createAttempt).not.toHaveBeenCalled();
+      expect(d.openCheckout).not.toHaveBeenCalled();
+    },
+  );
+
+  it('continues with the provider only when the shown and held fee-policy versions match', async () => {
+    const reserved = hold();
+    const d = deps({
+      createHold: vi.fn().mockResolvedValue({
+        ...reserved,
+        pricing: { ...reserved.pricing, feePolicy: { version: 'test-policy-one' } },
+      }),
+    });
+    expect(
+      await runPaidCheckout(d, { ...input, expectedFeePolicyVersion: 'test-policy-one' }),
+    ).toEqual({ kind: 'confirmed', orderId: 'ord_9' });
+    expect(d.createAttempt).toHaveBeenCalledOnce();
   });
 
   it('reports payments as unavailable when the server cannot take them (503)', async () => {
@@ -173,7 +277,7 @@ describe('runPaidCheckout', () => {
     });
 
     expect(await runPaidCheckout(d, input)).toEqual({ kind: 'processing', ticketsReady: true });
-    expect(d.waitForTickets).toHaveBeenCalledWith('evt_1');
+    expect(d.waitForTickets).toHaveBeenCalledWith('evt_1', 'hold_1');
   });
 
   it('never reports a failure once the buyer has paid, even if the tickets never appear', async () => {
@@ -193,6 +297,44 @@ describe('runPaidCheckout', () => {
     expect(d.openCheckout).toHaveBeenCalledWith(
       expect.objectContaining({ prefill: { name: 'A Buyer', email: 'b@example.com' } }),
     );
+  });
+
+  it('keeps authoritative uncertain provider creation blocked for support without opening payment', async () => {
+    const d = deps({
+      createAttempt: vi.fn().mockRejectedValue({
+        status: 400,
+        code: 'invalid_operation',
+        message: 'Payment creation requires_support; provider identity is unresolved',
+      }),
+    });
+    expect(await runPaidCheckout(d, input)).toMatchObject({ kind: 'requires_support' });
+    expect(d.openCheckout).not.toHaveBeenCalled();
+    expect(d.createHold).toHaveBeenCalledTimes(1);
+    expect(d.createAttempt).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not confirm a paid order while authoritative fulfillment remains pending', async () => {
+    const d = deps({
+      verify: vi.fn().mockResolvedValue({
+        order: { id: 'ord_pending', status: 'paid', fulfillmentState: 'pending' },
+        entitlements: [],
+      }),
+    });
+    expect(await runPaidCheckout(d, input)).toEqual({
+      kind: 'processing',
+      ticketsReady: false,
+      orderId: 'ord_pending',
+    });
+  });
+  it('shows durable approval-gated compensation as pending rather than refunded or confirmed', async () => {
+    const d = deps({
+      verify: vi.fn().mockResolvedValue({
+        order: { id: 'ord_comp', status: 'refund_requested', fulfillmentState: 'pending' },
+        entitlements: [],
+      }),
+    });
+    expect((await runPaidCheckout(d, input)).kind).toBe('refund_pending');
+    expect(d.waitForTickets).not.toHaveBeenCalled();
   });
 
   describe('a payment that arrived too late and was refunded', () => {

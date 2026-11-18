@@ -1,5 +1,7 @@
 # Handoff notes
 
+> **Update 2026-11-18.** `C1RCLE-BACKEND/` and `C1RCLE-FRONTEND/` were refreshed from the latest `staging` of the two source repositories (backend `3802889`, frontend `8532a73`) and sanitized with the same rules as the original snapshot (see "What was removed" below). Documentation under each `docs/` folder was updated only for files this snapshot already carried; newer internal documents were deliberately not added. **`architecture-package/` and `expertlabs/` were NOT refreshed in this update** and still describe the 2026-10-24 state. The backend `render.yaml` and the three scanner seed scripts were re-sanitized (no live identifiers, no hard-coded seed password: set `SEED_E2E_OWNER_PASSWORD`).
+
 This repository is a clean, single-repository snapshot assembled on **2026-10-26** from the two original `C1RCLE-BACKEND` and `C1RCLE-FRONTEND` repositories. The original Git histories are **not** included: this tree was created from each repository's tracked files at its then-current branch, then sanitized.
 
 ## Read this before sharing

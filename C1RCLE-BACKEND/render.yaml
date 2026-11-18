@@ -10,11 +10,11 @@ services:
   - type: web
     name: c1rcle-api
     runtime: docker
-    # The live service builds the SIDECAR image: nginx is the public edge and the
+    # The example service builds the SIDECAR image: nginx is the public edge and the
     # gateway listens on 127.0.0.1 behind it (deploy/docker/sidecar-entrypoint.sh).
     dockerfilePath: ./deploy/docker/Dockerfile.sidecar
     dockerContext: .
-    # The live service is on the free plan, which spins down when idle (the first
+    # The example service is on the free plan, which spins down when idle (the first
     # request after a pause takes ~40 s). Use `starter` or above before real
     # customers pay. Changing the plan here only takes effect once this Blueprint
     # is adopted.
@@ -24,7 +24,7 @@ services:
     # Deploys are CI-GATED: Render does NOT build or deploy on push
     # (autoDeploy is false). The ci.yml `deploy` job triggers Render only after
     # CI OK and the Security pipeline (`Security OK`) both pass for the pushed
-    # commit, then smoke-tests the result. The live service tracks `staging`;
+    # commit, then smoke-tests the result. The example service tracks `staging`;
     # keep this Blueprint's `branch` in step when it is adopted.
     autoDeploy: false
 
@@ -68,7 +68,7 @@ services:
       # Better Auth. Comma-separated exact https origins, no wildcards. Currently:
       # the guest portal, partner dashboard and admin console on Vercel. Not secret,
       # but kept in the dashboard because it changes with frontend domains.
-      # BETTER_AUTH_TRUSTED_ORIGINS defaults to this list when unset; the live
+      # BETTER_AUTH_TRUSTED_ORIGINS defaults to this list when unset; the example
       # service sets both to the same value.
       - key: ALLOWED_ORIGINS
         sync: false
@@ -76,6 +76,17 @@ services:
         sync: false
       - key: PUBLIC_API_URL
         value: https://api.example.com
+      # Public origin of the partner dashboard. The gateway builds every absolute
+      # link in partner emails from it: the staff-invitation "Accept invite" link,
+      # onboarding and application-decision links, and promoter links. If it is
+      # unset the gateway omits those links, so an invitee receives a mail with no
+      # way to accept. Use the stable domain, never a per-deployment *.vercel.app
+      # URL: for staging that is https://app.example.com. Bare origin only:
+      # no trailing slash, no path. Kept in the dashboard (not secret) because it
+      # changes with frontend domains, like ALLOWED_ORIGINS; the domain must also
+      # be listed in ALLOWED_ORIGINS and BETTER_AUTH_TRUSTED_ORIGINS.
+      - key: PARTNER_DASHBOARD_URL
+        sync: false
       # nginx (the sidecar's public edge) is the only trusted proxy hop.
       - key: TRUSTED_PROXY_CIDRS
         value: 127.0.0.1/32
@@ -117,12 +128,14 @@ services:
         value: memory
 
       # Payout release gate: off until the funds flow, provider and tax approvals are on
-      # file (see your own payout approval policy). Change only with sign-off.
+      # file (see docs/operations/payments-release-gate.md). Change only with sign-off.
       - key: PAYOUTS_ENABLED
         value: 'false'
+      - key: BACKGROUND_WORKERS_ENABLED
+        value: 'false'
 
-      # Phase 4 payments. Optional in the schema; required once the checkout
-      # and webhook routes are registered.
+      # M4 payments: configure all three together, with an rzp_test_ key ID.
+      # Live Mode and partial tuples fail validation at startup.
       - key: RAZORPAY_KEY_ID
         sync: false
       - key: RAZORPAY_KEY_SECRET

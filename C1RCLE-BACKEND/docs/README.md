@@ -14,8 +14,11 @@ docs/
 ├── admin-dashboard/      per-desk admin console docs (tiers, proposals, support desk)
 ├── scanner-app/          door scanner backend/app docs (SOTA blueprint, topic docs, task/impl logs)
 ├── integration-flows/    checkout + ticket-booking frontend↔gateway flows
+├── frontend-services/    point-in-time frontend service inventory
 ├── nginx/ operations/    edge/deploy docs (nginx, Render staging, env contract, rollback)
-└── ci-cd.md              CI/CD + deploy pipeline (adapt to your own infrastructure)
+├── ci-cd.md              CI/CD + deploy pipeline
+├── Intern/ Sagar_code_Changes/ WORK_DONE_BY_SAGAR_*.md   historical work logs (bannered)
+└── PHASE_5_HTTP_WIRING_PLAN.md   historical, fully superseded Phase 5 plan
 ```
 
 ## `docs/roadmap/` — implemented vs remaining (the status tracker)
@@ -46,6 +49,12 @@ just when a task finishes.
 - [`decisions.md`](architecture/decisions.md) — the decision log (D-001…).
   Append-only: every architectural choice that must survive a session, with
   its problem/options/choice/why. Never rewrite past entries.
+- [`IMPLEMENTATION-STATUS-2026-08-31.md`](architecture/IMPLEMENTATION-STATUS-2026-08-31.md)
+  — point-in-time implementation-vs-design gap analysis (target architecture,
+  the 25 non-negotiable rules, a 15-item cross-doc contradiction log, a
+  per-domain LIVE/NO-BACKEND status table, the honest-501 list as of that date, all since closed).
+  Numbers are dated to its audited commit — cross-check `ROADMAP.md` /
+  `git log` / `pnpm check` before citing a count as current.
 
 ## `docs/reference/` — point-in-time material, not maintained
 
@@ -57,9 +66,20 @@ for context, not as current truth** — if it disagrees with live code or with
 - `frontend-api-map.md` — `C1RCLE-FRONTEND` route/contract mapping as of
   2026-08-12. Useful for "what does the frontend expect," not for "what's
   live in this backend today" (that's `docs/roadmap/`).
-- `route-manifest.ts` — the original full-platform planning manifest. Live
-  registration is `apps/api-gateway/src/routes/v2/route-manifest.ts`.
-- `V1_TO_V2_PARITY.md` — V1 → V2 behavioural parity notes.
+- `task.md`, `V1 admin dashboard.md`, `V2 Backend Engineering — Senior Developer - IT Team Master Prompt.md`, `route-manifest.ts` (planning manifest; live registration is
+  `apps/api-gateway/src/routes/v2/route-manifest.ts`), `V1_TO_V2_PARITY.md`,
+  `MASTER_LAUNCH_IMPLEMENTATION_PLAN.md`,
+  `Dream Architecture Implementation Plan.md`, `chatgpt_response.md` — the
+  T-series design authority and full-platform destination plans, copied from
+  the frozen `thec1rcle` repo. Source of proven patterns and business logic
+  to port — see each `docs/roadmap/phase-*.md` file for exactly which parts.
+
+## Root-level docs (not in `docs/`)
+
+- `/task.md` — the original B-series execution plan for this repo. High
+  visibility by design (repo root, like `AGENTS.md`/`CLAUDE.md` elsewhere).
+  Its checkboxes are historical and can lag — the "Verified B-series state"
+  note near the top of the file points to `docs/roadmap/` for current status.
 
 ## Rule of thumb for adding new docs
 

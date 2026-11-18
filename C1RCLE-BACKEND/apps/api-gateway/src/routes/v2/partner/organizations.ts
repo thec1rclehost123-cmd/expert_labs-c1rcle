@@ -146,8 +146,8 @@ export default async function partnerOrganizationRoutes(fastify: FastifyInstance
   fastify.post(
     '/organizations',
     {
-      // No `requirePermission` here on purpose: creating your first
-      // organization happens before any membership exists to grant a role.
+      // Self-service provisioning is closed: only reviewed onboarding approval
+      // may create a Partner workspace. Keep input validation for legacy callers.
       preHandler: [
         fastify.rateLimit('STANDARD_COMMAND'),
         fastify.validateV2({
@@ -156,43 +156,13 @@ export default async function partnerOrganizationRoutes(fastify: FastifyInstance
         }),
       ],
     },
-    async (request, reply) => {
-      const body = request.body as z.infer<typeof createOrganizationBody>;
-      const actor = services.actor(request);
-      const v2Headers = request.v2Headers ?? {};
-      const result = await runIdempotent({
-        idempotency: services.idempotency,
-        request,
-        actorId: actor.userId,
-        commandName: 'organizations.create',
-        idempotencyKey: v2Headers['idempotency-key'],
-        context: { path: {}, body },
-        run: async () => {
-          const org = await services.organizations.create(actor, {
-            name: body.name,
-            slug: body.slug,
-            settings: body.settings,
-          });
-          const validated = validateV2Response(
-            reply,
-            request,
-            organizationDtoSchema,
-            organizationToDto(org, actor.userId),
-          );
-          if (validated === undefined) throw new Error('v2 response validation failed');
-          return { statusCode: 201, body: validated };
-        },
-      }).catch((error: unknown) => {
-        if (isIdempotencyConflict(error)) {
-          return mapDomainError(reply, request, 'new_org', error, {
-            conflictId: v2Headers['idempotency-key'],
-          });
-        }
-        return mapDomainError(reply, request, 'new_org', error);
-      });
-      if (result === undefined) return reply;
-      return reply.status(result.statusCode).send(result.body);
-    },
+    async (_request, reply) =>
+      reply.status(403).send({
+        code: 'forbidden',
+        status: 403,
+        message:
+          'Partner workspaces are created after application approval. Complete your onboarding application to continue.',
+      }),
   );
 
   // ── UPDATE (PATCH, optimistic-locked + idempotent) ─────────────────────────
@@ -635,6 +605,41 @@ export default async function partnerOrganizationRoutes(fastify: FastifyInstance
       const actor = services.actor(request);
       const invitation = await services.organizations
         .revokeInvitation(actor, invitationId)
+        .catch((error: unknown) => mapDomainError(reply, request, invitationId, error));
+      if (invitation === undefined) return reply;
+
+      const validated = validateV2Response(
+        reply,
+        request,
+        invitationDtoSchema,
+        invitationToDto(invitation),
+      );
+      if (validated === undefined) return reply;
+      return reply.send(validated);
+    },
+  );
+
+  // Resending re-emails a pending invitation and, when the invitee has never
+  // taken ownership of their account, issues a fresh 2-day temporary password
+  // (the old one stops working). Same authority as revoking: you can only act
+  // on invitations for roles below your own.
+  fastify.post(
+    '/invitations/:invitationId/resend',
+    {
+      preHandler: [
+        fastify.rateLimit('SENSITIVE_COMMAND'),
+        fastify.validateV2({
+          params: invitationIdParam,
+          headers: orgHeaders.extend({ 'idempotency-key': idempotencyKeySchema }),
+        }),
+        fastify.requirePermission('staff.manage'),
+      ],
+    },
+    async (request, reply) => {
+      const { invitationId } = request.params as z.infer<typeof invitationIdParam>;
+      const actor = services.actor(request);
+      const invitation = await services.organizations
+        .resendInvitation(actor, invitationId)
         .catch((error: unknown) => mapDomainError(reply, request, invitationId, error));
       if (invitation === undefined) return reply;
 

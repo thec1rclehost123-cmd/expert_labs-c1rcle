@@ -8,6 +8,8 @@ import type {
   PaymentVerificationResponse,
   RefundRequest,
   RefundResponse,
+  ProviderRefund,
+  ProviderOrder,
 } from '@c1rcle/core/domain/ports';
 
 /**
@@ -27,6 +29,9 @@ export class UnconfiguredPaymentProvider implements PaymentProvider {
   createOrder(_request: PaymentOrderRequest): Promise<PaymentOrderResponse> {
     return Promise.resolve().then(() => this.fail());
   }
+  findOrdersByReceipt(_receipt: string): Promise<ProviderOrder[]> {
+    return Promise.resolve().then(() => this.fail());
+  }
   verifyPayment(_request: PaymentVerificationRequest): Promise<PaymentVerificationResponse> {
     return Promise.resolve().then(() => this.fail());
   }
@@ -37,6 +42,9 @@ export class UnconfiguredPaymentProvider implements PaymentProvider {
     return Promise.resolve().then(() => this.fail());
   }
   getPayment(_paymentId: string): Promise<PaymentVerificationResponse | null> {
+    return Promise.resolve().then(() => this.fail());
+  }
+  getRefund(_paymentId: string, _refundId: string): Promise<ProviderRefund> {
     return Promise.resolve().then(() => this.fail());
   }
 }
