@@ -1,6 +1,6 @@
 # C1RCLE: Architecture Package for Expert Labs
 
-Prepared 2026-10-23, deepened and re-verified 2026-10-24 from a read-through of both repositories (`C1RCLE-BACKEND`, `C1RCLE-FRONTEND`) and their existing docs.
+**Partly refreshed 2026-11-17 against backend `staging` @ `7c181a0`: see `REFRESH-2026-11-17.md` (addendum 2026-11-18) for what is current and what is still the 2026-10-24 snapshot.** Prepared 2026-10-23, deepened and re-verified 2026-10-24 from a read-through of both repositories (`C1RCLE-BACKEND`, `C1RCLE-FRONTEND`) and their existing docs.
 **Confidential. Share only under an NDA.** This package includes known weaknesses and audit findings on purpose (see `12-status-and-known-issues/`).
 
 ## What C1RCLE is
@@ -23,6 +23,8 @@ A ticketing and nightlife-operations platform for India: venues, hosts (organise
 | 11 | `11-infrastructure-and-cicd/` | Render, Vercel, nginx, Cloudflare, CI/CD |
 | 12 | `12-status-and-known-issues/` | What is live vs partial vs unmerged; audits; open risks |
 | 13 | `13-reference/` | Generated route, env and collection indexes; services, errors, security and privacy, operations, decisions, glossary, getting started, **coverage and gaps** |
+| 14 | `14-vendor-handover/` | **New 2026-11-17.** Engineering handover and production-readiness checklist for six backend services (`.docx`), plus the current route list (404 routes) and schema list (95 collections) |
+| - | `_archive-2026-10-24/` | Previous versions of files replaced in the refresh |
 | - | `diagrams/` | Mermaid sources (also embedded in the pages) |
 
 ## Edge architecture

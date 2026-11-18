@@ -1,558 +1,770 @@
-# API route index (generated)
+# C1RCLE API route list (api-gateway, `/api/v2`)
 
-**Generated from source on 2026-10-24** by scanning `apps/api-gateway/src/routes/v2/**` on backend checkout `fix/partner-connections-and-events` at `4bcc15a`. It lists **275 route registrations**. Staging may differ (it is 9 commits ahead of this checkout; the door routes are unchanged but PR #138 modifies the offline manifest and sync handlers). Treat the route files as authoritative.
+> **Update 2026-11-18:** added `POST /invitations/:id/resend`. Roles are now `owner`, `admin` (Ops lead), `manager` (Venue manager), `door_supervisor`, `gate_staff`, `member`. `/door/events`, `/door/guests`, `/door/sales` and `POST /door/devices` now need the narrow `door.floor` permission instead of `venue.read` / `door.manage`. The generated tables below were not regenerated; treat per-route access labels for those routes as superseded by this note.
 
-Columns: **Rate** = rate-limit class (`PUBLIC_READ` 120/min, `AUTH_READ` 240, `STANDARD_COMMAND` 60, `SENSITIVE_COMMAND` 10, `OTP_SEND` 5, `OTP_VERIFY` 10, `SCANNER_COMMAND` 300). **Permission** = `requirePermission` on the route (organisation RBAC); `-` means none on the route, so authorisation, if any, happens in the service (session actor, scanner token, platform-admin authority, or HMAC). **Cache** = response cache class. **Idem** = the handler takes an `Idempotency-Key` or wraps `runIdempotent`; **Command** = its idempotency command name. Loop-registered routes (`${action}`) are shown with the placeholder.
+> Generated from `origin/staging` @ `7c181a0` (2026-11-17). Method: the app was booted with the in-memory driver and every registered route was captured through Fastify `onRoute`; per-route guards were then read from each route file's `preHandler`. HEAD/OPTIONS auto-routes are omitted. **404 routes.**
 
-## Summary by area
+Column legend: **RL** = rate-limit class (`PUBLIC_READ` 120/min, `AUTH_READ` 240/min, `STANDARD_COMMAND` 60/min, `SENSITIVE_COMMAND` 10/min, `OTP_SEND` 5/min, `OTP_VERIFY` 10/min, `SCANNER_COMMAND` 300/min). **Access** = `perm:` is an RBAC permission enforced in the route `preHandler` (`requirePermission`); `session` means a signed-in session is resolved globally and fine-grained authorization happens in the service layer (not visible at route level); `public` = no session required. **Validation** = Zod schemas from `@c1rcle/contracts` (B body, Q query, P params). Unlisted guard = none declared at route level.
 
-| Area (route directory) | Routes |
+## Cross-cutting
+
+- Global hooks (`apps/api-gateway/src/app.ts`): request tracing, CORS allow-list (exact origins, credentials), unsafe-method CSRF origin check (403 on untrusted `Origin`/cross-site), body limit (1 MiB -> 413), error redaction, rate limit (memory or Redis store), auth-context plugin (Better Auth session cookie -> `request.actor`), forced password-rotation gate (allow-listed paths), RBAC (default deny), response cache classes, `validateV2` + `validateV2Response`.
+- Command idempotency: mutating guest/partner commands take an `Idempotency-Key` header (`v2_idempotency_records`).
+- Errors use the v2 error contract (`status`, `code`, `message`, `requestId`).
+- Better Auth itself is mounted behind `/api/v2/auth/*` (routes below are the gateway's wrappers) and Google/native callbacks live in `routes/v2/auth/native-callbacks.ts`.
+
+## Counts by area
+
+| Area | Routes |
 |---|---|
-| `admin` | 84 |
-| `partner` | 66 |
-| `door` | 41 |
-| `finance` | 17 |
-| `auth` | 11 |
-| `public` | 11 |
-| `onboarding` | 8 |
-| `social` | 8 |
-| `checkout` | 6 |
-| `notifications` | 4 |
-| `support` | 4 |
-| `internal` | 3 |
-| `orders` | 3 |
-| `wallet` | 3 |
-| `phase5-routes` | 2 |
-| `profile` | 2 |
-| `rsvp` | 1 |
-| `tickets` | 1 |
+| Internal / health | 3 |
+| Auth & sessions | 12 |
+| Public discovery (unauthenticated) | 14 |
+| Guest: checkout, payments, RSVP, orders | 12 |
+| Guest: tickets, waitlist, wallet | 25 |
+| Guest: profile, social, saved events, support intake | 29 |
+| Partner dashboard (org-scoped) | 132 |
+| Door, scanner & cover wallet | 49 |
+| Finance, ledger & payouts | 17 |
+| Platform admin console | 111 |
+| **Total** | **404** |
 
-**Routes with no `requirePermission` (excluding `/public` and `/internal`): 155.** They are protected by something else (session, scanner token, admin authority, HMAC) or are deliberately open (signup, login). Review list at the end of this file.
+## 01 Internal / health
 
-By method: DELETE 5, GET 130, PATCH 8, POST 129, PUT 3.
+### `internal/index.ts`
 
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/internal/health` | - | public | - |  |
+| GET | `/internal/readiness` | - | public | - |  |
+| GET | `/internal/version` | - | public | - |  |
 
-## admin
+## 02 Auth & sessions
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/admin/analytics` | AUTH_READ | - |  |  |  | `admin/analytics.ts:21` |
-| GET | `/api/v2/admin/venues` | AUTH_READ | - |  |  |  | `admin/directory.ts:117` |
-| GET | `/api/v2/admin/events` | AUTH_READ | - |  |  |  | `admin/directory.ts:146` |
-| GET | `/api/v2/admin/hosts` | AUTH_READ | - |  |  |  | `admin/directory.ts:175` |
-| GET | `/api/v2/admin/users` | AUTH_READ | - |  |  |  | `admin/directory.ts:204` |
-| GET | `/api/v2/admin/lookup` | AUTH_READ | - |  |  |  | `admin/directory.ts:233` |
-| GET | `/api/v2/admin/venues/export.csv` | AUTH_READ | - |  |  |  | `admin/directory.ts:263` |
-| GET | `/api/v2/admin/events/export.csv` | AUTH_READ | - |  |  |  | `admin/directory.ts:308` |
-| GET | `/api/v2/admin/hosts/export.csv` | AUTH_READ | - |  |  |  | `admin/directory.ts:361` |
-| GET | `/api/v2/admin/users/export.csv` | AUTH_READ | - |  |  |  | `admin/directory.ts:411` |
-| GET | `/api/v2/admin/audit/export.csv` | AUTH_READ | - |  |  |  | `admin/directory.ts:446` |
-| POST | `/api/v2/admin/disputes/:disputeId/resolve` | SENSITIVE_COMMAND | - |  | yes | admin.dispute.resolve | `admin/disputes.ts:62` |
-| GET | `/api/v2/admin/disputes` | AUTH_READ | - |  |  |  | `admin/disputes.ts:117` |
-| GET | `/api/v2/admin/disputes/:disputeId` | AUTH_READ | - |  |  |  | `admin/disputes.ts:152` |
-| POST | `/api/v2/admin/events/:eventId/pause` | SENSITIVE_COMMAND | - |  | yes | admin.event.pause | `admin/event-actions.ts:52` |
-| POST | `/api/v2/admin/events/:eventId/resume` | SENSITIVE_COMMAND | - |  | yes | admin.event.resume | `admin/event-actions.ts:96` |
-| POST | `/api/v2/admin/events/:eventId/force-complete` | SENSITIVE_COMMAND | - |  | yes | admin.event.force_complete | `admin/event-actions.ts:140` |
-| GET | `/api/v2/admin/onboarding/applications` | AUTH_READ | - |  |  |  | `admin/onboarding-review.ts:77` |
-| GET | `/api/v2/admin/onboarding/applications/:requestId` | AUTH_READ | - |  | yes |  | `admin/onboarding-review.ts:112` |
-| GET | `/api/v2/admin/onboarding/applications/:requestId/documents/:label/read-url` | AUTH_READ | - |  |  |  | `admin/onboarding-review.ts:144` |
-| POST | `/api/v2/admin/onboarding/applications/:requestId/documents/:label/verify` | SENSITIVE_COMMAND | - |  | yes | admin.onboarding.document.verify | `admin/onboarding-review.ts:173` |
-| POST | `/api/v2/admin/onboarding/applications/:requestId/documents/:label/reject` | SENSITIVE_COMMAND | - |  | yes | admin.onboarding.document.reject | `admin/onboarding-review.ts:223` |
-| POST | `/api/v2/admin/onboarding/applications/:requestId/approve` | SENSITIVE_COMMAND | - |  | yes | admin.onboarding.approve | `admin/onboarding-review.ts:283` |
-| GET | `/api/v2/admin/proposals` | AUTH_READ | - |  |  |  | `admin/onboarding-review.ts:356` |
-| POST | `/api/v2/admin/proposals` | SENSITIVE_COMMAND | - |  | yes |  | `admin/onboarding-review.ts:391` |
-| GET | `/api/v2/admin/admins` | AUTH_READ | - |  |  |  | `admin/onboarding-review.ts:422` |
-| POST | `/api/v2/admin/proposals/:proposalId/provision-admin` | SENSITIVE_COMMAND | - |  | yes | admin.provision | `admin/onboarding-review.ts:460` |
-| POST | `/api/v2/admin/proposals/:proposalId/update-admin-role` | SENSITIVE_COMMAND | - |  | yes | admin.role_update | `admin/onboarding-review.ts:512` |
-| POST | `/api/v2/admin/admins/:adminId/revoke` | SENSITIVE_COMMAND | - |  | yes | admin.revoke | `admin/onboarding-review.ts:560` |
-| GET | `/api/v2/admin/audit` | AUTH_READ | - |  |  |  | `admin/onboarding-review.ts:610` |
-| POST | `/api/v2/admin/onboarding/applications/:requestId/${action}` | SENSITIVE_COMMAND | - |  | yes |  | `admin/onboarding-review.ts:650` |
-| POST | `/api/v2/admin/proposals/:proposalId/${action}` | SENSITIVE_COMMAND | - |  | yes |  | `admin/onboarding-review.ts:710` |
-| GET | `/api/v2/admin/orders` | AUTH_READ | - |  |  |  | `admin/orders.ts:60` |
-| GET | `/api/v2/admin/orders/export.csv` | AUTH_READ | - |  |  |  | `admin/orders.ts:89` |
-| POST | `/api/v2/admin/proposals/:proposalId/adjust-commission` | SENSITIVE_COMMAND | - |  | yes | admin.organization.adjust_commission | `admin/organization-actions.ts:46` |
-| POST | `/api/v2/admin/organizations/:organizationId/suspend` | SENSITIVE_COMMAND | - |  | yes | admin.organization.suspend | `admin/organization-actions.ts:89` |
-| POST | `/api/v2/admin/organizations/:organizationId/reinstate` | SENSITIVE_COMMAND | - |  | yes | admin.organization.reinstate | `admin/organization-actions.ts:132` |
-| POST | `/api/v2/admin/proposals/:proposalId/freeze-payout` | SENSITIVE_COMMAND | - |  | yes | admin.payout.freeze | `admin/payouts.ts:72` |
-| POST | `/api/v2/admin/proposals/:proposalId/release-payout` | SENSITIVE_COMMAND | - |  | yes | admin.payout.release | `admin/payouts.ts:120` |
-| POST | `/api/v2/admin/payouts/batch-run` | SENSITIVE_COMMAND | - |  | yes | admin.payout.batch_run | `admin/payouts.ts:171` |
-| POST | `/api/v2/admin/payouts/:payoutId/complete` | SENSITIVE_COMMAND | - |  | yes | admin.payout.complete | `admin/payouts.ts:220` |
-| GET | `/api/v2/admin/payouts` | AUTH_READ | - |  |  |  | `admin/payouts.ts:271` |
-| GET | `/api/v2/admin/payouts/:payoutId` | AUTH_READ | - |  |  |  | `admin/payouts.ts:306` |
-| GET | `/api/v2/admin/promoters` | AUTH_READ | - |  |  |  | `admin/promoters.ts:69` |
-| GET | `/api/v2/admin/promoters/export.csv` | AUTH_READ | - |  |  |  | `admin/promoters.ts:98` |
-| POST | `/api/v2/admin/promoters/:promoterId/suspend` | SENSITIVE_COMMAND | - |  | yes | admin.promoter.suspend | `admin/promoters.ts:141` |
-| POST | `/api/v2/admin/promoters/:promoterId/reinstate` | SENSITIVE_COMMAND | - |  | yes | admin.promoter.reinstate | `admin/promoters.ts:189` |
-| GET | `/api/v2/admin/promotions` | AUTH_READ | - |  |  |  | `admin/promotions.ts:59` |
-| GET | `/api/v2/admin/promotions/export.csv` | AUTH_READ | - |  |  |  | `admin/promotions.ts:88` |
-| POST | `/api/v2/admin/proposals/:proposalId/post-financial-adjustment` | SENSITIVE_COMMAND | - |  | yes | admin.finance.adjustment | `admin/reconciliation.ts:71` |
-| GET | `/api/v2/admin/chargebacks` | AUTH_READ | - |  |  |  | `admin/reconciliation.ts:150` |
-| POST | `/api/v2/admin/reconciliation/runs` | SENSITIVE_COMMAND | - |  | yes | admin.reconciliation.run | `admin/reconciliation.ts:198` |
-| GET | `/api/v2/admin/reconciliation/runs` | AUTH_READ | - |  |  |  | `admin/reconciliation.ts:245` |
-| GET | `/api/v2/admin/reconciliation/runs/:runId` | AUTH_READ | - |  |  |  | `admin/reconciliation.ts:266` |
-| GET | `/api/v2/admin/reconciliation/discrepancies` | AUTH_READ | - |  |  |  | `admin/reconciliation.ts:280` |
-| GET | `/api/v2/admin/reconciliation/discrepancies/:discrepancyId` | AUTH_READ | - |  |  |  | `admin/reconciliation.ts:301` |
-| POST | `/api/v2/admin/reconciliation/discrepancies/:discrepancyId/retry` | SENSITIVE_COMMAND | - |  | yes | admin.reconciliation.recheck | `admin/reconciliation.ts:332` |
-| POST | `/api/v2/admin/reconciliation/discrepancies/:discrepancyId/resolve` | SENSITIVE_COMMAND | - |  | yes | admin.reconciliation.resolve | `admin/reconciliation.ts:386` |
-| GET | `/api/v2/admin/reconciliation/export.csv` | - | - |  |  |  | `admin/reconciliation.ts:443` |
-| POST | `/api/v2/admin/refunds` | SENSITIVE_COMMAND | - |  | yes | admin.refund.request | `admin/refunds.ts:92` |
-| POST | `/api/v2/admin/refunds/:refundRequestId/approve` | SENSITIVE_COMMAND | - |  | yes | admin.refund.approve | `admin/refunds.ts:147` |
-| POST | `/api/v2/admin/refunds/:refundRequestId/reject` | SENSITIVE_COMMAND | - |  | yes | admin.refund.reject | `admin/refunds.ts:195` |
-| POST | `/api/v2/admin/refunds/:refundRequestId/execute` | SENSITIVE_COMMAND | - |  | yes | admin.refund.execute | `admin/refunds.ts:251` |
-| GET | `/api/v2/admin/refunds` | AUTH_READ | - |  |  |  | `admin/refunds.ts:301` |
-| GET | `/api/v2/admin/refunds/export.csv` | AUTH_READ | - |  |  |  | `admin/refunds.ts:336` |
-| GET | `/api/v2/admin/refunds/:refundRequestId` | AUTH_READ | - |  |  |  | `admin/refunds.ts:385` |
-| GET | `/api/v2/admin/settings/platform` | AUTH_READ | - |  |  |  | `admin/settings.ts:60` |
-| PUT | `/api/v2/admin/settings/platform` | SENSITIVE_COMMAND | - |  | yes | admin.platform-settings.update | `admin/settings.ts:85` |
-| GET | `/api/v2/admin/support/tickets` | AUTH_READ | - |  |  |  | `admin/support.ts:76` |
-| GET | `/api/v2/admin/support/tickets/:ticketId` | AUTH_READ | - |  | yes |  | `admin/support.ts:120` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/assign` | SENSITIVE_COMMAND | - |  | yes | admin.support.assign | `admin/support.ts:152` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/priority` | SENSITIVE_COMMAND | - |  | yes | admin.support.change-priority | `admin/support.ts:206` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/reply` | SENSITIVE_COMMAND | - |  | yes | admin.support.reply | `admin/support.ts:260` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/notes` | SENSITIVE_COMMAND | - |  | yes | admin.support.note | `admin/support.ts:314` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/link` | SENSITIVE_COMMAND | - |  | yes | admin.support.link | `admin/support.ts:368` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/resolve` | SENSITIVE_COMMAND | - |  | yes | admin.support.resolve | `admin/support.ts:428` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/merge` | SENSITIVE_COMMAND | - |  | yes | admin.support.merge | `admin/support.ts:482` |
-| DELETE | `/api/v2/admin/support/tickets/:ticketId` | SENSITIVE_COMMAND | - |  | yes | admin.support.delete | `admin/support.ts:608` |
-| GET | `/api/v2/admin/tickets` | AUTH_READ | - |  |  |  | `admin/tickets.ts:57` |
-| GET | `/api/v2/admin/tickets/export.csv` | AUTH_READ | - |  |  |  | `admin/tickets.ts:86` |
-| POST | `/api/v2/admin/users/:userId/ban` | SENSITIVE_COMMAND | - |  | yes | admin.user.ban | `admin/user-actions.ts:45` |
-| POST | `/api/v2/admin/users/:userId/unban` | SENSITIVE_COMMAND | - |  | yes | admin.user.unban | `admin/user-actions.ts:94` |
-| POST | `/api/v2/admin/venues/:venueId/suspend` | SENSITIVE_COMMAND | - |  | yes | admin.venue.suspend | `admin/venue-actions.ts:50` |
-| POST | `/api/v2/admin/venues/:venueId/reinstate` | SENSITIVE_COMMAND | - |  | yes | admin.venue.reinstate | `admin/venue-actions.ts:94` |
+### `auth/index.ts`
 
-## auth
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/auth/change-password` | SENSITIVE_COMMAND | session | B:changePasswordSchema |  |
+| POST | `/auth/forgot-password` | SENSITIVE_COMMAND | public | B:forgotPasswordRequestSchema |  |
+| GET | `/auth/invitations/mine` | AUTH_READ | session | - |  |
+| POST | `/auth/login` | SENSITIVE_COMMAND | public | B:loginRequestSchema |  |
+| POST | `/auth/logout` | - | session | - |  |
+| POST | `/auth/partner/signup` | SENSITIVE_COMMAND | public | B:signupRequestSchema | public; partner signup (role fixed server-side) |
+| POST | `/auth/refresh` | SENSITIVE_COMMAND | public | - |  |
+| POST | `/auth/reset-password` | SENSITIVE_COMMAND | public | B:resetPasswordRequestSchema |  |
+| GET | `/auth/session` | AUTH_READ | session | - |  |
+| POST | `/auth/signup` | SENSITIVE_COMMAND | public | B:signupRequestSchema | public; guest signup |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| POST | `/api/v2/auth/signup` | SENSITIVE_COMMAND | - |  |  |  | `auth/index.ts:59` |
-| POST | `/api/v2/auth/login` | SENSITIVE_COMMAND | - |  |  |  | `auth/index.ts:106` |
-| POST | `/api/v2/auth/forgot-password` | SENSITIVE_COMMAND | - |  |  |  | `auth/index.ts:156` |
-| POST | `/api/v2/auth/reset-password` | SENSITIVE_COMMAND | - |  |  |  | `auth/index.ts:191` |
-| POST | `/api/v2/auth/refresh` | SENSITIVE_COMMAND | - |  |  |  | `auth/index.ts:230` |
-| POST | `/api/v2/auth/logout` | - | - |  |  |  | `auth/index.ts:258` |
-| GET | `/api/v2/auth/session` | AUTH_READ | - |  |  |  | `auth/index.ts:268` |
-| POST | `/api/v2/auth/change-password` | SENSITIVE_COMMAND | - |  |  |  | `auth/index.ts:295` |
-| GET | `/api/v2/auth/invitations/mine` | AUTH_READ | - |  |  |  | `auth/index.ts:373` |
-| POST | `/api/v2/auth/otp/send` | OTP_SEND | - |  |  |  | `auth/otp-routes.ts:32` |
-| POST | `/api/v2/auth/otp/verify` | OTP_VERIFY | - |  |  |  | `auth/otp-routes.ts:72` |
+### `auth/otp-routes.ts`
 
-## checkout
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/auth/otp/send` | OTP_SEND | public | B:otpSendRequestSchema |  |
+| POST | `/auth/otp/verify` | OTP_VERIFY | public | B:otpVerifyRequestSchema |  |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| POST | `/api/v2/checkout/quote` | STANDARD_COMMAND | - |  |  |  | `checkout/checkout-routes.ts:48` |
-| POST | `/api/v2/checkout/holds` | STANDARD_COMMAND | - |  | yes | checkout.hold | `checkout/checkout-routes.ts:93` |
-| GET | `/api/v2/payments/attempts/:holdId/status` | AUTH_READ | - |  |  |  | `checkout/payment-routes.ts:56` |
-| POST | `/api/v2/payments/attempts` | STANDARD_COMMAND | - |  | yes | payment.attempt | `checkout/payment-routes.ts:85` |
-| POST | `/api/v2/payments/:id/verify` | STANDARD_COMMAND | - |  | yes | payment.verify | `checkout/payment-routes.ts:156` |
-| POST | `/api/v2/webhooks/payments/razorpay` | - | - |  |  |  | `checkout/webhook-routes.ts:109` |
+## 03 Public discovery (unauthenticated)
 
-## door
+### `guest-social.ts`
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| POST | `/api/v2/cover-wallets` | STANDARD_COMMAND | door.manage |  | yes | cover_wallet.create | `door/cover-wallet-routes.ts:78` |
-| GET | `/api/v2/cover-wallets/:walletId` | AUTH_READ | venue.read |  |  |  | `door/cover-wallet-routes.ts:137` |
-| GET | `/api/v2/cover-wallets/:walletId/qr` | AUTH_READ | venue.read |  |  |  | `door/cover-wallet-routes.ts:184` |
-| POST | `/api/v2/cover-wallets/:walletId/debit` | STANDARD_COMMAND | ticket.override |  | yes | cover_wallet.debit | `door/cover-wallet-routes.ts:215` |
-| POST | `/api/v2/cover-wallets/:walletId/credit` | STANDARD_COMMAND | door.manage |  | yes | cover_wallet.credit | `door/cover-wallet-routes.ts:283` |
-| POST | `/api/v2/cover-wallets/:walletId/freeze` | STANDARD_COMMAND | door.manage |  | yes | cover_wallet.freeze | `door/cover-wallet-routes.ts:345` |
-| POST | `/api/v2/cover-wallets/:walletId/unfreeze` | STANDARD_COMMAND | door.manage |  | yes | cover_wallet.unfreeze | `door/cover-wallet-routes.ts:395` |
-| POST | `/api/v2/cover-wallets/:walletId/terminate` | STANDARD_COMMAND | door.manage |  | yes | cover_wallet.terminate | `door/cover-wallet-routes.ts:443` |
-| POST | `/api/v2/cover-wallets/:walletId/reconcile` | STANDARD_COMMAND | door.manage |  | yes | cover_wallet.reconcile | `door/cover-wallet-routes.ts:499` |
-| GET | `/api/v2/door/events` | AUTH_READ | venue.read |  |  |  | `door/door-ops-routes.ts:70` |
-| POST | `/api/v2/door/devices` | STANDARD_COMMAND | door.manage |  |  |  | `door/door-ops-routes.ts:98` |
-| GET | `/api/v2/door/devices` | AUTH_READ | door.manage |  |  |  | `door/door-ops-routes.ts:127` |
-| POST | `/api/v2/door/devices/:deviceId/unbind` | SENSITIVE_COMMAND | door.manage |  |  |  | `door/door-ops-routes.ts:155` |
-| POST | `/api/v2/door/devices/:deviceId/reauthorize` | SENSITIVE_COMMAND | door.manage |  |  |  | `door/door-ops-routes.ts:189` |
-| POST | `/api/v2/door/heartbeat` | SCANNER_COMMAND | - |  |  |  | `door/door-ops-routes.ts:222` |
-| POST | `/api/v2/door/check-ins/confirm` | SCANNER_COMMAND | - |  | yes | door.check-in.confirm | `door/door-ops-routes.ts:260` |
-| POST | `/api/v2/door/staff-deny` | SCANNER_COMMAND | - |  |  |  | `door/door-ops-routes.ts:320` |
-| GET | `/api/v2/door/guests` | AUTH_READ | venue.read |  |  |  | `door/door-ops-routes.ts:360` |
-| GET | `/api/v2/door/attendance-report` | AUTH_READ | venue.read |  |  |  | `door/door-ops-routes.ts:401` |
-| POST | `/api/v2/door/guests/check-in` | STANDARD_COMMAND | ticket.override |  | yes | door.guest.check-in | `door/door-ops-routes.ts:431` |
-| POST | `/api/v2/door/wallet-qr` | SCANNER_COMMAND | - |  |  |  | `door/door-ops-routes.ts:480` |
-| POST | `/api/v2/door/wallet-charge` | SCANNER_COMMAND | - |  | yes | door.wallet.charge | `door/door-ops-routes.ts:519` |
-| POST | `/api/v2/door/ticket-sale` | STANDARD_COMMAND | - |  | yes | door.ticket-sale | `door/door-ops-routes.ts:582` |
-| POST | `/api/v2/door/walk-in` | STANDARD_COMMAND | ticket.override |  | yes | door.walkin | `door/door-sale-routes.ts:67` |
-| POST | `/api/v2/door/dine-in` | STANDARD_COMMAND | ticket.override |  | yes | door.dinein | `door/door-sale-routes.ts:130` |
-| GET | `/api/v2/door/sales` | AUTH_READ | venue.read |  |  |  | `door/door-sale-routes.ts:195` |
-| POST | `/api/v2/events/:eventId/door-codes` | STANDARD_COMMAND | door.manage |  | yes | door.code.create | `door/event-code-routes.ts:45` |
-| GET | `/api/v2/events/:eventId/door-codes` | AUTH_READ | door.manage |  |  |  | `door/event-code-routes.ts:104` |
-| POST | `/api/v2/door-codes/:codeId/revoke` | SENSITIVE_COMMAND | door.manage |  |  |  | `door/event-code-routes.ts:134` |
-| GET | `/api/v2/door-codes/:codeId/sessions` | AUTH_READ | door.manage |  |  |  | `door/event-code-routes.ts:167` |
-| POST | `/api/v2/door/sessions/:sessionId/revoke` | SENSITIVE_COMMAND | door.manage |  |  |  | `door/event-code-routes.ts:199` |
-| POST | `/api/v2/door/sessions` | SENSITIVE_COMMAND | - |  | yes | door.session.open | `door/scanner-routes.ts:74` |
-| GET | `/api/v2/door/sessions/:sessionId` | AUTH_READ | - |  |  |  | `door/scanner-routes.ts:126` |
-| POST | `/api/v2/door/check-ins` | SCANNER_COMMAND | - |  | yes | door.check-in | `door/scanner-routes.ts:154` |
-| POST | `/api/v2/door/check-ins/verify` | SCANNER_COMMAND | - |  |  |  | `door/scanner-routes.ts:211` |
-| POST | `/api/v2/door/lookup` | SCANNER_COMMAND | - |  |  |  | `door/scanner-routes.ts:228` |
-| GET | `/api/v2/door/check-ins/:checkInId` | AUTH_READ | - |  |  |  | `door/scanner-routes.ts:269` |
-| POST | `/api/v2/door/override` | SENSITIVE_COMMAND | ticket.override |  |  |  | `door/scanner-routes.ts:293` |
-| GET | `/api/v2/door/offline-manifest` | STANDARD_COMMAND | - |  |  |  | `door/scanner-routes.ts:328` |
-| POST | `/api/v2/door/offline-sync` | STANDARD_COMMAND | - |  | yes | door.offline-sync | `door/scanner-routes.ts:362` |
-| GET | `/api/v2/tickets/:ticketId/qr` | AUTH_READ | - |  |  |  | `door/scanner-routes.ts:413` |
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/public/events/:eventId/social-policy` | AUTH_READ | public | P:eventParams |  |
 
-## finance
+### `public/discovery.ts`
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/organizations/:organizationId/finance/balance` | AUTH_READ | finance.read |  |  |  | `finance/finance-routes.ts:58` |
-| GET | `/api/v2/organizations/:organizationId/finance/ledger` | AUTH_READ | finance.read |  |  |  | `finance/finance-routes.ts:81` |
-| GET | `/api/v2/organizations/:organizationId/finance/orders` | AUTH_READ | finance.orders.read |  |  |  | `finance/finance-routes.ts:128` |
-| POST | `/api/v2/organizations/:organizationId/payouts` | STANDARD_COMMAND | finance.payouts.manage |  | yes | finance.payout.request | `finance/finance-routes.ts:163` |
-| GET | `/api/v2/organizations/:organizationId/payouts` | AUTH_READ | finance.payouts.read |  |  |  | `finance/finance-routes.ts:214` |
-| GET | `/api/v2/organizations/:organizationId/payouts/:payoutId` | AUTH_READ | finance.payouts.read |  |  |  | `finance/finance-routes.ts:246` |
-| POST | `/api/v2/organizations/:organizationId/bank-accounts` | STANDARD_COMMAND | finance.bank_accounts.manage |  |  |  | `finance/finance-routes.ts:280` |
-| GET | `/api/v2/organizations/:organizationId/bank-accounts` | AUTH_READ | finance.read |  |  |  | `finance/finance-routes.ts:318` |
-| POST | `/api/v2/organizations/:organizationId/bank-accounts/:bankAccountId/default` | STANDARD_COMMAND | finance.bank_accounts.manage |  |  |  | `finance/finance-routes.ts:343` |
-| DELETE | `/api/v2/organizations/:organizationId/bank-accounts/:bankAccountId` | STANDARD_COMMAND | finance.bank_accounts.manage |  |  |  | `finance/finance-routes.ts:373` |
-| POST | `/api/v2/organizations/:organizationId/disputes` | STANDARD_COMMAND | organization.update |  |  |  | `finance/finance-routes.ts:400` |
-| GET | `/api/v2/organizations/:organizationId/disputes` | AUTH_READ | organization.read |  |  |  | `finance/finance-routes.ts:438` |
-| GET | `/api/v2/organizations/:organizationId/disputes/:disputeId` | AUTH_READ | organization.read |  |  |  | `finance/finance-routes.ts:470` |
-| POST | `/api/v2/organizations/:organizationId/disputes/:disputeId/review` | STANDARD_COMMAND | organization.update |  |  |  | `finance/finance-routes.ts:500` |
-| POST | `/api/v2/organizations/:organizationId/disputes/:disputeId/resolve` | STANDARD_COMMAND | organization.update |  |  |  | `finance/finance-routes.ts:528` |
-| GET | `/api/v2/leaderboard` | PUBLIC_READ | - |  |  |  | `finance/leaderboard-routes.ts:50` |
-| GET | `/api/v2/organizations/:organizationId/leaderboard/me` | AUTH_READ | organization.read |  |  |  | `finance/leaderboard-routes.ts:76` |
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/public/discovery` | PUBLIC_READ | public | - |  |
+| GET | `/public/events` | PUBLIC_READ | public | Q:paginationQuerySchema |  |
+| GET | `/public/events/:idOrSlug` | PUBLIC_READ | public | P:idOrSlugParam |  |
+| GET | `/public/events/:idOrSlug/ticket-addons` | PUBLIC_READ | public | P:idOrSlugParam |  |
+| GET | `/public/events/:idOrSlug/tiers` | PUBLIC_READ | public | P:idOrSlugParam |  |
+| GET | `/public/hosts/:slug` | PUBLIC_READ | public | P:slugParam |  |
+| GET | `/public/hosts/by-id/:organizationId` | PUBLIC_READ | public | P:organizationIdParam |  |
+| GET | `/public/promoter-links/:handle/:slug` | PUBLIC_READ | public | P:vanityParamsSchema |  |
+| POST | `/public/promoter-links/click` | PUBLIC_READ | public | B:promoterClickBodySchema |  |
+| GET | `/public/search` | PUBLIC_READ | public | Q:searchQuerySchema |  |
+| POST | `/public/ticket-access-codes/redeem` | SENSITIVE_COMMAND | public | B:redeemTicketAccessCodeSchema |  |
+| GET | `/public/venues/:slug` | PUBLIC_READ | public | P:slugParam |  |
+| GET | `/public/venues/by-id/:venueId` | PUBLIC_READ | public | P:venueIdParam |  |
 
-## internal
+## 10 Guest: checkout, payments, RSVP, orders
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/internal/health` | - | - |  |  |  | `internal/index.ts:28` |
-| GET | `/api/v2/internal/version` | - | - |  |  |  | `internal/index.ts:36` |
-| GET | `/api/v2/internal/readiness` | - | - |  |  |  | `internal/index.ts:47` |
+### `checkout/checkout-routes.ts`
 
-## notifications
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/checkout/holds` | STANDARD_COMMAND | session | B:checkoutHoldRequestSchema |  |
+| POST | `/checkout/quote` | STANDARD_COMMAND | session | B:checkoutQuoteRequestSchema |  |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/organizations/:organizationId/notifications` | AUTH_READ | organization.read |  |  |  | `notifications/notifications-routes.ts:48` |
-| PATCH | `/api/v2/organizations/:organizationId/notifications/read-all` | STANDARD_COMMAND | organization.read |  | yes |  | `notifications/notifications-routes.ts:91` |
-| PATCH | `/api/v2/organizations/:organizationId/notifications/:notificationId/read` | STANDARD_COMMAND | organization.read |  |  |  | `notifications/notifications-routes.ts:116` |
-| POST | `/api/v2/organizations/:organizationId/notifications/:notificationId/actions` | STANDARD_COMMAND | organization.read |  | yes | notifications.action | `notifications/notifications-routes.ts:148` |
+### `checkout/payment-routes.ts`
 
-## onboarding
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/payments/:id/verify` | STANDARD_COMMAND | session | P:paymentIdParam B:paymentConfirmRequestSchema |  |
+| POST | `/payments/attempts` | STANDARD_COMMAND | session | B:paymentAttemptRequestSchema |  |
+| POST | `/payments/attempts/:holdId/reconcile` | STANDARD_COMMAND | session | P:holdIdParam |  |
+| GET | `/payments/attempts/:holdId/status` | AUTH_READ | session | P:holdIdParam |  |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/onboarding/me` | AUTH_READ | - |  |  |  | `onboarding.ts:49` |
-| GET | `/api/v2/onboarding/applications` | AUTH_READ | - |  |  |  | `onboarding.ts:73` |
-| POST | `/api/v2/onboarding/applications` | STANDARD_COMMAND | - |  | yes |  | `onboarding.ts:105` |
-| PATCH | `/api/v2/onboarding/applications/:requestId` | STANDARD_COMMAND | - |  | yes |  | `onboarding.ts:132` |
-| POST | `/api/v2/onboarding/applications/:requestId/documents/upload-url` | STANDARD_COMMAND | - |  |  |  | `onboarding.ts:169` |
-| POST | `/api/v2/onboarding/applications/:requestId/documents` | STANDARD_COMMAND | - |  | yes |  | `onboarding.ts:194` |
-| POST | `/api/v2/onboarding/applications/:requestId/submit` | STANDARD_COMMAND | - |  | yes |  | `onboarding.ts:225` |
-| POST | `/api/v2/onboarding/verify-document` | SENSITIVE_COMMAND | - |  | yes |  | `onboarding.ts:257` |
+### `checkout/webhook-routes.ts`
 
-## orders
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/webhooks/payments/razorpay` | - | provider signature | - |  |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/orders` | AUTH_READ | - |  |  |  | `orders/orders-routes.ts:29` |
-| GET | `/api/v2/orders/:id` | AUTH_READ | - |  |  |  | `orders/orders-routes.ts:59` |
-| GET | `/api/v2/orders/:id/status` | AUTH_READ | - |  |  |  | `orders/orders-routes.ts:75` |
+### `orders/orders-routes.ts`
 
-## partner
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/orders` | AUTH_READ | session | Q:paginationQuerySchema |  |
+| GET | `/orders/:id` | AUTH_READ | session | P:orderIdParam |  |
+| GET | `/orders/:id/status` | AUTH_READ | session | P:orderIdParam |  |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/organizations/:organizationId/analytics/overview` | AUTH_READ | organization.read | ORGANIZATION |  |  | `partner/analytics.ts:72` |
-| GET | `/api/v2/organizations/:organizationId/analytics/trends` | AUTH_READ | organization.read | ORGANIZATION |  |  | `partner/analytics.ts:101` |
-| GET | `/api/v2/organizations/:organizationId/analytics/events` | AUTH_READ | organization.read | ORGANIZATION |  |  | `partner/analytics.ts:131` |
-| GET | `/api/v2/organizations/:organizationId/analytics/calendar` | AUTH_READ | organization.read | ORGANIZATION |  |  | `partner/analytics.ts:166` |
-| GET | `/api/v2/events/:eventId/analytics` | AUTH_READ | event.read | EVENT_PREVIEW |  |  | `partner/analytics.ts:196` |
-| GET | `/api/v2/organizations/:organizationId/discover-partners` | AUTH_READ | organization.read |  |  |  | `partner/discover.ts:31` |
-| GET | `/api/v2/events/:eventId/ticket-tiers` | AUTH_READ | event.read |  |  |  | `partner/event-catalog.ts:60` |
-| POST | `/api/v2/events/:eventId/ticket-tiers` | STANDARD_COMMAND | event.update |  | yes | event-ticket-tiers.create | `partner/event-catalog.ts:85` |
-| GET | `/api/v2/events/:eventId/promo-codes` | AUTH_READ | event.read |  |  |  | `partner/event-catalog.ts:135` |
-| POST | `/api/v2/events/:eventId/promo-codes` | STANDARD_COMMAND | event.update |  | yes | event-promo-codes.create | `partner/event-catalog.ts:174` |
-| GET | `/api/v2/events/:eventId/table-packages` | AUTH_READ | event.read |  |  |  | `partner/event-catalog.ts:224` |
-| POST | `/api/v2/events/:eventId/table-packages` | STANDARD_COMMAND | event.update |  | yes | event-table-packages.create | `partner/event-catalog.ts:249` |
-| GET | `/api/v2/events/:eventId/promoter-assignments` | AUTH_READ | event.read |  |  |  | `partner/event-catalog.ts:299` |
-| POST | `/api/v2/events/:eventId/promoter-assignments` | STANDARD_COMMAND | event.update |  | yes | event-promoter-assignments.create | `partner/event-catalog.ts:329` |
-| POST | `/api/v2/promoter-assignments/:assignmentId/end` | STANDARD_COMMAND | event.update |  | yes |  | `partner/event-catalog.ts:391` |
-| GET | `/api/v2/promoters/:promoterId/events` | AUTH_READ | event.read |  |  |  | `partner/events.ts:84` |
-| GET | `/api/v2/organizations/:organizationId/events` | AUTH_READ | event.read |  |  |  | `partner/events.ts:130` |
-| GET | `/api/v2/events/:eventId` | AUTH_READ | event.read |  |  |  | `partner/events.ts:169` |
-| POST | `/api/v2/organizations/:organizationId/events` | STANDARD_COMMAND | event.create |  | yes | event.create | `partner/events.ts:195` |
-| POST | `/api/v2/organizations/:organizationId/poster/upload-url` | STANDARD_COMMAND | event.create |  |  |  | `partner/events.ts:252` |
-| PATCH | `/api/v2/events/:eventId` | STANDARD_COMMAND | event.update |  | yes | event.update | `partner/events.ts:281` |
-| GET | `/api/v2/events/:eventId/previews` | AUTH_READ | event.read |  |  |  | `partner/events.ts:336` |
-| POST | `/api/v2/events/:eventId/${action}` | STANDARD_COMMAND | - |  | yes |  | `partner/events.ts:393` |
-| POST | `/api/v2/events/:eventId/cancel` | STANDARD_COMMAND | event.cancel |  | yes | event.cancel | `partner/events.ts:438` |
-| GET | `/api/v2/organizations` | AUTH_READ | organization.read |  |  |  | `partner/organizations.ts:82` |
-| GET | `/api/v2/organizations/:organizationId` | AUTH_READ | organization.read | ORGANIZATION |  |  | `partner/organizations.ts:115` |
-| POST | `/api/v2/organizations` | STANDARD_COMMAND | - |  | yes | organizations.create | `partner/organizations.ts:146` |
-| PATCH | `/api/v2/organizations/:organizationId` | STANDARD_COMMAND | organization.update |  | yes | organizations.update | `partner/organizations.ts:199` |
-| GET | `/api/v2/organizations/:organizationId/members` | AUTH_READ | organization.read |  |  |  | `partner/organizations.ts:282` |
-| POST | `/api/v2/organizations/:organizationId/members` | STANDARD_COMMAND | staff.manage |  | yes | organizations.inviteMember | `partner/organizations.ts:320` |
-| PATCH | `/api/v2/organizations/:organizationId/members/:userId` | STANDARD_COMMAND | staff.manage |  | yes | organizations.changeRole | `partner/organizations.ts:370` |
-| DELETE | `/api/v2/organizations/:organizationId/members/:userId` | STANDARD_COMMAND | staff.manage |  | yes | organizations.removeMember | `partner/organizations.ts:438` |
-| GET | `/api/v2/organizations/:organizationId/access` | AUTH_READ | organization.read |  |  |  | `partner/organizations.ts:482` |
-| GET | `/api/v2/organizations/:organizationId/invitations` | AUTH_READ | staff.manage |  |  |  | `partner/organizations.ts:525` |
-| POST | `/api/v2/organizations/:organizationId/invitations` | STANDARD_COMMAND | staff.manage |  | yes | organization-invitations.create | `partner/organizations.ts:565` |
-| POST | `/api/v2/invitations/:invitationId/revoke` | STANDARD_COMMAND | staff.manage |  | yes |  | `partner/organizations.ts:621` |
-| POST | `/api/v2/invitations/:invitationId/accept` | STANDARD_COMMAND | - |  |  |  | `partner/organizations.ts:655` |
-| GET | `/api/v2/organizations/:organizationId/partnerships` | AUTH_READ | organization.read |  |  |  | `partner/partnerships.ts:49` |
-| POST | `/api/v2/partnerships` | STANDARD_COMMAND | venue.manage |  | yes | partnerships.request | `partner/partnerships.ts:90` |
-| POST | `/api/v2/partnerships/:partnershipId/venue-share` | STANDARD_COMMAND | venue.manage |  | yes | partnerships.venue-share | `partner/partnerships.ts:165` |
-| POST | `/api/v2/partnerships/:partnershipId/${action}` | STANDARD_COMMAND | - |  | yes |  | `partner/partnerships.ts:228` |
-| GET | `/api/v2/organizations/:organizationId/promoter-connections` | AUTH_READ | organization.read |  |  |  | `partner/promoter-connections.ts:42` |
-| POST | `/api/v2/promoter-connections` | STANDARD_COMMAND | venue.manage |  | yes | promoter-connections.request | `partner/promoter-connections.ts:82` |
-| POST | `/api/v2/promoter-connections/:connectionId/${action}` | STANDARD_COMMAND | - |  | yes |  | `partner/promoter-connections.ts:169` |
-| POST | `/api/v2/promoter-assignments/:assignmentId/referral-links` | STANDARD_COMMAND | event.read |  | yes | promoter-assignment.referral-link.create | `partner/referral-links.ts:59` |
-| GET | `/api/v2/events/:eventId/referral-links` | AUTH_READ | event.read |  |  |  | `partner/referral-links.ts:115` |
-| POST | `/api/v2/events/:eventId/referral-links` | STANDARD_COMMAND | event.update |  | yes | referral-links.create | `partner/referral-links.ts:154` |
-| POST | `/api/v2/referral-links/:referralLinkId/deactivate` | STANDARD_COMMAND | event.update |  | yes |  | `partner/referral-links.ts:210` |
-| GET | `/api/v2/organizations/:organizationId/venues` | AUTH_READ | venue.read |  |  |  | `partner/venues.ts:126` |
-| POST | `/api/v2/organizations/:organizationId/venues` | STANDARD_COMMAND | venue.create |  | yes | venue.create | `partner/venues.ts:165` |
-| GET | `/api/v2/venues/:venueId` | AUTH_READ | venue.read |  |  |  | `partner/venues.ts:217` |
-| PATCH | `/api/v2/venues/:venueId` | STANDARD_COMMAND | venue.manage |  | yes | venue.update | `partner/venues.ts:242` |
-| GET | `/api/v2/venues/:venueId/profile` | - | - |  |  |  | `partner/venues.ts:297` |
-| PATCH | `/api/v2/venues/:venueId/profile` | STANDARD_COMMAND | venue.manage |  | yes | venue.profile.update | `partner/venues.ts:318` |
-| GET | `/api/v2/venues/:venueId/calendar` | AUTH_READ | venue.read |  |  |  | `partner/venues.ts:373` |
-| POST | `/api/v2/venues/:venueId/calendar/blocks` | STANDARD_COMMAND | venue.manage |  | yes | venue-calendar.block | `partner/venues.ts:402` |
-| DELETE | `/api/v2/venues/:venueId/calendar/blocks/:blockId` | STANDARD_COMMAND | venue.manage |  | yes | venue-calendar.unblock | `partner/venues.ts:446` |
-| GET | `/api/v2/venues/:venueId/menu` | AUTH_READ | venue.read | VENUE_PROFILE |  |  | `partner/venues.ts:488` |
-| PUT | `/api/v2/venues/:venueId/menu` | STANDARD_COMMAND | venue.manage |  | yes | venue-menu.update | `partner/venues.ts:513` |
-| GET | `/api/v2/venues/:venueId/availability` | AUTH_READ | venue.read | AVAILABILITY |  |  | `partner/venues.ts:571` |
-| GET | `/api/v2/venues/:venueId/slot-requests` | AUTH_READ | venue.read |  |  |  | `partner/venues.ts:607` |
-| GET | `/api/v2/organizations/:organizationId/slot-requests` | AUTH_READ | slot-request.list |  |  |  | `partner/venues.ts:646` |
-| GET | `/api/v2/venues/:venueId/slot-requests/:slotRequestId` | AUTH_READ | venue.read |  |  |  | `partner/venues.ts:684` |
-| POST | `/api/v2/venues/:venueId/slot-requests` | STANDARD_COMMAND | slot-request.create |  | yes | venue.slotRequest.create | `partner/venues.ts:717` |
-| POST | `/api/v2/venues/slot-requests/:slotRequestId/${action}` | STANDARD_COMMAND | venue.schedule |  | yes |  | `partner/venues.ts:771` |
-| POST | `/api/v2/venues/slot-requests/:slotRequestId/cancel` | STANDARD_COMMAND | slot-request.create |  | yes | venue.slotRequest.cancel | `partner/venues.ts:817` |
+### `rsvp/rsvp-routes.ts`
 
-## phase5-routes
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/rsvp` | STANDARD_COMMAND | session | B:rsvpRequestSchema |  |
+| POST | `/rsvp/:orderId/cancel` | STANDARD_COMMAND | session | P:z.object |  |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/door/stats` | AUTH_READ | - |  |  |  | `phase5-routes.ts:75` |
-| GET | `/api/v2/door/stats/stream` | AUTH_READ | - |  |  |  | `phase5-routes.ts:100` |
+## 11 Guest: tickets, waitlist, wallet
 
-## profile
+### `tickets/ticket-routes.ts`
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/profile/me` | AUTH_READ | - |  |  |  | `profile.ts:30` |
-| PUT | `/api/v2/profile/me` | STANDARD_COMMAND | - |  |  |  | `profile.ts:52` |
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/ticket-transfers/:transferId` | AUTH_READ | session | P:transferIdParam |  |
+| POST | `/ticket-transfers/:transferId/accept` | STANDARD_COMMAND | session | - | guest transfer resolution |
+| POST | `/ticket-transfers/:transferId/cancel` | STANDARD_COMMAND | session | - | guest transfer resolution |
+| POST | `/ticket-transfers/:transferId/decline` | STANDARD_COMMAND | session | - | guest transfer resolution |
+| POST | `/ticket-transfers/:transferId/resend` | STANDARD_COMMAND | session | P:transferIdParam |  |
+| GET | `/tickets/:id` | AUTH_READ | session | P:ticketIdParam |  |
+| POST | `/tickets/:id/event-changes/:eventVersion/respond` | STANDARD_COMMAND | session | P:eventChangeResponseParams B:eventChangeResponseRequestSchema |  |
+| GET | `/tickets/:id/management` | AUTH_READ | session | P:ticketIdParam |  |
+| POST | `/tickets/:id/refund-review` | STANDARD_COMMAND | session | P:ticketIdParam B:guestRefundReviewRequestSchema |  |
+| GET | `/tickets/:id/transfers` | AUTH_READ | session | P:ticketIdParam |  |
+| POST | `/tickets/:id/transfers` | STANDARD_COMMAND | session | P:ticketIdParam B:createTransferBody |  |
 
-## public
+### `tickets/waitlist-routes.ts`
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/public/promoter-links/:handle/:slug` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:85` |
-| POST | `/api/v2/public/promoter-links/click` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:105` |
-| GET | `/api/v2/public/events` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:125` |
-| GET | `/api/v2/public/events/:idOrSlug` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:155` |
-| GET | `/api/v2/public/venues/by-id/:venueId` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:182` |
-| GET | `/api/v2/public/venues/:slug` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:200` |
-| GET | `/api/v2/public/hosts/by-id/:organizationId` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:225` |
-| GET | `/api/v2/public/hosts/:slug` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:246` |
-| GET | `/api/v2/public/discovery` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:264` |
-| GET | `/api/v2/public/search` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:277` |
-| GET | `/api/v2/public/events/:idOrSlug/tiers` | PUBLIC_READ | - |  |  |  | `public/discovery.ts:311` |
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/events/:eventId/tiers/:tierId/waitlist` | AUTH_READ | platform admin | P:offerParams Q:adminQueueQuery | 410 in V1 (unavailableInV1) |
+| POST | `/admin/events/:eventId/tiers/:tierId/waitlist/offer-next` | SENSITIVE_COMMAND | platform admin | P:offerParams | 410 in V1 (unavailableInV1) |
+| GET | `/events/:eventId/tiers/:tierId/waitlist` | AUTH_READ | perm: event.read | P:offerParams Q:adminQueueQuery | 410 in V1 (unavailableInV1) |
+| POST | `/events/:eventId/tiers/:tierId/waitlist/offer-next` | SENSITIVE_COMMAND | perm: event.update | P:offerParams | 410 in V1 (unavailableInV1) |
+| GET | `/waitlist` | AUTH_READ | session | Q:paginationQuerySchema | 410 in V1 (unavailableInV1) |
+| POST | `/waitlist` | STANDARD_COMMAND | session | B:joinBody | 410 in V1 (unavailableInV1) |
+| DELETE | `/waitlist/:entryId` | SENSITIVE_COMMAND | session | P:entryParams | 410 in V1 (unavailableInV1) |
+| GET | `/waitlist/:entryId` | AUTH_READ | session | P:entryParams | 410 in V1 (unavailableInV1) |
+| POST | `/waitlist/:entryId/accept` | SENSITIVE_COMMAND | session | P:entryParams | 410 in V1 (unavailableInV1) |
 
-## rsvp
+### `wallet/wallet-routes.ts`
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| POST | `/api/v2/rsvp` | STANDARD_COMMAND | - |  | yes | rsvp.create | `rsvp/rsvp-routes.ts:38` |
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/wallet` | AUTH_READ | session | - |  |
+| GET | `/wallet/booking-tickets` | AUTH_READ | session | Q:paginationQuerySchema |  |
+| GET | `/wallet/event-covers` | AUTH_READ | session | - |  |
+| GET | `/wallet/orders` | AUTH_READ | session | Q:paginationQuerySchema |  |
+| GET | `/wallet/tickets` | AUTH_READ | session | Q:paginationQuerySchema |  |
 
-## social
+## 12 Guest: profile, social, saved events, support intake
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| POST | `/api/v2/follows` | STANDARD_COMMAND | - |  |  |  | `social/social-routes.ts:52` |
-| DELETE | `/api/v2/follows/:targetType/:targetId` | STANDARD_COMMAND | - |  |  |  | `social/social-routes.ts:81` |
-| GET | `/api/v2/follows/me` | AUTH_READ | - |  |  |  | `social/social-routes.ts:103` |
-| GET | `/api/v2/follows/:targetType/:targetId/status` | AUTH_READ | - |  |  |  | `social/social-routes.ts:136` |
-| GET | `/api/v2/notifications/me` | AUTH_READ | - |  |  |  | `social/social-routes.ts:160` |
-| GET | `/api/v2/notifications/me/unread-count` | AUTH_READ | - |  |  |  | `social/social-routes.ts:193` |
-| POST | `/api/v2/notifications/me/read` | STANDARD_COMMAND | - |  |  |  | `social/social-routes.ts:211` |
-| POST | `/api/v2/notifications/me/read-all` | STANDARD_COMMAND | - |  |  |  | `social/social-routes.ts:235` |
+### `guest-onboarding.ts`
 
-## support
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/profile/onboarding` | AUTH_READ | session | - |  |
+| PUT | `/profile/onboarding` | STANDARD_COMMAND | session | B:guestOnboardingPatchSchema |  |
+| POST | `/profile/onboarding/phone` | OTP_VERIFY | session | B:guestPhoneProofSchema |  |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| POST | `/api/v2/support/tickets` | SENSITIVE_COMMAND | - |  | yes | support.ticket.submit | `support/intake-routes.ts:88` |
-| GET | `/api/v2/support/tickets` | AUTH_READ | - |  |  |  | `support/intake-routes.ts:138` |
-| GET | `/api/v2/support/tickets/:ticketId` | AUTH_READ | - |  |  |  | `support/intake-routes.ts:169` |
-| POST | `/api/v2/support/tickets/:ticketId/messages` | SENSITIVE_COMMAND | - |  | yes | support.ticket.message | `support/intake-routes.ts:194` |
+### `guest-social.ts`
 
-## tickets
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/social-events` | AUTH_READ | perm: event.update | P:orgParams |  |
+| PATCH | `/organizations/:organizationId/social-events/:eventId` | STANDARD_COMMAND | perm: event.update | P:orgParams.extend |  |
+| PUT | `/social/blocks/:userId` | STANDARD_COMMAND | session | P:userParams B:socialBlockSchema |  |
+| GET | `/social/events/:eventId/guestlist` | AUTH_READ | session | P:eventParams Q:socialListQuerySchema |  |
+| PUT | `/social/events/:eventId/visibility` | STANDARD_COMMAND | session | P:eventParams B:socialHiddenEventSchema |  |
+| GET | `/social/privacy` | AUTH_READ | session | B:guestSocialPrivacySchema |  |
+| PUT | `/social/privacy` | STANDARD_COMMAND | session | B:guestSocialPrivacySchema |  |
+| GET | `/social/profiles/:userId` | AUTH_READ | session | P:userParams |  |
+| POST | `/social/reports/:userId` | SENSITIVE_COMMAND | session | P:userParams |  |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/tickets/:id` | AUTH_READ | - |  |  |  | `tickets/ticket-routes.ts:26` |
+### `profile.ts`
 
-## wallet
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/profile/me` | AUTH_READ | session | - |  |
+| PUT | `/profile/me` | STANDARD_COMMAND | session | B:upsertGuestProfileSchema |  |
 
-| Method | Path | Rate | Permission | Cache | Idem | Command | Source |
-|---|---|---|---|---|---|---|---|
-| GET | `/api/v2/wallet` | AUTH_READ | - |  |  |  | `wallet/wallet-routes.ts:28` |
-| GET | `/api/v2/wallet/tickets` | AUTH_READ | - |  |  |  | `wallet/wallet-routes.ts:50` |
-| GET | `/api/v2/wallet/orders` | AUTH_READ | - |  |  |  | `wallet/wallet-routes.ts:80` |
+### `saved-events.ts`
 
-## Routes with no `requirePermission` (review list)
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/saved-events` | AUTH_READ | session | Q:savedEventListQuerySchema |  |
+| GET | `/saved-events/:eventId` | AUTH_READ | session | - |  |
+| PUT | `/saved-events/:eventId` | STANDARD_COMMAND | session | B:savedEventStateSchema |  |
 
-| Method | Path | Rate | Source |
-|---|---|---|---|
-| GET | `/api/v2/admin/analytics` | AUTH_READ | `admin/analytics.ts:21` |
-| GET | `/api/v2/admin/venues` | AUTH_READ | `admin/directory.ts:117` |
-| GET | `/api/v2/admin/events` | AUTH_READ | `admin/directory.ts:146` |
-| GET | `/api/v2/admin/hosts` | AUTH_READ | `admin/directory.ts:175` |
-| GET | `/api/v2/admin/users` | AUTH_READ | `admin/directory.ts:204` |
-| GET | `/api/v2/admin/lookup` | AUTH_READ | `admin/directory.ts:233` |
-| GET | `/api/v2/admin/venues/export.csv` | AUTH_READ | `admin/directory.ts:263` |
-| GET | `/api/v2/admin/events/export.csv` | AUTH_READ | `admin/directory.ts:308` |
-| GET | `/api/v2/admin/hosts/export.csv` | AUTH_READ | `admin/directory.ts:361` |
-| GET | `/api/v2/admin/users/export.csv` | AUTH_READ | `admin/directory.ts:411` |
-| GET | `/api/v2/admin/audit/export.csv` | AUTH_READ | `admin/directory.ts:446` |
-| POST | `/api/v2/admin/disputes/:disputeId/resolve` | SENSITIVE_COMMAND | `admin/disputes.ts:62` |
-| GET | `/api/v2/admin/disputes` | AUTH_READ | `admin/disputes.ts:117` |
-| GET | `/api/v2/admin/disputes/:disputeId` | AUTH_READ | `admin/disputes.ts:152` |
-| POST | `/api/v2/admin/events/:eventId/pause` | SENSITIVE_COMMAND | `admin/event-actions.ts:52` |
-| POST | `/api/v2/admin/events/:eventId/resume` | SENSITIVE_COMMAND | `admin/event-actions.ts:96` |
-| POST | `/api/v2/admin/events/:eventId/force-complete` | SENSITIVE_COMMAND | `admin/event-actions.ts:140` |
-| GET | `/api/v2/admin/onboarding/applications` | AUTH_READ | `admin/onboarding-review.ts:77` |
-| GET | `/api/v2/admin/onboarding/applications/:requestId` | AUTH_READ | `admin/onboarding-review.ts:112` |
-| GET | `/api/v2/admin/onboarding/applications/:requestId/documents/:label/read-url` | AUTH_READ | `admin/onboarding-review.ts:144` |
-| POST | `/api/v2/admin/onboarding/applications/:requestId/documents/:label/verify` | SENSITIVE_COMMAND | `admin/onboarding-review.ts:173` |
-| POST | `/api/v2/admin/onboarding/applications/:requestId/documents/:label/reject` | SENSITIVE_COMMAND | `admin/onboarding-review.ts:223` |
-| POST | `/api/v2/admin/onboarding/applications/:requestId/approve` | SENSITIVE_COMMAND | `admin/onboarding-review.ts:283` |
-| GET | `/api/v2/admin/proposals` | AUTH_READ | `admin/onboarding-review.ts:356` |
-| POST | `/api/v2/admin/proposals` | SENSITIVE_COMMAND | `admin/onboarding-review.ts:391` |
-| GET | `/api/v2/admin/admins` | AUTH_READ | `admin/onboarding-review.ts:422` |
-| POST | `/api/v2/admin/proposals/:proposalId/provision-admin` | SENSITIVE_COMMAND | `admin/onboarding-review.ts:460` |
-| POST | `/api/v2/admin/proposals/:proposalId/update-admin-role` | SENSITIVE_COMMAND | `admin/onboarding-review.ts:512` |
-| POST | `/api/v2/admin/admins/:adminId/revoke` | SENSITIVE_COMMAND | `admin/onboarding-review.ts:560` |
-| GET | `/api/v2/admin/audit` | AUTH_READ | `admin/onboarding-review.ts:610` |
-| POST | `/api/v2/admin/onboarding/applications/:requestId/${action}` | SENSITIVE_COMMAND | `admin/onboarding-review.ts:650` |
-| POST | `/api/v2/admin/proposals/:proposalId/${action}` | SENSITIVE_COMMAND | `admin/onboarding-review.ts:710` |
-| GET | `/api/v2/admin/orders` | AUTH_READ | `admin/orders.ts:60` |
-| GET | `/api/v2/admin/orders/export.csv` | AUTH_READ | `admin/orders.ts:89` |
-| POST | `/api/v2/admin/proposals/:proposalId/adjust-commission` | SENSITIVE_COMMAND | `admin/organization-actions.ts:46` |
-| POST | `/api/v2/admin/organizations/:organizationId/suspend` | SENSITIVE_COMMAND | `admin/organization-actions.ts:89` |
-| POST | `/api/v2/admin/organizations/:organizationId/reinstate` | SENSITIVE_COMMAND | `admin/organization-actions.ts:132` |
-| POST | `/api/v2/admin/proposals/:proposalId/freeze-payout` | SENSITIVE_COMMAND | `admin/payouts.ts:72` |
-| POST | `/api/v2/admin/proposals/:proposalId/release-payout` | SENSITIVE_COMMAND | `admin/payouts.ts:120` |
-| POST | `/api/v2/admin/payouts/batch-run` | SENSITIVE_COMMAND | `admin/payouts.ts:171` |
-| POST | `/api/v2/admin/payouts/:payoutId/complete` | SENSITIVE_COMMAND | `admin/payouts.ts:220` |
-| GET | `/api/v2/admin/payouts` | AUTH_READ | `admin/payouts.ts:271` |
-| GET | `/api/v2/admin/payouts/:payoutId` | AUTH_READ | `admin/payouts.ts:306` |
-| GET | `/api/v2/admin/promoters` | AUTH_READ | `admin/promoters.ts:69` |
-| GET | `/api/v2/admin/promoters/export.csv` | AUTH_READ | `admin/promoters.ts:98` |
-| POST | `/api/v2/admin/promoters/:promoterId/suspend` | SENSITIVE_COMMAND | `admin/promoters.ts:141` |
-| POST | `/api/v2/admin/promoters/:promoterId/reinstate` | SENSITIVE_COMMAND | `admin/promoters.ts:189` |
-| GET | `/api/v2/admin/promotions` | AUTH_READ | `admin/promotions.ts:59` |
-| GET | `/api/v2/admin/promotions/export.csv` | AUTH_READ | `admin/promotions.ts:88` |
-| POST | `/api/v2/admin/proposals/:proposalId/post-financial-adjustment` | SENSITIVE_COMMAND | `admin/reconciliation.ts:71` |
-| GET | `/api/v2/admin/chargebacks` | AUTH_READ | `admin/reconciliation.ts:150` |
-| POST | `/api/v2/admin/reconciliation/runs` | SENSITIVE_COMMAND | `admin/reconciliation.ts:198` |
-| GET | `/api/v2/admin/reconciliation/runs` | AUTH_READ | `admin/reconciliation.ts:245` |
-| GET | `/api/v2/admin/reconciliation/runs/:runId` | AUTH_READ | `admin/reconciliation.ts:266` |
-| GET | `/api/v2/admin/reconciliation/discrepancies` | AUTH_READ | `admin/reconciliation.ts:280` |
-| GET | `/api/v2/admin/reconciliation/discrepancies/:discrepancyId` | AUTH_READ | `admin/reconciliation.ts:301` |
-| POST | `/api/v2/admin/reconciliation/discrepancies/:discrepancyId/retry` | SENSITIVE_COMMAND | `admin/reconciliation.ts:332` |
-| POST | `/api/v2/admin/reconciliation/discrepancies/:discrepancyId/resolve` | SENSITIVE_COMMAND | `admin/reconciliation.ts:386` |
-| GET | `/api/v2/admin/reconciliation/export.csv` | - | `admin/reconciliation.ts:443` |
-| POST | `/api/v2/admin/refunds` | SENSITIVE_COMMAND | `admin/refunds.ts:92` |
-| POST | `/api/v2/admin/refunds/:refundRequestId/approve` | SENSITIVE_COMMAND | `admin/refunds.ts:147` |
-| POST | `/api/v2/admin/refunds/:refundRequestId/reject` | SENSITIVE_COMMAND | `admin/refunds.ts:195` |
-| POST | `/api/v2/admin/refunds/:refundRequestId/execute` | SENSITIVE_COMMAND | `admin/refunds.ts:251` |
-| GET | `/api/v2/admin/refunds` | AUTH_READ | `admin/refunds.ts:301` |
-| GET | `/api/v2/admin/refunds/export.csv` | AUTH_READ | `admin/refunds.ts:336` |
-| GET | `/api/v2/admin/refunds/:refundRequestId` | AUTH_READ | `admin/refunds.ts:385` |
-| GET | `/api/v2/admin/settings/platform` | AUTH_READ | `admin/settings.ts:60` |
-| PUT | `/api/v2/admin/settings/platform` | SENSITIVE_COMMAND | `admin/settings.ts:85` |
-| GET | `/api/v2/admin/support/tickets` | AUTH_READ | `admin/support.ts:76` |
-| GET | `/api/v2/admin/support/tickets/:ticketId` | AUTH_READ | `admin/support.ts:120` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/assign` | SENSITIVE_COMMAND | `admin/support.ts:152` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/priority` | SENSITIVE_COMMAND | `admin/support.ts:206` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/reply` | SENSITIVE_COMMAND | `admin/support.ts:260` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/notes` | SENSITIVE_COMMAND | `admin/support.ts:314` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/link` | SENSITIVE_COMMAND | `admin/support.ts:368` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/resolve` | SENSITIVE_COMMAND | `admin/support.ts:428` |
-| POST | `/api/v2/admin/support/tickets/:ticketId/merge` | SENSITIVE_COMMAND | `admin/support.ts:482` |
-| DELETE | `/api/v2/admin/support/tickets/:ticketId` | SENSITIVE_COMMAND | `admin/support.ts:608` |
-| GET | `/api/v2/admin/tickets` | AUTH_READ | `admin/tickets.ts:57` |
-| GET | `/api/v2/admin/tickets/export.csv` | AUTH_READ | `admin/tickets.ts:86` |
-| POST | `/api/v2/admin/users/:userId/ban` | SENSITIVE_COMMAND | `admin/user-actions.ts:45` |
-| POST | `/api/v2/admin/users/:userId/unban` | SENSITIVE_COMMAND | `admin/user-actions.ts:94` |
-| POST | `/api/v2/admin/venues/:venueId/suspend` | SENSITIVE_COMMAND | `admin/venue-actions.ts:50` |
-| POST | `/api/v2/admin/venues/:venueId/reinstate` | SENSITIVE_COMMAND | `admin/venue-actions.ts:94` |
-| POST | `/api/v2/auth/signup` | SENSITIVE_COMMAND | `auth/index.ts:59` |
-| POST | `/api/v2/auth/login` | SENSITIVE_COMMAND | `auth/index.ts:106` |
-| POST | `/api/v2/auth/forgot-password` | SENSITIVE_COMMAND | `auth/index.ts:156` |
-| POST | `/api/v2/auth/reset-password` | SENSITIVE_COMMAND | `auth/index.ts:191` |
-| POST | `/api/v2/auth/refresh` | SENSITIVE_COMMAND | `auth/index.ts:230` |
-| POST | `/api/v2/auth/logout` | - | `auth/index.ts:258` |
-| GET | `/api/v2/auth/session` | AUTH_READ | `auth/index.ts:268` |
-| POST | `/api/v2/auth/change-password` | SENSITIVE_COMMAND | `auth/index.ts:295` |
-| GET | `/api/v2/auth/invitations/mine` | AUTH_READ | `auth/index.ts:373` |
-| POST | `/api/v2/auth/otp/send` | OTP_SEND | `auth/otp-routes.ts:32` |
-| POST | `/api/v2/auth/otp/verify` | OTP_VERIFY | `auth/otp-routes.ts:72` |
-| POST | `/api/v2/checkout/quote` | STANDARD_COMMAND | `checkout/checkout-routes.ts:48` |
-| POST | `/api/v2/checkout/holds` | STANDARD_COMMAND | `checkout/checkout-routes.ts:93` |
-| GET | `/api/v2/payments/attempts/:holdId/status` | AUTH_READ | `checkout/payment-routes.ts:56` |
-| POST | `/api/v2/payments/attempts` | STANDARD_COMMAND | `checkout/payment-routes.ts:85` |
-| POST | `/api/v2/payments/:id/verify` | STANDARD_COMMAND | `checkout/payment-routes.ts:156` |
-| POST | `/api/v2/webhooks/payments/razorpay` | - | `checkout/webhook-routes.ts:109` |
-| POST | `/api/v2/door/heartbeat` | SCANNER_COMMAND | `door/door-ops-routes.ts:222` |
-| POST | `/api/v2/door/check-ins/confirm` | SCANNER_COMMAND | `door/door-ops-routes.ts:260` |
-| POST | `/api/v2/door/staff-deny` | SCANNER_COMMAND | `door/door-ops-routes.ts:320` |
-| POST | `/api/v2/door/wallet-qr` | SCANNER_COMMAND | `door/door-ops-routes.ts:480` |
-| POST | `/api/v2/door/wallet-charge` | SCANNER_COMMAND | `door/door-ops-routes.ts:519` |
-| POST | `/api/v2/door/ticket-sale` | STANDARD_COMMAND | `door/door-ops-routes.ts:582` |
-| POST | `/api/v2/door/sessions` | SENSITIVE_COMMAND | `door/scanner-routes.ts:74` |
-| GET | `/api/v2/door/sessions/:sessionId` | AUTH_READ | `door/scanner-routes.ts:126` |
-| POST | `/api/v2/door/check-ins` | SCANNER_COMMAND | `door/scanner-routes.ts:154` |
-| POST | `/api/v2/door/check-ins/verify` | SCANNER_COMMAND | `door/scanner-routes.ts:211` |
-| POST | `/api/v2/door/lookup` | SCANNER_COMMAND | `door/scanner-routes.ts:228` |
-| GET | `/api/v2/door/check-ins/:checkInId` | AUTH_READ | `door/scanner-routes.ts:269` |
-| GET | `/api/v2/door/offline-manifest` | STANDARD_COMMAND | `door/scanner-routes.ts:328` |
-| POST | `/api/v2/door/offline-sync` | STANDARD_COMMAND | `door/scanner-routes.ts:362` |
-| GET | `/api/v2/tickets/:ticketId/qr` | AUTH_READ | `door/scanner-routes.ts:413` |
-| GET | `/api/v2/leaderboard` | PUBLIC_READ | `finance/leaderboard-routes.ts:50` |
-| GET | `/api/v2/onboarding/me` | AUTH_READ | `onboarding.ts:49` |
-| GET | `/api/v2/onboarding/applications` | AUTH_READ | `onboarding.ts:73` |
-| POST | `/api/v2/onboarding/applications` | STANDARD_COMMAND | `onboarding.ts:105` |
-| PATCH | `/api/v2/onboarding/applications/:requestId` | STANDARD_COMMAND | `onboarding.ts:132` |
-| POST | `/api/v2/onboarding/applications/:requestId/documents/upload-url` | STANDARD_COMMAND | `onboarding.ts:169` |
-| POST | `/api/v2/onboarding/applications/:requestId/documents` | STANDARD_COMMAND | `onboarding.ts:194` |
-| POST | `/api/v2/onboarding/applications/:requestId/submit` | STANDARD_COMMAND | `onboarding.ts:225` |
-| POST | `/api/v2/onboarding/verify-document` | SENSITIVE_COMMAND | `onboarding.ts:257` |
-| GET | `/api/v2/orders` | AUTH_READ | `orders/orders-routes.ts:29` |
-| GET | `/api/v2/orders/:id` | AUTH_READ | `orders/orders-routes.ts:59` |
-| GET | `/api/v2/orders/:id/status` | AUTH_READ | `orders/orders-routes.ts:75` |
-| POST | `/api/v2/events/:eventId/${action}` | STANDARD_COMMAND | `partner/events.ts:393` |
-| POST | `/api/v2/organizations` | STANDARD_COMMAND | `partner/organizations.ts:146` |
-| POST | `/api/v2/invitations/:invitationId/accept` | STANDARD_COMMAND | `partner/organizations.ts:655` |
-| POST | `/api/v2/partnerships/:partnershipId/${action}` | STANDARD_COMMAND | `partner/partnerships.ts:228` |
-| POST | `/api/v2/promoter-connections/:connectionId/${action}` | STANDARD_COMMAND | `partner/promoter-connections.ts:169` |
-| GET | `/api/v2/venues/:venueId/profile` | - | `partner/venues.ts:297` |
-| GET | `/api/v2/door/stats` | AUTH_READ | `phase5-routes.ts:75` |
-| GET | `/api/v2/door/stats/stream` | AUTH_READ | `phase5-routes.ts:100` |
-| GET | `/api/v2/profile/me` | AUTH_READ | `profile.ts:30` |
-| PUT | `/api/v2/profile/me` | STANDARD_COMMAND | `profile.ts:52` |
-| POST | `/api/v2/rsvp` | STANDARD_COMMAND | `rsvp/rsvp-routes.ts:38` |
-| POST | `/api/v2/follows` | STANDARD_COMMAND | `social/social-routes.ts:52` |
-| DELETE | `/api/v2/follows/:targetType/:targetId` | STANDARD_COMMAND | `social/social-routes.ts:81` |
-| GET | `/api/v2/follows/me` | AUTH_READ | `social/social-routes.ts:103` |
-| GET | `/api/v2/follows/:targetType/:targetId/status` | AUTH_READ | `social/social-routes.ts:136` |
-| GET | `/api/v2/notifications/me` | AUTH_READ | `social/social-routes.ts:160` |
-| GET | `/api/v2/notifications/me/unread-count` | AUTH_READ | `social/social-routes.ts:193` |
-| POST | `/api/v2/notifications/me/read` | STANDARD_COMMAND | `social/social-routes.ts:211` |
-| POST | `/api/v2/notifications/me/read-all` | STANDARD_COMMAND | `social/social-routes.ts:235` |
-| POST | `/api/v2/support/tickets` | SENSITIVE_COMMAND | `support/intake-routes.ts:88` |
-| GET | `/api/v2/support/tickets` | AUTH_READ | `support/intake-routes.ts:138` |
-| GET | `/api/v2/support/tickets/:ticketId` | AUTH_READ | `support/intake-routes.ts:169` |
-| POST | `/api/v2/support/tickets/:ticketId/messages` | SENSITIVE_COMMAND | `support/intake-routes.ts:194` |
-| GET | `/api/v2/tickets/:id` | AUTH_READ | `tickets/ticket-routes.ts:26` |
-| GET | `/api/v2/wallet` | AUTH_READ | `wallet/wallet-routes.ts:28` |
-| GET | `/api/v2/wallet/tickets` | AUTH_READ | `wallet/wallet-routes.ts:50` |
-| GET | `/api/v2/wallet/orders` | AUTH_READ | `wallet/wallet-routes.ts:80` |
+### `social/social-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/follows` | STANDARD_COMMAND | session | B:createFollowSchema |  |
+| DELETE | `/follows/:targetType/:targetId` | STANDARD_COMMAND | session | P:followTargetParamsSchema |  |
+| GET | `/follows/:targetType/:targetId/status` | AUTH_READ | session | P:followTargetParamsSchema |  |
+| GET | `/follows/me` | AUTH_READ | session | Q:listMyFollowsQuerySchema |  |
+| GET | `/notifications/me` | AUTH_READ | session | Q:listNotificationsQuerySchema |  |
+| POST | `/notifications/me/read` | STANDARD_COMMAND | session | B:markNotificationsReadSchema |  |
+| POST | `/notifications/me/read-all` | STANDARD_COMMAND | session | - |  |
+| GET | `/notifications/me/unread-count` | AUTH_READ | session | - |  |
+
+### `support/intake-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/support/tickets` | AUTH_READ | session | Q:paginationQuerySchema |  |
+| POST | `/support/tickets` | SENSITIVE_COMMAND | session | B:submitSupportTicketSchema |  |
+| GET | `/support/tickets/:ticketId` | AUTH_READ | session | P:supportIdParam |  |
+| POST | `/support/tickets/:ticketId/messages` | SENSITIVE_COMMAND | session | P:supportIdParam B:supportTicketMessageSchema |  |
+
+## 20 Partner dashboard (org-scoped)
+
+### `notifications/notifications-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/notifications` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:paginationQuerySchema |  |
+| POST | `/organizations/:organizationId/notifications/:notificationId/actions` | STANDARD_COMMAND | perm: organization.read | P:notificationIdParam B:notificationActionRequestSchema |  |
+| PATCH | `/organizations/:organizationId/notifications/:notificationId/read` | STANDARD_COMMAND | perm: organization.read | P:notificationIdParam B:notificationReadRequestSchema |  |
+| PATCH | `/organizations/:organizationId/notifications/read-all` | STANDARD_COMMAND | perm: organization.read | P:organizationIdParam |  |
+
+### `onboarding.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/onboarding/applications` | AUTH_READ | session | Q:paginationQuerySchema |  |
+| POST | `/onboarding/applications` | STANDARD_COMMAND | session | B:startOnboardingSchema |  |
+| PATCH | `/onboarding/applications/:requestId` | STANDARD_COMMAND | session | P:requestIdParam B:saveOnboardingProgressSchema |  |
+| POST | `/onboarding/applications/:requestId/documents` | STANDARD_COMMAND | session | P:requestIdParam B:addOnboardingDocumentSchema |  |
+| POST | `/onboarding/applications/:requestId/documents/upload-url` | STANDARD_COMMAND | session | P:requestIdParam B:documentUploadUrlRequestSchema |  |
+| POST | `/onboarding/applications/:requestId/promoter-agreement/accept` | STANDARD_COMMAND | session | P:requestIdParam B:promoterAgreementAcceptanceRequestSchema.omit |  |
+| POST | `/onboarding/applications/:requestId/submit` | STANDARD_COMMAND | session | P:requestIdParam |  |
+| GET | `/onboarding/me` | AUTH_READ | session | - |  |
+| GET | `/onboarding/promoter-agreement` | AUTH_READ | session | - |  |
+| POST | `/onboarding/verify-document` | SENSITIVE_COMMAND | session | B:verifyDocumentSchema |  |
+| POST | `/onboarding/verify-phone` | SENSITIVE_COMMAND | session | B:verifyPhoneSchema |  |
+
+### `partner/analytics.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/events/:eventId/analytics` | AUTH_READ | perm: event.read | P:eventIdParam | cache: EVENT_PREVIEW |
+| GET | `/events/:eventId/analytics/booking-heatmap` | AUTH_READ | perm: event.read | P:eventIdParam | cache: EVENT_PREVIEW |
+| GET | `/events/:eventId/promoter-analytics` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| GET | `/organizations/:organizationId/analytics/calendar` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:calendarQuery | cache: ORGANIZATION |
+| GET | `/organizations/:organizationId/analytics/events` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:cardQuery | cache: ORGANIZATION |
+| GET | `/organizations/:organizationId/analytics/overview` | AUTH_READ | perm: organization.read | P:organizationIdParam | cache: ORGANIZATION |
+| GET | `/organizations/:organizationId/analytics/sales-breakdown` | AUTH_READ | perm: organization.read | P:organizationIdParam | cache: ORGANIZATION |
+| GET | `/organizations/:organizationId/analytics/trends` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:trendsQuery | cache: ORGANIZATION |
+
+### `partner/discover.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/discover-partners` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:discoverPartnersQuerySchema |  |
+
+### `partner/event-catalog.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/events/:eventId/access-codes` | AUTH_READ | perm: event.read | P:eventIdParam Q:paginationQuerySchema |  |
+| POST | `/events/:eventId/access-codes` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:createTicketAccessCodeSchema |  |
+| POST | `/events/:eventId/access-codes/:codeId/revoke` | STANDARD_COMMAND | perm: event.update | P:accessCodeIdParam B:z.object |  |
+| POST | `/events/:eventId/access-invitations` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:createTicketAccessInvitationSchema |  |
+| GET | `/events/:eventId/cover-policy` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| POST | `/events/:eventId/cover-policy` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:proposeEventCoverPolicySchema |  |
+| POST | `/events/:eventId/cover-policy/:proposalId/accept` | STANDARD_COMMAND | perm: event.update | P:eventIdParam.extend |  |
+| GET | `/events/:eventId/promo-codes` | AUTH_READ | perm: event.read | P:eventIdParam Q:paginationQuerySchema |  |
+| POST | `/events/:eventId/promo-codes` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:createPromoCodeSchema |  |
+| GET | `/events/:eventId/promoter-assignments` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| POST | `/events/:eventId/promoter-assignments` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:assignPromoterSchema |  |
+| GET | `/events/:eventId/promoter-candidates` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| GET | `/events/:eventId/table-packages` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| POST | `/events/:eventId/table-packages` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:createTablePackageSchema |  |
+| GET | `/events/:eventId/ticket-addons` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| POST | `/events/:eventId/ticket-addons` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:createTicketAddonSchema |  |
+| GET | `/events/:eventId/ticket-tiers` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| POST | `/events/:eventId/ticket-tiers` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:createTicketTierSchema |  |
+| PATCH | `/events/:eventId/ticket-tiers/:tierId` | STANDARD_COMMAND | perm: event.update | P:ticketTierIdParam |  |
+| POST | `/promoter-assignments/:assignmentId/end` | STANDARD_COMMAND | perm: event.update | P:assignmentIdParam |  |
+| POST | `/promoter-assignments/:assignmentId/respond` | STANDARD_COMMAND | perm: event.read | P:assignmentIdParam B:promoterAssignmentActionSchema |  |
+| POST | `/promoter-assignments/:assignmentId/revoke` | STANDARD_COMMAND | perm: event.update | P:assignmentIdParam B:promoterAssignmentRevokeSchema |  |
+| GET | `/promoter-candidates` | AUTH_READ | perm: event.create | - |  |
+
+### `partner/event-comparison.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/events/:eventId/comparison` | AUTH_READ | perm: event.read | - |  |
+
+### `partner/events.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/events/:eventId` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| PATCH | `/events/:eventId` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:updateEventSchema |  |
+| POST | `/events/:eventId/cancel` | STANDARD_COMMAND | perm: event.cancel | P:eventIdParam B:cancelEventSchema |  |
+| POST | `/events/:eventId/duplicate` | STANDARD_COMMAND | perm: event.create | - | idempotent lifecycle action (Idempotency-Key) |
+| GET | `/events/:eventId/external-location/contact` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| POST | `/events/:eventId/external-location/resubmit` | SENSITIVE_COMMAND | perm: event.update | P:eventIdParam B:externalEventLocationInputSchema |  |
+| POST | `/events/:eventId/lifecycle` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:lifecycleBody |  |
+| POST | `/events/:eventId/pause-sales` | STANDARD_COMMAND | perm: event.update | - | idempotent lifecycle action (Idempotency-Key) |
+| GET | `/events/:eventId/previews` | AUTH_READ | perm: event.read | P:eventIdParam |  |
+| POST | `/events/:eventId/publish` | STANDARD_COMMAND | perm: event.publish | - | idempotent lifecycle action (Idempotency-Key) |
+| POST | `/events/:eventId/resume-sales` | STANDARD_COMMAND | perm: event.update | - | idempotent lifecycle action (Idempotency-Key) |
+| POST | `/events/:eventId/review` | STANDARD_COMMAND | perm: event.update | - | idempotent lifecycle action (Idempotency-Key) |
+| DELETE | `/organizations/:organizationId/event-draft` | STANDARD_COMMAND | perm: event.create | P:orgIdParam |  |
+| GET | `/organizations/:organizationId/event-draft` | AUTH_READ | perm: event.create | P:orgIdParam |  |
+| PUT | `/organizations/:organizationId/event-draft` | STANDARD_COMMAND | perm: event.create | P:orgIdParam B:eventDraftRequestSchema |  |
+| GET | `/organizations/:organizationId/events` | AUTH_READ | perm: event.read | P:orgIdParam Q:paginationQuerySchema |  |
+| POST | `/organizations/:organizationId/events` | STANDARD_COMMAND | perm: event.create | P:orgIdParam B:createEventBody |  |
+| POST | `/organizations/:organizationId/poster/upload-url` | STANDARD_COMMAND | perm: event.create | P:orgIdParam B:posterUploadUrlRequestSchema |  |
+| GET | `/organizations/:organizationId/venue-events` | AUTH_READ | perm: venue.read | P:orgIdParam Q:paginationQuerySchema |  |
+| GET | `/organizations/:organizationId/venue-events/:eventId` | AUTH_READ | perm: venue.read | P:orgIdParam.extend |  |
+| GET | `/promoters/:promoterId/assignment-invitations` | AUTH_READ | perm: event.read | P:z.object |  |
+| GET | `/promoters/:promoterId/events` | AUTH_READ | perm: event.read | P:z.object |  |
+
+### `partner/marketing.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/analytics/ticket-tiers` | AUTH_READ | perm: organization.read | P:z.object |  |
+| GET | `/organizations/:organizationId/marketing/audience` | AUTH_READ | perm: finance.orders.read | P:z.object |  |
+
+### `partner/organizations.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/invitations/:invitationId/accept` | STANDARD_COMMAND | session | P:invitationIdParam |  |
+| POST | `/invitations/:invitationId/revoke` | STANDARD_COMMAND | perm: staff.manage | P:invitationIdParam |  |
+| POST | `/invitations/:invitationId/resend` | SENSITIVE_COMMAND | perm: staff.manage | P:invitationIdParam | new 2026-11-18: re-emails a pending invite; reissues a 2-day temporary password only if the invitee never chose their own; only for roles below the caller |
+| GET | `/organizations` | AUTH_READ | perm: organization.read | Q:paginationQuerySchema |  |
+| POST | `/organizations` | STANDARD_COMMAND | session | B:createOrganizationBody |  |
+| GET | `/organizations/:organizationId` | AUTH_READ | perm: organization.read | P:organizationIdParam | cache: ORGANIZATION |
+| PATCH | `/organizations/:organizationId` | STANDARD_COMMAND | perm: organization.update | P:organizationIdParam |  |
+| GET | `/organizations/:organizationId/access` | AUTH_READ | perm: organization.read | P:organizationIdParam |  |
+| GET | `/organizations/:organizationId/invitations` | AUTH_READ | perm: staff.manage | P:organizationIdParam Q:paginationQuerySchema |  |
+| POST | `/organizations/:organizationId/invitations` | STANDARD_COMMAND | perm: staff.manage | P:organizationIdParam |  |
+| GET | `/organizations/:organizationId/members` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:paginationQuerySchema |  |
+| POST | `/organizations/:organizationId/members` | STANDARD_COMMAND | perm: staff.manage | P:organizationIdParam B:inviteMemberSchema |  |
+| DELETE | `/organizations/:organizationId/members/:userId` | STANDARD_COMMAND | perm: staff.manage | P:memberIdParam |  |
+| PATCH | `/organizations/:organizationId/members/:userId` | STANDARD_COMMAND | perm: staff.manage | P:memberIdParam B:updateMemberRoleSchema |  |
+
+### `partner/partnerships.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/partnerships` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:paginationQuerySchema |  |
+| POST | `/partnerships` | STANDARD_COMMAND | perm: venue.manage | B:requestPartnershipSchema |  |
+| POST | `/partnerships/:partnershipId/approve` | STANDARD_COMMAND | perm: venue.manage | - | resolution action |
+| POST | `/partnerships/:partnershipId/block` | STANDARD_COMMAND | perm: venue.manage | - | resolution action |
+| POST | `/partnerships/:partnershipId/end` | STANDARD_COMMAND | perm: venue.manage | - | resolution action |
+| POST | `/partnerships/:partnershipId/reject` | STANDARD_COMMAND | perm: venue.manage | - | resolution action |
+| POST | `/partnerships/:partnershipId/venue-share` | STANDARD_COMMAND | perm: venue.manage | P:partnershipIdParam B:setVenueShareRequestSchema |  |
+
+### `partner/profiles.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/partner-profiles/:partnerId` | AUTH_READ | perm: organization.read | Q:query |  |
+
+### `partner/promoter-connections.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/promoter-connections` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:paginationQuerySchema |  |
+| POST | `/promoter-connections` | STANDARD_COMMAND | perm: venue.manage | B:requestConnectionSchema |  |
+| POST | `/promoter-connections/:connectionId/approve` | STANDARD_COMMAND | perm: venue.manage (default; per-action option) | - | resolution action |
+| POST | `/promoter-connections/:connectionId/block` | STANDARD_COMMAND | perm: venue.manage (default; per-action option) | - | resolution action |
+| POST | `/promoter-connections/:connectionId/reject` | STANDARD_COMMAND | perm: venue.manage (default; per-action option) | - | resolution action |
+| POST | `/promoter-connections/:connectionId/revoke` | STANDARD_COMMAND | perm: venue.manage (default; per-action option) | - | resolution action |
+
+### `partner/referral-links.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/events/:eventId/promoters/:promoterId/attributed-orders` | AUTH_READ | perm: event.read | P:eventPromoterParam Q:eventAttributedOrdersQuerySchema |  |
+| GET | `/events/:eventId/referral-links` | AUTH_READ | perm: event.read | P:eventIdParam Q:paginationQuerySchema |  |
+| POST | `/events/:eventId/referral-links` | STANDARD_COMMAND | perm: event.update | P:eventIdParam B:createReferralLinkSchema |  |
+| POST | `/promoter-assignments/:assignmentId/referral-links` | STANDARD_COMMAND | perm: event.read | P:assignmentIdParam B:promoterCreateLinkSchema |  |
+| GET | `/promoters/:promoterId/attributed-orders` | AUTH_READ | perm: event.read | P:promoterIdParam Q:paginationQuerySchema |  |
+| GET | `/promoters/:promoterId/campaign-summary` | AUTH_READ | perm: event.read | P:promoterIdParam |  |
+| GET | `/promoters/:promoterId/referral-links` | AUTH_READ | perm: event.read | P:promoterIdParam Q:referralLinkPaginationQuerySchema |  |
+| POST | `/referral-links/:referralLinkId/deactivate` | STANDARD_COMMAND | perm: event.update | P:linkIdParam |  |
+
+### `partner/search.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/search` | AUTH_READ | perm: organization.read | Q:partnerGlobalSearchQuerySchema |  |
+
+### `partner/settings.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/organizations/:organizationId/partner-profile-media/upload-url` | STANDARD_COMMAND | perm: partner.profile.update | P:organizationParams B:uploadRequest |  |
+| GET | `/organizations/:organizationId/partner-settings` | AUTH_READ | perm: organization.read | P:organizationParams |  |
+| PATCH | `/organizations/:organizationId/partner-settings` | STANDARD_COMMAND | perm: partner.profile.update | P:organizationParams B:updatePartnerSettingsSchema |  |
+
+### `partner/venues.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/slot-requests` | AUTH_READ | perm: slot-request.list | P:orgIdParam Q:paginationQuerySchema |  |
+| GET | `/organizations/:organizationId/venues` | AUTH_READ | perm: venue.read | P:orgIdParam Q:paginationQuerySchema |  |
+| POST | `/organizations/:organizationId/venues` | STANDARD_COMMAND | perm: venue.create | P:orgIdParam B:createVenueBody |  |
+| GET | `/venues/:venueId` | AUTH_READ | perm: venue.read | P:venueIdParam |  |
+| PATCH | `/venues/:venueId` | STANDARD_COMMAND | perm: venue.manage | P:venueIdParam B:updateVenueBody |  |
+| GET | `/venues/:venueId/availability` | AUTH_READ | perm: venue.read | P:venueIdParam Q:calendarQuery |  |
+| GET | `/venues/:venueId/calendar` | AUTH_READ | perm: venue.read | P:venueIdParam Q:calendarQuery |  |
+| POST | `/venues/:venueId/calendar/availability` | STANDARD_COMMAND | perm: venue.manage | P:venueIdParam B:publishVenueAvailabilitySchema |  |
+| POST | `/venues/:venueId/calendar/blocks` | STANDARD_COMMAND | perm: venue.manage | P:venueIdParam B:createVenueBlockSchema |  |
+| DELETE | `/venues/:venueId/calendar/blocks/:blockId` | STANDARD_COMMAND | perm: venue.manage | P:venueBlockParam |  |
+| GET | `/venues/:venueId/menu` | AUTH_READ | perm: venue.read | P:venueIdParam | cache: VENUE_PROFILE |
+| PUT | `/venues/:venueId/menu` | STANDARD_COMMAND | perm: venue.manage | P:venueIdParam B:updateVenueMenuSchema |  |
+| GET | `/venues/:venueId/profile` | - | session | P:venueIdParam |  |
+| PATCH | `/venues/:venueId/profile` | STANDARD_COMMAND | perm: venue.manage | P:venueIdParam B:updateVenueBody |  |
+| GET | `/venues/:venueId/slot-requests` | AUTH_READ | perm: venue.read | P:venueIdParam Q:paginationQuerySchema |  |
+| POST | `/venues/:venueId/slot-requests` | STANDARD_COMMAND | perm: slot-request.create | P:venueIdParam B:createSlotRequestSchema |  |
+| GET | `/venues/:venueId/slot-requests/:slotRequestId` | AUTH_READ | perm: venue.read | P:slotRequestDetailParam |  |
+| POST | `/venues/slot-requests/:slotRequestId/accept` | STANDARD_COMMAND | perm: venue.schedule | - | resolve slot request |
+| POST | `/venues/slot-requests/:slotRequestId/cancel` | STANDARD_COMMAND | perm: slot-request.create | P:slotRequestIdParam |  |
+| POST | `/venues/slot-requests/:slotRequestId/cancel-by-venue` | STANDARD_COMMAND | perm: venue.schedule | P:slotRequestIdParam |  |
+| POST | `/venues/slot-requests/:slotRequestId/reject` | STANDARD_COMMAND | perm: venue.schedule | - | resolve slot request |
+
+## 40 Door, scanner & cover wallet
+
+### `door/cover-wallet-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/cover-wallets` | STANDARD_COMMAND | perm: door.manage | B:coverWalletIssueRequestSchema |  |
+| GET | `/cover-wallets/:walletId` | AUTH_READ | perm: venue.read | P:walletIdParam |  |
+| POST | `/cover-wallets/:walletId/credit` | STANDARD_COMMAND | perm: door.manage | P:walletIdParam B:coverWalletCreditRequestSchema |  |
+| POST | `/cover-wallets/:walletId/debit` | STANDARD_COMMAND | perm: ticket.override | P:walletIdParam B:coverWalletDebitBody |  |
+| POST | `/cover-wallets/:walletId/freeze` | STANDARD_COMMAND | perm: door.manage | P:walletIdParam |  |
+| GET | `/cover-wallets/:walletId/qr` | AUTH_READ | perm: venue.read | P:walletIdParam |  |
+| POST | `/cover-wallets/:walletId/reconcile` | STANDARD_COMMAND | perm: door.manage | P:walletIdParam B:coverWalletReconciliationRequestSchema |  |
+| POST | `/cover-wallets/:walletId/terminate` | STANDARD_COMMAND | perm: door.manage | P:walletIdParam B:coverWalletTerminateBody |  |
+| POST | `/cover-wallets/:walletId/unfreeze` | STANDARD_COMMAND | perm: door.manage | P:walletIdParam |  |
+
+### `door/door-ops-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/door/attendance-report` | AUTH_READ | perm: venue.read | Q:attendanceReportQuerySchema |  |
+| POST | `/door/check-ins/confirm` | SCANNER_COMMAND | scanner/door session | B:confirmCoupleBodySchema |  |
+| GET | `/door/devices` | AUTH_READ | perm: door.manage | Q:paginationQuerySchema |  |
+| POST | `/door/devices` | STANDARD_COMMAND | perm: door.manage | B:scannerDeviceBindBodySchema |  |
+| POST | `/door/devices/:deviceId/reauthorize` | SENSITIVE_COMMAND | perm: door.manage | P:deviceIdParam B:scannerDeviceReauthorizeBodySchema |  |
+| POST | `/door/devices/:deviceId/unbind` | SENSITIVE_COMMAND | perm: door.manage | P:deviceIdParam B:revokeReasonBodySchema |  |
+| GET | `/door/events` | AUTH_READ | perm: venue.read | Q:doorEventListQuerySchema |  |
+| GET | `/door/guests` | AUTH_READ | perm: venue.read | Q:doorGuestListQuerySchema |  |
+| POST | `/door/guests/check-in` | STANDARD_COMMAND | perm: ticket.override | B:manualCheckInBodySchema |  |
+| POST | `/door/heartbeat` | SCANNER_COMMAND | scanner/door session | B:scannerHeartbeatBodySchema |  |
+| POST | `/door/staff-deny` | SCANNER_COMMAND | scanner/door session | B:staffDenyBodySchema |  |
+| POST | `/door/ticket-sale` | STANDARD_COMMAND | scanner/door session | B:doorTicketSaleBodySchema |  |
+| POST | `/door/wallet-charge` | SCANNER_COMMAND | scanner/door session | B:walletChargeBodySchema |  |
+| POST | `/door/wallet-qr` | SCANNER_COMMAND | scanner/door session | B:walletQrResolveBodySchema |  |
+
+### `door/door-sale-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/door/dine-in` | STANDARD_COMMAND | perm: ticket.override | B:doorDineInRequestSchema |  |
+| GET | `/door/sales` | AUTH_READ | perm: venue.read | Q:doorSalesQuerySchema |  |
+| POST | `/door/walk-in` | STANDARD_COMMAND | perm: ticket.override | B:doorWalkInRequestSchema |  |
+
+### `door/event-code-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/door-codes/:codeId/revoke` | SENSITIVE_COMMAND | perm: door.manage | P:codeIdParam B:revokeReasonBodySchema |  |
+| GET | `/door-codes/:codeId/sessions` | AUTH_READ | perm: door.manage | P:codeIdParam Q:paginationQuerySchema |  |
+| POST | `/door/sessions/:sessionId/revoke` | SENSITIVE_COMMAND | perm: door.manage | P:sessionIdParam B:revokeReasonBodySchema |  |
+| GET | `/events/:eventId/door-codes` | AUTH_READ | perm: door.manage | P:eventIdParam |  |
+| POST | `/events/:eventId/door-codes` | STANDARD_COMMAND | perm: door.manage | P:eventIdParam B:eventCodeCreateBodySchema |  |
+
+### `door/scanner-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/door/check-ins` | SCANNER_COMMAND | scanner/door session | B:scanRequestSchema |  |
+| GET | `/door/check-ins/:checkInId` | AUTH_READ | scanner/door session | P:checkInIdParam |  |
+| POST | `/door/check-ins/verify` | SCANNER_COMMAND | scanner/door session | B:scanRequestSchema |  |
+| POST | `/door/lookup` | SCANNER_COMMAND | scanner/door session | B:scanRequestSchema |  |
+| GET | `/door/offline-manifest` | STANDARD_COMMAND | scanner/door session | Q:offlineManifestRequestSchema |  |
+| POST | `/door/offline-sync` | STANDARD_COMMAND | scanner/door session | B:offlineSyncRequestSchema |  |
+| POST | `/door/override` | SENSITIVE_COMMAND | perm: ticket.override | B:overrideRequestSchema |  |
+| POST | `/door/sessions` | SENSITIVE_COMMAND | scanner/door session | B:scannerSessionCreateBodySchema |  |
+| GET | `/door/sessions/:sessionId` | AUTH_READ | scanner/door session | P:sessionIdParam |  |
+| POST | `/door/ticket-addons/redeem` | SCANNER_COMMAND | scanner/door session | B:ticketAddonRedemptionRequestSchema |  |
+| GET | `/tickets/:ticketId/qr` | AUTH_READ | scanner/door session | P:ticketIdParam |  |
+
+### `event-cover/event-cover-redemption-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/event-cover/redemption-challenges` | STANDARD_COMMAND | perm: door.manage | B:createEventCoverRedemptionChallengeSchema |  |
+| GET | `/event-cover/redemption-challenges/:challengeId` | AUTH_READ | perm: door.manage | P:challengeParams |  |
+| POST | `/event-cover/redemption-challenges/:challengeId/consume` | STANDARD_COMMAND | perm: door.manage | P:challengeParams B:z.object |  |
+| GET | `/wallet/event-cover-redemption-challenges/:challengeId` | AUTH_READ | session | P:challengeParams |  |
+| POST | `/wallet/event-cover-redemption-challenges/:challengeId/confirm` | STANDARD_COMMAND | session | P:challengeParams B:z.object |  |
+
+### `phase5-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/door/stats` | AUTH_READ | scanner/door session | Q:doorStatsQuerySchema |  |
+| GET | `/door/stats/stream` | AUTH_READ | scanner/door session | Q:doorStatsQuerySchema |  |
+
+## 50 Finance, ledger & payouts
+
+### `finance/finance-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/organizations/:organizationId/bank-accounts` | AUTH_READ | perm: finance.read | P:organizationIdParam |  |
+| POST | `/organizations/:organizationId/bank-accounts` | STANDARD_COMMAND | perm: finance.bank_accounts.manage | P:organizationIdParam B:bankAccountRequestSchema |  |
+| DELETE | `/organizations/:organizationId/bank-accounts/:bankAccountId` | STANDARD_COMMAND | perm: finance.bank_accounts.manage | P:bankAccountIdParam |  |
+| POST | `/organizations/:organizationId/bank-accounts/:bankAccountId/default` | STANDARD_COMMAND | perm: finance.bank_accounts.manage | P:bankAccountIdParam |  |
+| GET | `/organizations/:organizationId/disputes` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:paginationQuerySchema |  |
+| POST | `/organizations/:organizationId/disputes` | STANDARD_COMMAND | perm: organization.update | P:organizationIdParam B:raiseDisputeRequestSchema |  |
+| GET | `/organizations/:organizationId/disputes/:disputeId` | AUTH_READ | perm: organization.read | P:disputeIdParam |  |
+| POST | `/organizations/:organizationId/disputes/:disputeId/resolve` | STANDARD_COMMAND | perm: organization.update | P:disputeIdParam B:resolveDisputeRequestSchema |  |
+| POST | `/organizations/:organizationId/disputes/:disputeId/review` | STANDARD_COMMAND | perm: organization.update | P:disputeIdParam |  |
+| GET | `/organizations/:organizationId/finance/balance` | AUTH_READ | perm: finance.read | P:organizationIdParam |  |
+| GET | `/organizations/:organizationId/finance/ledger` | AUTH_READ | perm: finance.read | P:organizationIdParam Q:paginationQuerySchema |  |
+| GET | `/organizations/:organizationId/finance/orders` | AUTH_READ | perm: finance.orders.read | P:organizationIdParam Q:paginationQuerySchema |  |
+| GET | `/organizations/:organizationId/payouts` | AUTH_READ | perm: finance.payouts.read | P:organizationIdParam Q:paginationQuerySchema |  |
+| POST | `/organizations/:organizationId/payouts` | STANDARD_COMMAND | perm: finance.payouts.manage | P:organizationIdParam B:payoutRequestSchema |  |
+| GET | `/organizations/:organizationId/payouts/:payoutId` | AUTH_READ | perm: finance.payouts.read | P:payoutIdParam |  |
+
+### `finance/leaderboard-routes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/leaderboard` | PUBLIC_READ | session | Q:leaderboardQuerySchema |  |
+| GET | `/organizations/:organizationId/leaderboard/me` | AUTH_READ | perm: organization.read | P:organizationIdParam Q:leaderboardQuerySchema |  |
+
+## 90 Platform admin console
+
+### `admin/analytics.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/analytics` | AUTH_READ | platform admin | - |  |
+
+### `admin/communications.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/communications/email-deliveries/:aggregateId` | AUTH_READ | platform admin | P:paramsSchema |  |
+
+### `admin/complimentary-allocations.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/admin/complimentary-allocations/:allocationId/claims` | SENSITIVE_COMMAND | platform admin | P:allocationParams B:issueBody |  |
+| POST | `/admin/complimentary-claims/:claimId/revoke` | SENSITIVE_COMMAND | platform admin | P:claimParams B:revokeBody |  |
+| GET | `/admin/events/:eventId/complimentary-allocations` | AUTH_READ | platform admin | P:eventParams Q:paginationQuerySchema |  |
+| POST | `/admin/events/:eventId/complimentary-allocations` | SENSITIVE_COMMAND | platform admin | P:eventParams B:createBody |  |
+
+### `admin/directory.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/audit/export.csv` | AUTH_READ | platform admin | - |  |
+| GET | `/admin/events` | AUTH_READ | platform admin | Q:directoryQuerySchema |  |
+| GET | `/admin/events/export.csv` | AUTH_READ | platform admin | - |  |
+| GET | `/admin/hosts` | AUTH_READ | platform admin | Q:directoryQuerySchema |  |
+| GET | `/admin/hosts/export.csv` | AUTH_READ | platform admin | - |  |
+| GET | `/admin/lookup` | AUTH_READ | platform admin | Q:lookupQuerySchema |  |
+| GET | `/admin/users` | AUTH_READ | platform admin | Q:directoryQuerySchema |  |
+| GET | `/admin/users/export.csv` | AUTH_READ | platform admin | - |  |
+| GET | `/admin/venues` | AUTH_READ | platform admin | Q:directoryQuerySchema |  |
+| GET | `/admin/venues/export.csv` | AUTH_READ | platform admin | - |  |
+
+### `admin/disputes.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/disputes` | AUTH_READ | platform admin | Q:disputeQuerySchema |  |
+| GET | `/admin/disputes/:disputeId` | AUTH_READ | platform admin | P:disputeIdParam |  |
+| POST | `/admin/disputes/:disputeId/resolve` | SENSITIVE_COMMAND | platform admin | P:disputeIdParam B:adminResolveDisputeSchema |  |
+
+### `admin/event-actions.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/admin/events/:eventId/external-venue-review` | SENSITIVE_COMMAND | platform admin | P:eventIdParam B:externalVenueReviewDecisionSchema |  |
+| POST | `/admin/events/:eventId/force-complete` | SENSITIVE_COMMAND | platform admin | P:eventIdParam |  |
+| POST | `/admin/events/:eventId/pause` | SENSITIVE_COMMAND | platform admin | P:eventIdParam |  |
+| POST | `/admin/events/:eventId/resume` | SENSITIVE_COMMAND | platform admin | P:eventIdParam |  |
+| GET | `/admin/external-venue-requests` | AUTH_READ | platform admin | - |  |
+
+### `admin/onboarding-review.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/admins` | AUTH_READ | platform admin | Q:paginationQuerySchema |  |
+| POST | `/admin/admins/:adminId/revoke` | SENSITIVE_COMMAND | platform admin | P:adminIdParam |  |
+| GET | `/admin/audit` | AUTH_READ | platform admin | Q:auditQuerySchema |  |
+| GET | `/admin/onboarding/applications` | AUTH_READ | platform admin | Q:queueQuerySchema |  |
+| GET | `/admin/onboarding/applications/:requestId` | AUTH_READ | platform admin | P:requestIdParam |  |
+| POST | `/admin/onboarding/applications/:requestId/approve` | SENSITIVE_COMMAND | platform admin | P:requestIdParam B:reviewOnboardingSchema.optional |  |
+| GET | `/admin/onboarding/applications/:requestId/documents/:label/read-url` | AUTH_READ | platform admin | P:requestDocumentParam |  |
+| POST | `/admin/onboarding/applications/:requestId/documents/:label/reject` | SENSITIVE_COMMAND | platform admin | P:requestDocumentParam B:rejectKycDocumentSchema |  |
+| POST | `/admin/onboarding/applications/:requestId/documents/:label/verify` | SENSITIVE_COMMAND | platform admin | P:requestDocumentParam |  |
+| POST | `/admin/onboarding/applications/:requestId/reject` | SENSITIVE_COMMAND | platform admin | - | platform-admin review action |
+| POST | `/admin/onboarding/applications/:requestId/request-changes` | SENSITIVE_COMMAND | platform admin | - | platform-admin review action |
+| GET | `/admin/proposals` | AUTH_READ | platform admin | Q:proposalQuerySchema |  |
+| POST | `/admin/proposals` | SENSITIVE_COMMAND | platform admin | B:proposeActionSchema |  |
+| POST | `/admin/proposals/:proposalId/approve` | SENSITIVE_COMMAND | platform admin | - | platform-admin proposed-action resolution |
+| POST | `/admin/proposals/:proposalId/cancel` | SENSITIVE_COMMAND | platform admin | - | platform-admin proposed-action resolution |
+| POST | `/admin/proposals/:proposalId/provision-admin` | SENSITIVE_COMMAND | platform admin | P:proposalIdParam |  |
+| POST | `/admin/proposals/:proposalId/reject` | SENSITIVE_COMMAND | platform admin | - | platform-admin proposed-action resolution |
+| POST | `/admin/proposals/:proposalId/update-admin-role` | SENSITIVE_COMMAND | platform admin | P:proposalIdParam |  |
+
+### `admin/orders.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/orders` | AUTH_READ | platform admin | Q:ordersQuerySchema |  |
+| GET | `/admin/orders/by-booking-reference/:bookingReference` | AUTH_READ | platform admin | P:z.object |  |
+| GET | `/admin/orders/export.csv` | AUTH_READ | platform admin | - |  |
+
+### `admin/organization-actions.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/admin/organizations/:organizationId/reinstate` | SENSITIVE_COMMAND | platform admin | P:organizationIdParam |  |
+| POST | `/admin/organizations/:organizationId/suspend` | SENSITIVE_COMMAND | platform admin | P:organizationIdParam |  |
+| POST | `/admin/proposals/:proposalId/adjust-commission` | SENSITIVE_COMMAND | platform admin | P:proposalIdParam |  |
+
+### `admin/payouts.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/payouts` | AUTH_READ | platform admin | Q:payoutQuerySchema |  |
+| GET | `/admin/payouts/:payoutId` | AUTH_READ | platform admin | P:payoutIdParam |  |
+| POST | `/admin/payouts/:payoutId/complete` | SENSITIVE_COMMAND | platform admin | P:payoutIdParam B:completeManualPayoutSchema |  |
+| POST | `/admin/payouts/batch-run` | SENSITIVE_COMMAND | platform admin | B:runPayoutBatchSchema |  |
+| POST | `/admin/proposals/:proposalId/freeze-payout` | SENSITIVE_COMMAND | platform admin | P:proposalIdParam |  |
+| POST | `/admin/proposals/:proposalId/release-payout` | SENSITIVE_COMMAND | platform admin | P:proposalIdParam |  |
+
+### `admin/promoters.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/admin/promoter-links/:linkId/deactivate` | SENSITIVE_COMMAND | platform admin | P:promoterLinkIdParam B:adminPromoterSuspendRequestSchema |  |
+| GET | `/admin/promoters` | AUTH_READ | platform admin | Q:promotersQuerySchema |  |
+| GET | `/admin/promoters/:promoterId/referral-links` | AUTH_READ | platform admin | P:promoterIdParam Q:promotersQuerySchema |  |
+| POST | `/admin/promoters/:promoterId/reinstate` | SENSITIVE_COMMAND | platform admin | P:promoterIdParam B:adminPromoterSuspendRequestSchema |  |
+| GET | `/admin/promoters/:promoterId/risk-flags` | AUTH_READ | platform admin | P:promoterIdParam |  |
+| POST | `/admin/promoters/:promoterId/suspend` | SENSITIVE_COMMAND | platform admin | P:promoterIdParam B:adminPromoterSuspendRequestSchema |  |
+| GET | `/admin/promoters/export.csv` | AUTH_READ | platform admin | - |  |
+
+### `admin/promotions.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/promotions` | AUTH_READ | platform admin | Q:promotionsQuerySchema |  |
+| GET | `/admin/promotions/export.csv` | AUTH_READ | platform admin | - |  |
+
+### `admin/reconciliation.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/chargebacks` | AUTH_READ | platform admin | Q:paginationQuerySchema |  |
+| POST | `/admin/proposals/:proposalId/post-financial-adjustment` | SENSITIVE_COMMAND | platform admin | P:z.object |  |
+| GET | `/admin/reconciliation/discrepancies` | AUTH_READ | platform admin | Q:discrepancyQuery |  |
+| GET | `/admin/reconciliation/discrepancies/:discrepancyId` | AUTH_READ | platform admin | P:discrepancyParam |  |
+| POST | `/admin/reconciliation/discrepancies/:discrepancyId/resolve` | SENSITIVE_COMMAND | platform admin | P:discrepancyParam B:resolveReconciliationDiscrepancySchema |  |
+| POST | `/admin/reconciliation/discrepancies/:discrepancyId/retry` | SENSITIVE_COMMAND | platform admin | P:discrepancyParam |  |
+| GET | `/admin/reconciliation/export.csv` | - | platform admin | - |  |
+| GET | `/admin/reconciliation/runs` | AUTH_READ | platform admin | Q:paginationQuerySchema |  |
+| POST | `/admin/reconciliation/runs` | SENSITIVE_COMMAND | platform admin | - |  |
+| GET | `/admin/reconciliation/runs/:runId` | AUTH_READ | platform admin | P:runParam |  |
+
+### `admin/refunds.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/refunds` | AUTH_READ | platform admin | Q:refundQuerySchema |  |
+| POST | `/admin/refunds` | SENSITIVE_COMMAND | platform admin | B:requestRefundSchema |  |
+| GET | `/admin/refunds/:refundRequestId` | AUTH_READ | platform admin | P:refundIdParam |  |
+| POST | `/admin/refunds/:refundRequestId/approve` | SENSITIVE_COMMAND | platform admin | P:refundIdParam |  |
+| POST | `/admin/refunds/:refundRequestId/execute` | SENSITIVE_COMMAND | platform admin | P:refundIdParam |  |
+| POST | `/admin/refunds/:refundRequestId/policy-remedy` | SENSITIVE_COMMAND | platform admin | P:refundIdParam |  |
+| POST | `/admin/refunds/:refundRequestId/reconcile` | SENSITIVE_COMMAND | platform admin | P:refundIdParam B:reconcileRefundRequestSchema |  |
+| POST | `/admin/refunds/:refundRequestId/reject` | SENSITIVE_COMMAND | platform admin | P:refundIdParam B:rejectRefundRequestSchema |  |
+| GET | `/admin/refunds/export.csv` | AUTH_READ | platform admin | - |  |
+
+### `admin/settings.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/settings/platform` | AUTH_READ | platform admin | - |  |
+| PUT | `/admin/settings/platform` | SENSITIVE_COMMAND | platform admin | B:platformSettingsUpdateRequestSchema |  |
+
+### `admin/support.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/support/tickets` | AUTH_READ | platform admin | Q:supportTicketQuerySchema |  |
+| DELETE | `/admin/support/tickets/:ticketId` | SENSITIVE_COMMAND | platform admin | P:supportIdParam |  |
+| GET | `/admin/support/tickets/:ticketId` | AUTH_READ | platform admin | P:supportIdParam |  |
+| POST | `/admin/support/tickets/:ticketId/assign` | SENSITIVE_COMMAND | platform admin | P:supportIdParam B:assignSupportTicketSchema |  |
+| POST | `/admin/support/tickets/:ticketId/close` | - | platform admin | - | body-free support transition |
+| POST | `/admin/support/tickets/:ticketId/escalate` | - | platform admin | - | body-free support transition |
+| POST | `/admin/support/tickets/:ticketId/link` | SENSITIVE_COMMAND | platform admin | P:supportIdParam B:supportTicketLinkSchema |  |
+| POST | `/admin/support/tickets/:ticketId/merge` | SENSITIVE_COMMAND | platform admin | P:supportIdParam B:mergeSupportTicketSchema |  |
+| POST | `/admin/support/tickets/:ticketId/notes` | SENSITIVE_COMMAND | platform admin | P:supportIdParam B:supportTicketMessageSchema |  |
+| POST | `/admin/support/tickets/:ticketId/priority` | SENSITIVE_COMMAND | platform admin | P:supportIdParam B:changeSupportTicketPrioritySchema |  |
+| POST | `/admin/support/tickets/:ticketId/reopen` | - | platform admin | - | body-free support transition |
+| POST | `/admin/support/tickets/:ticketId/reply` | SENSITIVE_COMMAND | platform admin | P:supportIdParam B:supportTicketMessageSchema |  |
+| POST | `/admin/support/tickets/:ticketId/resolve` | SENSITIVE_COMMAND | platform admin | P:supportIdParam B:resolveSupportTicketSchema |  |
+| POST | `/admin/support/tickets/:ticketId/restore` | - | platform admin | - | body-free support transition |
+
+### `admin/tickets.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| GET | `/admin/events/:eventId/cover-reconciliation` | AUTH_READ | platform admin | P:eventCoverReconciliationParamsSchema |  |
+| POST | `/admin/ticket-transfers/:transferId/freeze` | STANDARD_COMMAND | platform admin | P:freezeTransferParamsSchema B:freezeTransferBodySchema |  |
+| POST | `/admin/ticket-transfers/:transferId/release` | STANDARD_COMMAND | platform admin | P:freezeTransferParamsSchema B:freezeTransferBodySchema |  |
+| GET | `/admin/tickets` | AUTH_READ | platform admin | Q:ticketsQuerySchema |  |
+| GET | `/admin/tickets/:ticketId/cover-reconciliation` | AUTH_READ | platform admin | P:ticketTransferParamsSchema |  |
+| POST | `/admin/tickets/:ticketId/cover-redemptions/:captureEntryId/reverse` | SENSITIVE_COMMAND | platform admin | P:coverReversalParamsSchema B:coverReversalBodySchema |  |
+| GET | `/admin/tickets/:ticketId/event-change-refund-reviews` | AUTH_READ | platform admin | P:ticketTransferParamsSchema |  |
+| GET | `/admin/tickets/:ticketId/transfers` | AUTH_READ | platform admin | P:ticketTransferParamsSchema |  |
+| GET | `/admin/tickets/export.csv` | AUTH_READ | platform admin | - |  |
+
+### `admin/user-actions.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/admin/users/:userId/ban` | SENSITIVE_COMMAND | platform admin | P:userIdParam B:banBodySchema.optional |  |
+| POST | `/admin/users/:userId/unban` | SENSITIVE_COMMAND | platform admin | P:userIdParam |  |
+
+### `admin/venue-actions.ts`
+
+| Method | Path | RL | Access | Validation | Notes |
+|---|---|---|---|---|---|
+| POST | `/admin/venues/:venueId/reinstate` | SENSITIVE_COMMAND | platform admin | P:venueIdParam |  |
+| POST | `/admin/venues/:venueId/suspend` | SENSITIVE_COMMAND | platform admin | P:venueIdParam |  |

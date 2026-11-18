@@ -6,8 +6,8 @@ Cross-cutting material that does not belong to one service. Three of these files
 |---|---|
 | `GETTING-STARTED.md` | Prerequisites, run modes (memory, Firestore, emulator), env files, running each app, every seed and ops script, third-party setup, seeding order, pitfalls |
 | `ENV-MATRIX.md` | **Generated.** All 32 backend variables from the config schema with production rules, plus frontend, nginx, CI and staging-script names, and name traps |
-| `API-ROUTE-INDEX.md` | **Generated.** All 275 route registrations with method, full path, rate class, permission, cache, idempotency, source line; plus the 155 routes with no `requirePermission` |
-| `COLLECTIONS-INDEX.md` | **Generated.** All 69 `v2_*` Firestore collections with the files that reference them |
+| `API-ROUTE-INDEX.md` | **Generated, refreshed 2026-11-17 from staging 7c181a0.** All 404 registered routes with method, path, rate class, access rule and Zod schemas (old version with source lines: `../_archive-2026-10-24/`) |
+| `COLLECTIONS-INDEX.md` | **Generated, refreshed 2026-11-17 from staging 7c181a0.** 95 Firestore collections with domain fields, plus the 88 composite indexes (old version: `../_archive-2026-10-24/`) |
 | `SERVICES-INDEX.md` | Services, models, ports, contracts and route families, with where each is documented and the documentation gaps |
 | `ERROR-CODES.md` | The wire envelope, the 12 codes, internal domain codes, who emits what |
 | `SECURITY-AND-PRIVACY.md` | PII inventory, controls, secrets and rotation, findings, missing policies |
